@@ -130,15 +130,22 @@ function PluginPlatformCard({ p, busy, onRemove, onChanged }) {
     }
   }, [loginState?.status])
 
-  // provider 插件没有自己的前端：管理入口 = magpie 控制台的该 provider 详情页。
-// 前端支持 ?view=providers&edit=<providerId>，直接落到详情弹窗。
-  const openPanelLogin = async () => {
-    const providerId = (p.providers || [])[0]
+  // provider 插件没有自己的前端：管理界面来自 magpie 控制台。
+// 控制台没设 X-Frame-Options，可内嵌；桌面端 Electron 也可用。
+  const [embedOpen, setEmbedOpen] = useState(false)
+  const providerId = (p.providers || [])[0]
+  const embedUrl = providerId
+    ? `http://127.0.0.1:17899/?k=wanneng2api-magpie-web-2026&view=providers&edit=${encodeURIComponent(providerId)}`
+    : 'http://127.0.0.1:17899/?k=wanneng2api-magpie-web-2026&view=providers'
+
+  const openPanelLogin = () => setEmbedOpen(true)
+
+  const openExternalPanel = async () => {
     try {
       await api.openPanel('magpie-web', providerId ? { view: 'providers', edit: providerId } : undefined)
-      toast(providerId ? `已打开 Magpie 控制台的 ${p.name} 详情` : '已在系统浏览器打开 Magpie 控制台')
+      toast('已在系统浏览器打开')
     } catch (e) {
-      toast(`打开控制台失败：${e.message}`, 'err')
+      toast(`打开失败：${e.message}`, 'err')
     }
   }
 
@@ -233,6 +240,8 @@ function PluginPlatformCard({ p, busy, onRemove, onChanged }) {
         <button className="btn sm ghost" disabled={busy} onClick={onRemove}>{busy ? '卸载中…' : '卸载'}</button>
       </div>
 
+      {embedOpen && <EmbedPanel title={`${p.name} 管理`} url={embedUrl} onClose={() => setEmbedOpen(false)} onExternal={openExternalPanel} />}
+
       {dialog && (
         <div className="modal-mask" onClick={() => setDialog(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -255,6 +264,35 @@ function PluginPlatformCard({ p, busy, onRemove, onChanged }) {
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+/**
+ * 内嵌面板：把 magpie 控制台页面直接嵌进管理台（全屏抽屉）。
+ * magpie web 未设 X-Frame-Options / CSP frame-ancestors，实测可嵌入。
+ */
+function EmbedPanel({ title, url, onClose, onExternal }) {
+  const [loading, setLoading] = useState(true)
+  return (
+    <div className="embed-mask">
+      <div className="embed-bar">
+        <b>{title}</b>
+        <span className="mono sub" style={{ fontSize: 11 }}>{url.split('?')[0]}</span>
+        <span style={{ flex: 1 }} />
+        <button className="btn sm" onClick={onExternal}>新窗口打开</button>
+        <button className="btn sm" onClick={() => { const f = document.querySelector('.embed-frame'); if (f) f.src = url }}>刷新</button>
+        <button className="btn sm ghost" onClick={onClose}>关闭</button>
+      </div>
+      <div className="embed-body">
+        {loading && <div className="embed-loading"><span className="spinner" /> 加载 magpie 控制台…</div>}
+        <iframe
+          className="embed-frame"
+          title={title}
+          src={url}
+          onLoad={() => setLoading(false)}
+        />
+      </div>
     </div>
   )
 }
