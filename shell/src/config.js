@@ -25,7 +25,7 @@ function defaultManagerConfig() {
       closeAction: 'tray',            // tray | quit
       autoStart: false,               // 开机自启（app.setLoginItemSettings）
       startMinimized: false,
-      autoStartPlatforms: ['workbuddy', 'codearts', 'loomy', 'lingxi', 'magpie'],
+      autoStartPlatforms: ['workbuddy', 'codearts', 'loomy', 'lingxi', 'magpie', 'magpie-web'],
       autoStartDelaySec: 0,
     },
     manager: {
@@ -242,7 +242,40 @@ function defaultPlatforms() {
           failThreshold: 3,
           okThreshold: 1,
         },
-        adminPanel: 'http://127.0.0.1:3425/',
+        // 管理界面是 magpie 自己的 Web UI（另一个端口），不是网关 API 根。
+        adminPanel: 'http://127.0.0.1:17899/',
+      },
+      {
+        // magpie 的网页控制台：插件管理、用量页、page 型插件都渲染在这里。
+        // 由壳托管（随壳启停），provider 插件本身没有前端。
+        id: 'magpie-web',
+        name: 'Magpie 控制台',
+        type: 'go-binary',
+        enabled: true,
+        mode: 'managed',
+        workDir: 'D:/app/wanneng2api/tools/magpie',
+        run: {
+          binary: 'magpie.exe',
+          args: ['web', '--gateway', '--no-open', '--addr', '127.0.0.1:17899'],
+          env: {
+            NO_PROXY: '*',
+            // 固定 key：重启后链接不变，管理台可直接跳转
+            MAGPIE_WEB_KEY: 'wanneng2api-magpie-web-2026',
+            MAGPIE_ADDR: '127.0.0.1:3425',
+          },
+          shell: false,
+        },
+        port: 17899,
+        health: {
+          // 带 key 访问返回 303（跳转并下发会话 cookie），不带则 401
+          url: 'http://127.0.0.1:17899/?k=wanneng2api-magpie-web-2026',
+          intervalSec: 20,
+          timeoutSec: 5,
+          failThreshold: 3,
+          okThreshold: 1,
+        },
+        adminPanel: 'http://127.0.0.1:17899/?k=wanneng2api-magpie-web-2026',
+        restart: { baseBackoffSec: 3, maxBackoffSec: 300, maxRetries: 0 },
       },
     ],
   };

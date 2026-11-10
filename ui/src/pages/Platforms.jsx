@@ -130,9 +130,14 @@ function PluginPlatformCard({ p, busy, onRemove, onChanged }) {
     }
   }, [loginState?.status])
 
-  // 插件没有独立 Web 面板，管理入口 = magpie 的控制台（Web UI）
-  const openPanelLogin = () => {
-    window.open('http://127.0.0.1:3425/', '_blank', 'noopener')
+  // provider 插件没有自己的前端：管理入口 = magpie 控制台（magpie-web 平台）
+  const openPanelLogin = async () => {
+    try {
+      await api.openPanel('magpie-web')
+      toast('已在系统浏览器打开 Magpie 控制台')
+    } catch (e) {
+      toast(`打开控制台失败：${e.message}`, 'err')
+    }
   }
 
   const openLogin = async () => {
