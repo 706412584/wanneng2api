@@ -47,6 +47,28 @@ function getJson(url, headers = {}) {
   })
 }
 
+// TCP 连一下最可靠：Windows 上 bind 探测会被 SO_REUSEADDR 之类影响。
+function checkPortInUse(port) {
+  return new Promise((resolve) => {
+    const sock = require('net').connect({ host: '127.0.0.1', port, timeout: 800 })
+    const done = (v) => { try { sock.destroy() } catch { /* ignore */ } resolve(v) }
+    sock.once('connect', () => done(true))
+    sock.once('error', () => done(false))
+    sock.once('timeout', () => done(false))
+  })
+}
+
+function findFreePort() {
+  return new Promise((resolve, reject) => {
+    const srv = require('net').createServer()
+    srv.once('error', reject)
+    srv.listen(0, '127.0.0.1', () => {
+      const p = srv.address().port
+      srv.close(() => resolve(p))
+    })
+  })
+}
+
 async function main() {
   console.log('=== wanneng2api 端到端验收 ===\n')
 
@@ -85,6 +107,38 @@ async function main() {
   if (!fs.existsSync(exe)) {
     console.log(`  SKIP  灵犀可执行文件不存在: ${exe}`)
   } else {
+    // 端口隔离：若 6789 已被本机真实灵犀实例占用（开发时常见），
+    // 改用一个空闲端口，避免把"端口预检生效"误判成"启动失败"。
+    const conflict = await checkPortInUse(lingxi.port)
+    if (conflict) {
+      const freePort = await findFreePort()
+      console.log(`  INFO  端口 ${lingxi.port} 已被占用（本机真实实例），改用 ${freePort} 做隔离测试`)
+      // 灵犀只认 --config：复制一份指向 workDir 的配置并改端口，
+      // auths / data 用绝对路径指向真实目录的绝对位置，但测试实例应为空账号。
+      const srcCfg = path.join(lingxi.workDir, 'config.json')
+      const isoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lingxi-iso-'))
+      let cfg = {}
+      if (fs.existsSync(srcCfg)) cfg = JSON.parse(fs.readFileSync(srcCfg, 'utf8'))
+      cfg.listen = `:${freePort}`
+      cfg.auth_dir = path.join(isoDir, 'auths')       // 空目录 → 0 账号，不碰真实号池
+      cfg.state_file = path.join(isoDir, 'state.json')
+      if (cfg.logging) cfg.logging.request_archive_enabled = false
+      const cfgPath = path.join(isoDir, 'config.json')
+      fs.mkdirSync(cfg.auth_dir, { recursive: true })
+      fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2))
+      lingxi.port = freePort
+      lingxi.health.url = `http://127.0.0.1:${freePort}/healthz`
+      lingxi.run.args = ['--config', cfgPath]
+      lingxi._isoDir = isoDir
+      // PlatformManager 持有自己的 runtime 副本（cfg 来自启动时读取的 platforms.json），
+      // 必须同步修改它，否则端口预检仍会检查旧端口。
+      const rt = manager.getRuntime('lingxi')
+      if (rt && rt.cfg) {
+        rt.cfg.port = freePort
+        rt.cfg.health = { ...(rt.cfg.health || {}), url: `http://127.0.0.1:${freePort}/healthz` }
+        rt.cfg.run = { ...(rt.cfg.run || {}), args: ['--config', cfgPath] }
+      }
+    }
     let started = null
     try {
       started = await manager.start('lingxi')
@@ -101,11 +155,11 @@ async function main() {
 
       // 真实 HTTP 探测：能连上即证明进程在跑
       await sleep(500)
-      const h = await getJson('http://127.0.0.1:6789/healthz')
+      const h = await getJson(`http://127.0.0.1:${lingxi.port}/healthz`)
       ok('真实健康端点可达（200 或 503）', h.status === 200 || h.status === 503, `status=${h.status}`)
       ok('健康响应含 service=lingxi2api', h.json && h.json.service === 'lingxi2api')
 
-      const m = await getJson('http://127.0.0.1:6789/v1/models', { Authorization: `Bearer ${lingxi.apiKey || 'test_key'}` })
+      const m = await getJson(`http://127.0.0.1:${lingxi.port}/v1/models`, { Authorization: `Bearer ${lingxi.apiKey || 'test_key'}` })
       ok('/v1/models 可访问', m.status === 200 || m.status === 401, `status=${m.status}`)
 
       // 日志收集
@@ -118,7 +172,7 @@ async function main() {
       const stopped = await manager.stop('lingxi')
       ok('stop 后状态为 stopped', stopped.status === 'stopped', `实际 ${stopped.status}`)
       await sleep(800)
-      const after = await getJson('http://127.0.0.1:6789/healthz')
+      const after = await getJson(`http://127.0.0.1:${lingxi.port}/healthz`)
       ok('停止后端口不再响应', after.status === 0, `status=${after.status}`)
     }
   }
@@ -153,6 +207,9 @@ async function main() {
   console.log('\n[清理]')
   await manager.stopAll().catch(() => {})
   await sleep(500)
+  try {
+    if (byId.lingxi && byId.lingxi._isoDir) fs.rmSync(byId.lingxi._isoDir, { recursive: true, force: true })
+  } catch { /* 隔离目录清理失败可忽略 */ }
   try {
     fs.rmSync(dataDir, { recursive: true, force: true })
     console.log('  临时目录已清理')

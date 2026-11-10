@@ -3,11 +3,11 @@
   "version": "0.1.0",
   "description": "Replaces the client's system prompt with the gateway's own, so upstreams that block client template sentences by exact match stop rejecting valid traffic",
   "type": "module",
-  "files": ["prompt-guard.middleware.js", "default-prompt.md", "README.md"],
+  "files": ["prompt-guard.middleware.js", "default-prompt.mjs", "README.md"],
   "keywords": ["magpie", "magpie-middleware", "prompt", "system-prompt", "llm-gateway"],
   "license": "MIT",
   "magpie": {
     "middleware": "./prompt-guard.middleware.js",
-    "options": { "mode": "custom", "prompt": "", "promptFile": "", "targets": ["system", "developer"] }
+    "options": { "mode": "custom", "prompt": "", "targets": ["system", "developer"] }
   }
 }

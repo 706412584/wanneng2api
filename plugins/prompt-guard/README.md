@@ -40,14 +40,15 @@ Claude Code / Codex CLI 在 system prompt 注入固定模板。部分上游按�
 {
   "mode": "custom",
   "prompt": "",
-  "promptFile": "",
   "targets": ["system", "developer"]
 }
 ```
 
-- `prompt` 非空 → 用它
-- `promptFile` 非空 → 读该文件（读不到时退回内置）
-- 都为空的 `custom` 模式 → 用包内 `default-prompt.md`
+- `prompt` 非空 → 用它（推荐：`magpie plugin options prompt-guard '{"prompt":"..."}'` 随时改，无需重装）
+- 为空的 `custom` 模式 → 用包内 `default-prompt.mjs` 编译进去的默认提示词
+
+> **为什么没有 `promptFile`**：magpie 的 middleware 沙箱只允许 import 同目录文件，
+> 不能用 `node:fs` 读任意路径。内置提示词因此编译成 `default-prompt.mjs`。
 
 ## 失败行为
 

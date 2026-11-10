@@ -16,38 +16,21 @@
 //   mode=passthrough → 不动 system，只留指纹脱敏给另一个 middleware
 //   mode=remove    → 直接删除 system 段（不插入替代提示词）
 
-import { readFileSync } from "node:fs"
-import { fileURLToPath } from "node:url"
-import { dirname, join } from "node:path"
-
-const HERE = dirname(fileURLToPath(import.meta.url))
+// magpie 的 middleware 只能 import 同目录文件，不能用 node:fs / node:path。
+// 因此内置提示词编译成同目录的 ES 模块，文件内容由 options.prompt 直接传入。
+import { DEFAULT_PROMPT } from "./default-prompt.mjs"
 
 // 降级提示词：误报处理用，刻意极简中性。
 const DEGRADED =
   "You are a helpful assistant. Respond in the user's language, follow the user's instructions, and be direct and concise."
 
-let builtinPrompt = null
-function builtin() {
-  if (builtinPrompt === null) {
-    try {
-      builtinPrompt = readFileSync(join(HERE, "default-prompt.md"), "utf8").trim()
-    } catch {
-      builtinPrompt = DEGRADED
-    }
-  }
-  return builtinPrompt
-}
-
 function resolvePrompt(o) {
+  // 1. options 里直接给文本（推荐：可随时改，无需重装插件）
   if (typeof o.prompt === "string" && o.prompt.trim()) return o.prompt
-  if (typeof o.promptFile === "string" && o.promptFile.trim()) {
-    try {
-      return readFileSync(o.promptFile, "utf8").trim()
-    } catch {
-      // 配置的文件读不到 → 退回内置，不因配置错误阻塞所有请求
-    }
-  }
-  return builtin()
+  // 2. 内置提示词
+  if (typeof DEFAULT_PROMPT === "string" && DEFAULT_PROMPT.trim()) return DEFAULT_PROMPT
+  // 3. 兜底
+  return DEGRADED
 }
 
 // ── 各协议的 system 位置 ──────────────────────────────────────────────
