@@ -34,3 +34,6 @@ Thumbs.db
 # magpie CLI 二进制（78MB，本地测试用）
 /tools/magpie/*.exe
 /tools/magpie/*.log
+
+# magpie 自更新临时文件（79MB 二进制，不入库）
+/tools/magpie/.magpie-update/
