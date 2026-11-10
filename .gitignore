@@ -27,3 +27,6 @@ shell/platforms.json
 Thumbs.db
 .DS_Store
 .playwright-mcp/
+
+# 上游克隆（本地参考，不入库）
+/upstream/

@@ -1,0 +1,13 @@
+{
+  "name": "@wanneng2api/middleware-fingerprint-sanitize",
+  "version": "0.1.0",
+  "description": "Strips the client template sentences that some upstreams block by literal exact match, leaving semantics unchanged",
+  "type": "module",
+  "files": ["fingerprint-sanitize.middleware.js", "README.md"],
+  "keywords": ["magpie", "magpie-middleware", "sanitize", "fingerprint", "llm-gateway"],
+  "license": "MIT",
+  "magpie": {
+    "middleware": "./fingerprint-sanitize.middleware.js",
+    "options": { "enabled": true, "custom": [] }
+  }
+}
