@@ -140,6 +140,15 @@ export const api = {
   magpieVersion: () => request('/api/magpie/version'),
   // 直接执行 magpie update（下载并替换内核）
   magpieUpdate: () => request('/api/magpie/update', { method: 'POST', timeout: 30000 }),
+  // magpie 支持的完整 provider 目录（含未安装）
+  magpiePresets: (refresh) => request(`/api/magpie/presets${refresh ? '?refresh=1' : ''}`, { timeout: 30000 }),
+  // 社区插件市场（Trae / Qoder / WorkBuddy / Loomy / CodeArts …）
+  magpiePlugins: (refresh) => request(`/api/magpie/plugins${refresh ? '?refresh=1' : ''}`, { timeout: 30000 }),
+  magpieAddPlugin: (pkg) => request('/api/magpie/plugins/add', { method: 'POST', body: { package: pkg }, timeout: 300000 }),
+  magpieRemovePlugin: (pkg) => request('/api/magpie/plugins/remove', { method: 'POST', body: { package: pkg }, timeout: 60000 }),
+  // 安装 / 移除 provider（走 magpie CLI）
+  magpieAddProvider: (id, key, args) => request('/api/magpie/providers/add', { method: 'POST', body: { id, key, args }, timeout: 180000 }),
+  magpieRemoveProvider: (id) => request('/api/magpie/providers/remove', { method: 'POST', body: { id }, timeout: 60000 }),
 
   getSettings: () => request('/api/settings'),
   putSettings: (settings) => request('/api/settings', { method: 'PUT', body: settings })

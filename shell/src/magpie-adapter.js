@@ -17,6 +17,54 @@ const { execFile } = require('child_process');
 
 const MAGPIE_RELEASES_REPO = 'yetone/magpie-releases';
 
+/** 中文名与说明：magpie 的 preset 只有英文名，这里补上中文对照 */
+const PRESET_ZH = {
+  anthropic: ['Anthropic', 'Claude 官方 API'],
+  openai: ['OpenAI', 'GPT 官方 API'],
+  google: ['Google Gemini', 'Gemini 官方 API'],
+  'google-vertex': ['Google Vertex AI', 'GCP 上的 Gemini/Claude'],
+  deepseek: ['DeepSeek', '深度求索官方 API'],
+  xai: ['xAI', 'Grok 官方 API'],
+  moonshot: ['Kimi', '月之暗面国际版'],
+  'moonshot-cn': ['Kimi（国内）', '月之暗面国内版'],
+  'kimi-code': ['Kimi Code', 'Kimi 编程订阅'],
+  'kimi-code-cn': ['Kimi Code（国内）', 'Kimi 编程订阅国内版'],
+  zhipu: ['智谱 GLM', 'GLM 官方 API'],
+  zai: ['Z.ai', '智谱国际站'],
+  minimax: ['MiniMax', 'MiniMax 国际版'],
+  'minimax-cn': ['MiniMax（国内）', 'MiniMax 国内版'],
+  stepfun: ['阶跃星辰', 'Step 系列'],
+  'stepfun-cn': ['阶跃星辰（国内）', ''],
+  xiaomi: ['小米 MiMo', 'MiMo 模型'],
+  longcat: ['LongCat', '美团 LongCat'],
+  'baidu-qianfan': ['百度千帆', '文心一言'],
+  'tencent-cloud': ['腾讯云', '混元等'],
+  huaweicloud: ['华为云 MaaS', '盘古等'],
+  volcengine: ['火山方舟', '豆包'],
+  qwen: ['通义千问', 'Qwen 国际版'],
+  'qwen-cn': ['通义千问（国内）', ''],
+  openrouter: ['OpenRouter', '聚合中转，一个 key 用多家'],
+  vercel: ['Vercel AI Gateway', '聚合中转'],
+  siliconflow: ['硅基流动', '国内聚合中转'],
+  together: ['Together AI', '开源模型托管'],
+  fireworks: ['Fireworks', '开源模型托管'],
+  groq: ['Groq', '超快推理'],
+  mistral: ['Mistral', 'Mistral 官方'],
+  voyage: ['Voyage AI', '向量模型'],
+  bedrock: ['Amazon Bedrock', 'AWS 模型托管'],
+  azure: ['Azure OpenAI', '微软云 OpenAI'],
+  ollama: ['Ollama（本地）', '本机模型，无需 key'],
+  lmstudio: ['LM Studio（本地）', '本机模型，无需 key'],
+  omlx: ['oMLX（本地）', 'Apple 芯片本地推理'],
+  'mlx-serve': ['MLX-Serve（本地）', ''],
+  'remote-magpie': ['远程 magpie', '用另一台电脑上的 magpie'],
+  modelscope: ['魔搭 ModelScope', '阿里模型社区'],
+  nvidia: ['NVIDIA NIM', ''],
+  aihubmix: ['AiHubMix', '聚合中转'],
+  'opencode-zen': ['OpenCode Zen', ''],
+  kilo: ['Kilo Gateway', ''],
+}
+
 /** magpie 的配置目录：Windows 下 ~/.config/magpie 优先，其次 LOCALAPPDATA/APPDATA */
 function magpieConfigDir() {
   const home = os.homedir();
@@ -247,6 +295,216 @@ function listGroups() {
   return out;
 }
 
+// ── 社区插件目录（magpie Plugins › Discover） ────────────────────────
+// magpie 的 CLI 没有 discover 命令，这个页面读的是社区插件仓库的 registry.json：
+//   https://raw.githubusercontent.com/magpie-community/plugins/main/registry.json
+// 每条给出 package / name / icon / providers / kind / summary(zh,en) / replaces。
+
+const PLUGIN_REGISTRY_URL =
+  'https://raw.githubusercontent.com/magpie-community/plugins/main/registry.json';
+const PLUGIN_REGISTRY_CACHE_MS = 6 * 3600 * 1000;
+
+let registryCache = null;
+
+function fetchJson(url, { timeoutMs = 15000 } = {}) {
+  return new Promise((resolve) => {
+    const mod = url.startsWith('https:') ? require('https') : require('http');
+    const req = mod.get(url, { headers: { 'User-Agent': 'wanneng2api-manager' }, timeout: timeoutMs }, (res) => {
+      let data = '';
+      res.on('data', (c) => (data += c));
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+  });
+}
+
+/** 本地克隆的 registry 作为离线兜底（开发机上常有） */
+function localRegistryPath() {
+  const cands = [
+    path.resolve(__dirname, '..', '..', 'upstream', 'magpie-plugins', 'registry.json'),
+    path.resolve(__dirname, '..', '..', 'magpie-plugins', 'registry.json'),
+    'D:/app/magpie-plugins/registry.json',
+  ];
+  for (const c of cands) {
+    if (fs.existsSync(c)) return c;
+  }
+  return null;
+}
+
+async function listPluginCatalog({ force = false } = {}) {
+  if (!force && registryCache && Date.now() - registryCache.at < PLUGIN_REGISTRY_CACHE_MS) {
+    return registryCache.data;
+  }
+  let reg = await fetchJson(PLUGIN_REGISTRY_URL);
+  let source = 'remote';
+  if (!reg) {
+    const local = localRegistryPath();
+    if (local) {
+      reg = readJson(local, null);
+      source = 'local';
+    }
+  }
+  if (!reg || !Array.isArray(reg.plugins)) return { plugins: [], source: 'none' };
+
+  // 已安装插件（按 package spec 匹配，含 @latest 后缀差异）
+  const installedSpecs = (readJson(path.join(magpieConfigDir(), 'plugins.json'), { plugins: [] }).plugins || [])
+    .map((p) => String(p.spec || '').replace(/@latest$/, ''));
+
+  const plugins = reg.plugins.map((p) => {
+    const pkg = String(p.package || '');
+    const basePkg = pkg.replace(/@latest$/, '');
+    return {
+      package: pkg,
+      name: p.name || pkg,
+      icon: p.icon || '',
+      kind: p.kind || 'provider',
+      providers: Array.isArray(p.providers) ? p.providers : [],
+      community: p.community !== false,
+      replaces: p.replaces || '',
+      summary: p.summary || {},
+      installed: installedSpecs.some((s) => s === basePkg || s === pkg),
+    };
+  });
+
+  const data = { plugins, source, fetchedAt: Date.now(), total: plugins.length };
+  registryCache = { at: Date.now(), data };
+  return data;
+}
+
+/** 安装社区插件：magpie plugin add <package> */
+function addPlugin(binaryPath, pkg, { timeoutMs = 300000 } = {}) {
+  return new Promise((resolve) => {
+    if (!binaryPath) return resolve({ ok: false, stdout: '', stderr: '未找到 magpie 可执行文件' });
+    if (!/^@?[\w.-]+\/[\w.-]+(@[\w.-]+)?$|^@?[\w.-]+$/.test(String(pkg || ''))) {
+      return resolve({ ok: false, stdout: '', stderr: `非法包名: ${pkg}` });
+    }
+    execFile(binaryPath, ['plugin', 'add', pkg], { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
+      resolve({
+        ok: !err,
+        stdout: String(stdout || '').trim(),
+        stderr: String(stderr || '').trim() || (err && err.message) || '',
+      });
+    });
+  });
+}
+
+function removePlugin(binaryPath, specOrName, { timeoutMs = 60000 } = {}) {
+  return new Promise((resolve) => {
+    if (!binaryPath) return resolve({ ok: false, stdout: '', stderr: '未找到 magpie 可执行文件' });
+    execFile(binaryPath, ['plugin', 'rm', specOrName], { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
+      resolve({ ok: !err, stdout: String(stdout || '').trim(), stderr: String(stderr || '').trim() || (err && err.message) || '' });
+    });
+  });
+}
+
+// ── 预置 provider 目录（magpie presets） ──────────────────────────────
+// magpie presets 只有文本输出，形状是：
+//   分组标题              （两空格缩进，无其余内容）
+//   显示名 <空格> id <空格> magpie provider add <id> [<key> ...]
+// 分组：partners (sponsors) / vendors / relays / local / another computer's magpie
+
+const GROUP_ZH = {
+  'partners (sponsors)': '赞助商',
+  vendors: '厂商直连',
+  relays: '聚合中转',
+  local: '本地模型',
+  "another computer's magpie": '远程 magpie',
+};
+
+function parsePresets(text) {
+  const out = [];
+  let group = '';
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const line = raw.replace(/\s+$/, '');
+    if (!line.trim()) continue;
+    if (/^\s{2}\S/.test(raw) && !/magpie provider add/.test(line)) {
+      const g = line.trim();
+      group = GROUP_ZH[g] || g;
+      continue;
+    }
+    // "Name    id    magpie provider add id <key> [k=v ...]"
+    const m = /^\s{2}(.+?)\s{2,}(\S+)\s{2,}(magpie provider add\s+(.*))$/.exec(line);
+    if (!m) continue;
+    const [, name, id, , argsStr] = m;
+    const zh = PRESET_ZH[id];
+    // 安装后告诉用户要填什么：<key> 表示需要 API Key；project=xx 等是具名参数
+    const needsKey = /<key>/.test(argsStr);
+    const params = [...argsStr.matchAll(/([a-zA-Z][\w-]*)=<[^>]+>/g)].map((x) => x[1]);
+    out.push({
+      id,
+      name: zh ? zh[0] : name.trim(),
+      originalName: name.trim(),
+      group,
+      description: zh ? zh[1] : '',
+      needsKey,
+      params,
+      command: `magpie provider add ${argsStr.replace(/^add\s+/, '')}`,
+    });
+  }
+  return out;
+}
+
+let presetsCache = null;
+
+function listPresets(binaryPath, { force = false, timeoutMs = 20000 } = {}) {
+  if (!force && presetsCache && Date.now() - presetsCache.at < 300000) {
+    return Promise.resolve(presetsCache.list);
+  }
+  return new Promise((resolve) => {
+    if (!binaryPath || !fs.existsSync(binaryPath)) return resolve([]);
+    execFile(binaryPath, ['presets'], { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
+      if (err) return resolve([]);
+      const list = parsePresets(`${stdout || ''}${stderr || ''}`);
+      presetsCache = { at: Date.now(), list };
+      resolve(list);
+    });
+  });
+}
+
+/**
+ * 安装一个预置 provider。
+ * @param {string} binaryPath magpie 可执行文件
+ * @param {{id:string, key?:string, args?:string[]}} opts
+ * @returns {Promise<{ok:boolean, stdout:string, stderr:string}>}
+ */
+function addProvider(binaryPath, { id, key, args = [] }, { timeoutMs = 180000 } = {}) {
+  return new Promise((resolve) => {
+    if (!binaryPath) return resolve({ ok: false, stdout: '', stderr: '未找到 magpie 可执行文件' });
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(String(id || ''))) {
+      return resolve({ ok: false, stdout: '', stderr: `非法 provider id: ${id}` });
+    }
+    const argv = ['provider', 'add', id];
+    if (key) argv.push(key);
+    for (const a of args) argv.push(String(a));
+    execFile(binaryPath, argv, { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
+      // 安装后 presets 缓存不必失效（目录没变），但 provider 列表要重读
+      resolve({
+        ok: !err,
+        stdout: String(stdout || '').trim(),
+        stderr: String(stderr || '').trim() || (err && err.message) || '',
+      });
+    });
+  });
+}
+
+function removeProvider(binaryPath, id, { timeoutMs = 60000 } = {}) {
+  return new Promise((resolve) => {
+    if (!binaryPath || !/^[a-z0-9][a-z0-9-]*$/.test(String(id || ''))) {
+      return resolve({ ok: false, stdout: '', stderr: '非法 provider id' });
+    }
+    execFile(binaryPath, ['provider', 'rm', id], { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
+      resolve({ ok: !err, stdout: String(stdout || '').trim(), stderr: String(stderr || '').trim() || (err && err.message) || '' });
+    });
+  });
+}
+
 // ── 内核自更新 ────────────────────────────────────────────────────────
 // magpie 自带 `magpie update`：下载最新 release 并原位替换可执行文件，
 // 成功后需要重启 magpie 网关进程才生效。这里只负责把命令跑起来并记录状态。
@@ -295,6 +553,14 @@ module.exports = {
   listProviders,
   listGroups,
   checkViaCli,
+  listPluginCatalog,
+  addPlugin,
+  removePlugin,
+  PLUGIN_REGISTRY_URL,
+  listPresets,
+  parsePresets,
+  addProvider,
+  removeProvider,
   detectVersion,
   latestRelease,
   semverGt,

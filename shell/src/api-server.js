@@ -223,6 +223,76 @@ class ApiServer {
       };
     }
 
+    // GET /api/magpie/plugins —— 社区插件商城目录（Trae / Qoder / WorkBuddy / Loomy …）
+    if (method === 'GET' && parts[1] === 'magpie' && parts[2] === 'plugins') {
+      const magpie = require('./magpie-adapter');
+      const force = u.searchParams.get('refresh') === '1';
+      const data = await magpie.listPluginCatalog({ force });
+      const kinds = {};
+      for (const p of data.plugins) kinds[p.kind] = (kinds[p.kind] || 0) + 1;
+      return { ...data, kinds };
+    }
+
+    // POST /api/magpie/plugins/add —— magpie plugin add <package>
+    if (method === 'POST' && parts[1] === 'magpie' && parts[2] === 'plugins' && parts[3] === 'add') {
+      const magpie = require('./magpie-adapter');
+      const bin = this._magpieBinary();
+      const pkg = body && body.package;
+      if (!pkg) throw new Error('缺少 package');
+      const r = await magpie.addPlugin(bin, pkg);
+      return { ok: r.ok, package: pkg, stdout: r.stdout, stderr: r.stderr, __code: r.ok ? 200 : 400 };
+    }
+
+    // POST /api/magpie/plugins/remove
+    if (method === 'POST' && parts[1] === 'magpie' && parts[2] === 'plugins' && parts[3] === 'remove') {
+      const magpie = require('./magpie-adapter');
+      const bin = this._magpieBinary();
+      const target = body && (body.spec || body.package || body.name);
+      if (!target) throw new Error('缺少插件标识');
+      const r = await magpie.removePlugin(bin, target);
+      return { ok: r.ok, removed: target, stdout: r.stdout, stderr: r.stderr, __code: r.ok ? 200 : 400 };
+    }
+
+    // GET /api/magpie/presets —— magpie 支持的完整 provider 目录（含未安装的）
+    if (method === 'GET' && parts[1] === 'magpie' && parts[2] === 'presets') {
+      const magpie = require('./magpie-adapter');
+      const bin = this._magpieBinary();
+      const force = u.searchParams.get('refresh') === '1';
+      const presets = await magpie.listPresets(bin, { force });
+      // 已安装 = 出现在 providers.json 或 plugin-providers.json 或内置订阅里
+      const installed = new Set(magpie.listProviders().map((p) => p.id));
+      return {
+        presets: presets.map((p) => ({ ...p, installed: installed.has(p.id) })),
+        groups: [...new Set(presets.map((p) => p.group))],
+        binary: bin,
+      };
+    }
+
+    // POST /api/magpie/providers/add —— 用 magpie CLI 安装一个 provider
+    if (method === 'POST' && parts[1] === 'magpie' && parts[2] === 'providers' && parts[3] === 'add') {
+      const magpie = require('./magpie-adapter');
+      const bin = this._magpieBinary();
+      if (!bin) throw new Error('未找到 magpie 可执行文件');
+      const { id, key, args } = body || {};
+      if (!id) throw new Error('缺少 provider id');
+      const r = await magpie.addProvider(bin, {
+        id,
+        key: typeof key === 'string' ? key.trim() : '',
+        args: Array.isArray(args) ? args : [],
+      });
+      return { ok: r.ok, id, stdout: r.stdout, stderr: r.stderr, __code: r.ok ? 200 : 400 };
+    }
+
+    // POST /api/magpie/providers/remove —— 移除一个 provider
+    if (method === 'POST' && parts[1] === 'magpie' && parts[2] === 'providers' && parts[3] === 'remove') {
+      const magpie = require('./magpie-adapter');
+      const bin = this._magpieBinary();
+      const id = body && body.id;
+      if (!id) throw new Error('缺少 provider id');
+      const r = await magpie.removeProvider(bin, id);
+      return { ok: r.ok, id, stdout: r.stdout, stderr: r.stderr, __code: r.ok ? 200 : 400 };
+    }
+
     // GET /api/magpie/version —— 内核版本与最新 release 对比
     if (method === 'GET' && parts[1] === 'magpie' && parts[2] === 'version') {
       const magpie = require('./magpie-adapter');
