@@ -291,6 +291,39 @@ class ApiServer {
       return { ok: r.ok, provider, stdout: r.stdout, stderr: r.stderr, __code: r.ok ? 200 : 400 };
     }
 
+    // ── magpie 网关自身的可观测数据（无需鉴权，直连 127.0.0.1:3425）──
+    // GET /api/magpie/gateway?what=quotas|usage|requests|mcp|statusline|trace
+    if (method === 'GET' && parts[1] === 'magpie' && parts[2] === 'gateway') {
+      const what = u.searchParams.get('what') || 'overview';
+      const period = u.searchParams.get('period') || '7d';
+      const limit = Math.min(200, Number(u.searchParams.get('limit')) || 50);
+      const base = 'http://127.0.0.1:3425';
+      const paths = {
+        overview: '/',
+        quotas: '/v1/magpie/quotas',
+        usage: `/v1/magpie/usage?period=${encodeURIComponent(period)}`,
+        requests: `/v1/magpie/usage/requests?period=${encodeURIComponent(period)}&limit=${limit}`,
+        mcp: '/v1/magpie/mcp',
+        trace: '/v1/magpie/trace',
+        statusline: '/v1/magpie/statusline',
+      };
+      const path = paths[what];
+      if (!path) throw new Error(`未知的 magpie 数据源: ${what}`);
+      return await new Promise((resolve, reject) => {
+        const req = require('http').get(base + path, { timeout: 12000 }, (res) => {
+          let data = '';
+          res.on('data', (c) => (data += c));
+          res.on('end', () => {
+            if (/text\/plain/.test(res.headers['content-type'] || '')) return resolve({ text: data });
+            try { resolve(JSON.parse(data)); }
+            catch { resolve({ raw: data.slice(0, 2000) }); }
+          });
+        });
+        req.on('error', (e) => reject(new Error(`连接 magpie 网关失败: ${e.message}`)));
+        req.on('timeout', () => { req.destroy(); reject(new Error('magpie 网关响应超时')); });
+      });
+    }
+
     // GET /api/magpie/presets —— magpie 支持的完整 provider 目录（含未安装的）
     if (method === 'GET' && parts[1] === 'magpie' && parts[2] === 'presets') {
       const magpie = require('./magpie-adapter');

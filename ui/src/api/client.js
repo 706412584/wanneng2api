@@ -151,6 +151,11 @@ export const api = {
   magpieLogin: (provider, method) => request('/api/magpie/login', { method: 'POST', body: { provider, method }, timeout: 60000 }),
   magpieLoginStatus: (provider) => request(`/api/magpie/login/status?provider=${encodeURIComponent(provider)}`),
   magpieLogout: (provider) => request('/api/magpie/logout', { method: 'POST', body: { provider }, timeout: 60000 }),
+  // magpie 网关自身可观测数据：overview|quotas|usage|requests|mcp|trace|statusline
+  magpieGateway: (what, opts = {}) => {
+    const qs = new URLSearchParams({ what, ...opts }).toString()
+    return request(`/api/magpie/gateway?${qs}`, { timeout: 15000 })
+  },
   // 安装 / 移除 provider（走 magpie CLI）
   magpieAddProvider: (id, key, args) => request('/api/magpie/providers/add', { method: 'POST', body: { id, key, args }, timeout: 180000 }),
   magpieRemoveProvider: (id) => request('/api/magpie/providers/remove', { method: 'POST', body: { id }, timeout: 60000 }),

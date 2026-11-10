@@ -470,6 +470,52 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
   max-width: 55%;
 }
 
+/* ===== 调用趋势柱状图 ===== */
+.bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 140px;
+  padding: 8px 2px 0;
+  overflow-x: auto;
+}
+.bar-col {
+  flex: 1 0 22px;
+  min-width: 22px;
+  max-width: 56px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 4px;
+}
+.bar-fill {
+  width: 100%;
+  background: var(--primary);
+  border-radius: 4px 4px 2px 2px;
+  transition: height 0.2s;
+  min-height: 2px;
+}
+.bar-label {
+  font-size: 10px;
+  color: var(--text-3);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ===== 接口标签 ===== */
+.api-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: var(--bg-soft);
+  color: var(--text-2);
+  border: 1px solid var(--border);
+}
+
 /* ===== 折叠区块 ===== */
 .collapse-head {
   width: 100%;
