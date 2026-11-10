@@ -146,6 +146,11 @@ export const api = {
   magpiePlugins: (refresh) => request(`/api/magpie/plugins${refresh ? '?refresh=1' : ''}`, { timeout: 30000 }),
   magpieAddPlugin: (pkg) => request('/api/magpie/plugins/add', { method: 'POST', body: { package: pkg }, timeout: 300000 }),
   magpieRemovePlugin: (pkg) => request('/api/magpie/plugins/remove', { method: 'POST', body: { package: pkg }, timeout: 60000 }),
+  // 插件登录（OAuth 设备码）：探方式 → 启动 → 轮询状态
+  magpieLoginMethods: (provider) => request(`/api/magpie/login/methods?provider=${encodeURIComponent(provider)}`, { timeout: 30000 }),
+  magpieLogin: (provider, method) => request('/api/magpie/login', { method: 'POST', body: { provider, method }, timeout: 60000 }),
+  magpieLoginStatus: (provider) => request(`/api/magpie/login/status?provider=${encodeURIComponent(provider)}`),
+  magpieLogout: (provider) => request('/api/magpie/logout', { method: 'POST', body: { provider }, timeout: 60000 }),
   // 安装 / 移除 provider（走 magpie CLI）
   magpieAddProvider: (id, key, args) => request('/api/magpie/providers/add', { method: 'POST', body: { id, key, args }, timeout: 180000 }),
   magpieRemoveProvider: (id) => request('/api/magpie/providers/remove', { method: 'POST', body: { id }, timeout: 60000 }),

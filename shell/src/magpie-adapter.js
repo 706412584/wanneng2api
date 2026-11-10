@@ -357,19 +357,31 @@ async function listPluginCatalog({ force = false } = {}) {
   const installedSpecs = (readJson(path.join(magpieConfigDir(), 'plugins.json'), { plugins: [] }).plugins || [])
     .map((p) => String(p.spec || '').replace(/@latest$/, ''));
 
+  // 已登录的插件账号：logins.json 里 agent 形如 "plugin:kiro"
+  const signedInProviders = new Set(
+    (readJson(path.join(magpieConfigDir(), 'logins.json'), []) || [])
+      .map((l) => String(l.agent || ''))
+      .filter((a) => a.startsWith('plugin:'))
+      .map((a) => a.slice('plugin:'.length))
+  );
+
   const plugins = reg.plugins.map((p) => {
     const pkg = String(p.package || '');
     const basePkg = pkg.replace(/@latest$/, '');
+    const providers = Array.isArray(p.providers) ? p.providers : [];
+    const signed = providers.filter((x) => signedInProviders.has(x));
     return {
       package: pkg,
       name: p.name || pkg,
       icon: p.icon || '',
       kind: p.kind || 'provider',
-      providers: Array.isArray(p.providers) ? p.providers : [],
+      providers,
       community: p.community !== false,
       replaces: p.replaces || '',
       summary: p.summary || {},
       installed: installedSpecs.some((s) => s === basePkg || s === pkg),
+      signedIn: signed.length > 0,
+      signedProviders: signed,
     };
   });
 
@@ -505,6 +517,150 @@ function removeProvider(binaryPath, id, { timeoutMs = 60000 } = {}) {
   });
 }
 
+// ── 插件登录（OAuth / 设备码 / 短信等） ────────────────────────────────
+// `magpie plugin login <provider> [<method>]` 是交互式的：不给 method 时会列出
+// 选项并等 stdin。给了 method 编号就走设备码流程，先打印一个浏览器授权链接，
+// 然后阻塞等待用户在浏览器里完成授权。
+//
+// 可视化做法：后台起进程、捕获链接、把链接交给前端打开；进程继续跑，
+// 结束（成功/失败/超时）后把结果记进 loginState 供轮询。
+
+const loginStates = new Map();   // provider -> { status, url, message, startedAt, finishedAt }
+
+function loginState(provider) {
+  return loginStates.get(provider) || null;
+}
+
+function listLoginStates() {
+  return Object.fromEntries(loginStates);
+}
+
+/** 解析 `magpie plugin login <p>` 不带 method 时的选项列表 */
+function probeLoginMethods(binaryPath, provider, { timeoutMs = 20000 } = {}) {
+  return new Promise((resolve) => {
+    if (!binaryPath) return resolve({ methods: [], error: '未找到 magpie 可执行文件' });
+    const child = execFile(binaryPath, ['plugin', 'login', provider], { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
+      const text = `${stdout || ''}${stderr || ''}`;
+      // 形如：\nHow do you sign in to Qoder?\n  1. Sign in with Qoder\n  2. Sign in with Qoder PAT\n>
+      const methods = [...text.matchAll(/^\s*(\d+)\.\s*(.+)$/gm)].map((m) => ({
+        index: Number(m[1]),
+        label: m[2].trim(),
+      }));
+      if (methods.length) resolve({ methods });
+      else resolve({ methods: [], error: text.trim().slice(0, 300) || (err && err.message) || '' });
+    });
+    // 这只是探测，拿到选项就结束
+    child.on('exit', () => {});
+  });
+}
+
+/**
+ * 启动登录流程。
+ * @returns {Promise<{started:boolean, url?:string, message?:string}>}
+ */
+function startLogin(binaryPath, provider, method, { urlTimeoutMs = 45000 } = {}) {
+  return new Promise((resolve) => {
+    if (!binaryPath) return resolve({ started: false, message: '未找到 magpie 可执行文件' });
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(String(provider || ''))) {
+      return resolve({ started: false, message: `非法 provider: ${provider}` });
+    }
+
+    const argv = ['plugin', 'login', provider];
+    if (method !== undefined && method !== null && method !== '') argv.push(String(method));
+
+    const child = require('child_process').spawn(binaryPath, argv, {
+      cwd: path.dirname(binaryPath),
+      env: { ...process.env },
+      windowsHide: true,
+    });
+
+    const state = {
+      status: 'pending',
+      url: '',
+      message: '',
+      method: method || null,
+      startedAt: Date.now(),
+      finishedAt: null,
+    };
+    loginStates.set(provider, state);
+
+    let buf = '';
+    let settledUrl = false;
+
+    const onData = (chunk) => {
+      buf += String(chunk);
+      if (!settledUrl) {
+        // 设备码链接：https://...（同一行常有 "If it didn't open, go to:"）
+        const m = /(https?:\/\/\S+)/.exec(buf);
+        if (m) {
+          settledUrl = true;
+          state.url = m[1].replace(/[),.]+$/, '');
+          state.status = 'awaiting-browser';
+          resolve({ started: true, url: state.url, message: '请在浏览器完成授权' });
+        }
+        // 也可能直接给到 "code: XXXXX"
+        const code = /enter (?:this )?code[:\s]+([A-Z0-9-]{4,})/i.exec(buf);
+        if (code && !state.url) {
+          settledUrl = true;
+          state.code = code[1];
+          state.status = 'awaiting-code';
+          resolve({ started: true, message: `设备码：${code[1]}` });
+        }
+      }
+      state.output = (state.output || '') + String(chunk);
+      if (state.output.length > 8000) state.output = state.output.slice(-8000);
+    };
+    child.stdout.on('data', onData);
+    child.stderr.on('data', onData);
+
+    child.on('exit', (code) => {
+      state.finishedAt = Date.now();
+      if (!settledUrl && !state.url && !state.code) {
+        // 没拿到链接就退出了：把对话输出交给用户自己处理
+        state.status = 'interactive';
+        state.message = '该 provider 需要交互式登录（输入验证码等），请用命令行完成';
+        resolve({ started: false, interactive: true, message: state.message, output: state.output });
+        return;
+      }
+      const ok = code === 0;
+      state.status = ok ? 'signed-in' : 'failed';
+      state.message = ok ? '登录成功' : `登录未完成（exit ${code}）`;
+      if (!settledUrl) resolve({ started: true, message: state.message });
+    });
+
+    // 拿到链接才算启动成功；超时也算"已在后台等待"
+    setTimeout(() => {
+      if (!settledUrl) {
+        resolve({
+          started: true,
+          message: '登录进程已启动，暂未拿到授权链接',
+          note: '如长时间无响应，用命令行执行 magpie plugin login',
+        });
+      }
+    }, urlTimeoutMs);
+  });
+}
+
+function cancelLogin(provider) {
+  const st = loginStates.get(provider);
+  if (st) {
+    st.status = 'cancelled';
+    st.message = '已取消';
+    st.finishedAt = Date.now();
+  }
+  return true;
+}
+
+function logoutProvider(binaryPath, provider, { timeoutMs = 60000 } = {}) {
+  return new Promise((resolve) => {
+    if (!binaryPath) return resolve({ ok: false, stderr: '未找到 magpie 可执行文件' });
+    execFile(binaryPath, ['plugin', 'logout', provider], { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
+      if (!err) loginStates.delete(provider);
+      resolve({ ok: !err, stdout: String(stdout || '').trim(), stderr: String(stderr || '').trim() || (err && err.message) || '' });
+    });
+  });
+}
+
 // ── 内核自更新 ────────────────────────────────────────────────────────
 // magpie 自带 `magpie update`：下载最新 release 并原位替换可执行文件，
 // 成功后需要重启 magpie 网关进程才生效。这里只负责把命令跑起来并记录状态。
@@ -556,6 +712,12 @@ module.exports = {
   listPluginCatalog,
   addPlugin,
   removePlugin,
+  probeLoginMethods,
+  startLogin,
+  cancelLogin,
+  logoutProvider,
+  loginState,
+  listLoginStates,
   PLUGIN_REGISTRY_URL,
   listPresets,
   parsePresets,

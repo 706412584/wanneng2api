@@ -89,7 +89,9 @@ function defaultPlatforms() {
           failThreshold: 3,
           okThreshold: 1,
         },
-        adminPanel: 'http://127.0.0.1:7863/__admin/',
+        // 面板挂在 "/" 兜底路由上（源码 handler.go:279 `H("/", cfg.Web)`）；
+        // /__admin/ 只注册了 handler，实测返回 404。
+        adminPanel: 'http://127.0.0.1:7863/',
         updater: {
           repo: '',
           assetPattern: 'workbuddy2api.*windows.*amd64\\.exe$',

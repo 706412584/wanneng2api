@@ -168,13 +168,47 @@ html[data-theme='dark'] .banner { background: #3a1d1d; color: #f2a19d; border-co
 .metric .hint.neutral { color: var(--text-3); }
 
 /* ===== 平台卡片 ===== */
-.platform-grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
-.plat-card { display: flex; flex-direction: column; gap: 10px; }
+/* 统一网格：所有平台卡（自研 / 插件 / 内核）同列宽、同行等高 */
+.platform-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  align-items: stretch;
+}
+/* 卡内三段式：head / body(自适应) / actions(贴底)，保证同排卡片按钮水平对齐 */
+.plat-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 210px;
+}
+.plat-card .plat-actions { margin-top: auto; }
+/* 卡片内描述统一 3 行（有无描述都占位），插件卡与自研卡视觉一致 */
+.plat-card .catalog-desc { margin: 0; }
+/* 平台卡描述统一 2 行，让插件卡与自研卡同为 210px 基准高度 */
+.plat-card .catalog-desc {
+  height: calc(1.5em * 2);
+  max-height: calc(1.5em * 2);
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+
+/* 卡片排序用 order：自研 → 内核 → 插件，同一网格内稳定排列 */
+.plat-card[data-kind='own'] { order: 1; }
+.plat-card[data-kind='core'] { order: 2; }
+.plat-card[data-kind='plugin'] { order: 3; }
 .plat-head { display: flex; align-items: flex-start; gap: 10px; }
 .plat-head .name { font-weight: 700; font-size: 15px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .plat-head .meta { font-size: 12px; color: var(--text-3); margin-top: 2px; font-family: var(--mono); }
 .plat-head .grow { flex: 1; min-width: 0; }
-.plat-stats { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12.5px; color: var(--text-2); }
+/* stats 单行不折行：折行会让插件卡比自研卡高出十几像素 */
+.plat-stats {
+  display: flex; gap: 16px; flex-wrap: nowrap;
+  font-size: 12.5px; color: var(--text-2);
+  overflow: hidden;
+}
+.plat-stats > span { white-space: nowrap; }
+.plat-stats > span.ellipsis { overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
 .plat-stats b { color: var(--text); font-variant-numeric: tabular-nums; }
 .plat-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding-top: 4px; }
 .plat-error {

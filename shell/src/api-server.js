@@ -253,6 +253,44 @@ class ApiServer {
       return { ok: r.ok, removed: target, stdout: r.stdout, stderr: r.stderr, __code: r.ok ? 200 : 400 };
     }
 
+    // GET /api/magpie/login/methods?provider=x —— 该 provider 支持的登录方式
+    if (method === 'GET' && parts[1] === 'magpie' && parts[2] === 'login' && parts[3] === 'methods') {
+      const magpie = require('./magpie-adapter');
+      const provider = u.searchParams.get('provider');
+      if (!provider) throw new Error('缺少 provider');
+      return await magpie.probeLoginMethods(this._magpieBinary(), provider);
+    }
+
+    // POST /api/magpie/login —— 启动登录（返回浏览器授权链接）
+    if (method === 'POST' && parts[1] === 'magpie' && parts[2] === 'login' && parts.length === 3) {
+      const magpie = require('./magpie-adapter');
+      const bin = this._magpieBinary();
+      const { provider, method: loginMethod } = body || {};
+      if (!provider) throw new Error('缺少 provider');
+      const r = await magpie.startLogin(bin, provider, loginMethod);
+      // 拿到链接就顺手在系统浏览器打开，省一次点击
+      if (r.url && this.deps.openExternal) {
+        try { this.deps.openExternal(r.url); } catch { /* 打开失败不影响流程 */ }
+      }
+      return r;
+    }
+
+    // GET /api/magpie/login/status —— 全部登录流程状态（供轮询）
+    if (method === 'GET' && parts[1] === 'magpie' && parts[2] === 'login' && parts[3] === 'status') {
+      const magpie = require('./magpie-adapter');
+      const provider = u.searchParams.get('provider');
+      return provider ? { state: magpie.loginState(provider) } : { states: magpie.listLoginStates() };
+    }
+
+    // POST /api/magpie/logout
+    if (method === 'POST' && parts[1] === 'magpie' && parts[2] === 'logout') {
+      const magpie = require('./magpie-adapter');
+      const provider = body && body.provider;
+      if (!provider) throw new Error('缺少 provider');
+      const r = await magpie.logoutProvider(this._magpieBinary(), provider);
+      return { ok: r.ok, provider, stdout: r.stdout, stderr: r.stderr, __code: r.ok ? 200 : 400 };
+    }
+
     // GET /api/magpie/presets —— magpie 支持的完整 provider 目录（含未安装的）
     if (method === 'GET' && parts[1] === 'magpie' && parts[2] === 'presets') {
       const magpie = require('./magpie-adapter');

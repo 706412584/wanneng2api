@@ -61,6 +61,7 @@ export default function Platforms() {
 
   return (
     <>
+      {/* 自研网关与内核同属"我在跑的服务"，放在同一网格里统一排序 */}
       <div className="platform-grid">
         {ourPlatforms.map((p) => (
           <PlatformCard
@@ -71,25 +72,19 @@ export default function Platforms() {
             onOpenPanel={openPanel}
           />
         ))}
+        {corePlatforms.map((p) => (
+          <PlatformCard
+            key={p.id}
+            p={p}
+            busy={acting[p.id]}
+            onAction={doAction}
+            onOpenPanel={openPanel}
+          />
+        ))}
+        <InstalledPlugins rev={pluginRev} onRemoved={() => setPluginRev((v) => v + 1)} />
       </div>
 
-      {corePlatforms.length > 0 && (
-        <div className="platform-grid" style={{ marginTop: 16 }}>
-          {corePlatforms.map((p) => (
-            <PlatformCard
-              key={p.id}
-              p={p}
-              busy={acting[p.id]}
-              onAction={doAction}
-              onOpenPanel={openPanel}
-            />
-          ))}
-        </div>
-      )}
-
-      <InstalledPlugins rev={pluginRev} />
-
-      <PluginMarket onInstalled={() => setPluginRev((v) => v + 1)} />
+      <PluginMarket onInstalled={() => setPluginRev((v) => v + 1)} onRemoved={() => setPluginRev((v) => v + 1)} />
       <Collapsible title="已配置的内置 Provider" summaryKey="已接入的厂商 / 中转 / 订阅">
         <MagpieProviders />
       </Collapsible>
@@ -101,7 +96,163 @@ export default function Platforms() {
 }
 
 /** 已安装的平台型插件：安装后出现在这里，与自研网关并列 */
-function InstalledPlugins({ rev }) {
+/**
+ * 插件平台卡片 —— 与自研网关卡同模板、同高度：
+ *   head（名称+徽标 / 包名）→ stats（三栏）→ desc（固定 3 行）→ actions（贴底）
+ * 登录走设备码流程：选方式 → 拿浏览器链接 → 轮询结果。
+ */
+function PluginPlatformCard({ p, busy, onRemove, onChanged }) {
+  const toast = useToast()
+  const [methods, setMethods] = useState(null)
+  const [loginState, setLoginState] = useState(null)
+  const [working, setWorking] = useState(false)
+  const [dialog, setDialog] = useState(false)
+
+  // 有进行中的登录就轮询状态
+  useEffect(() => {
+    if (!loginState || ['signed-in', 'failed', 'cancelled', 'interactive'].includes(loginState.status)) return
+    const t = setInterval(async () => {
+      try {
+        const r = await api.magpieLoginStatus((p.providers || [])[0])
+        if (r?.state) setLoginState(r.state)
+      } catch { /* 轮询失败忽略 */ }
+    }, 2000)
+    return () => clearInterval(t)
+  }, [loginState, p.providers])
+
+  // 登录成功后提示并刷新列表
+  useEffect(() => {
+    if (loginState?.status === 'signed-in') {
+      toast(`${p.name} 登录成功`)
+      onChanged && onChanged()
+    } else if (loginState?.status === 'failed') {
+      toast(`${p.name} 登录未完成：${loginState.message || ''}`, 'err')
+    }
+  }, [loginState?.status])
+
+  // 插件没有独立 Web 面板，管理入口 = magpie 的控制台（Web UI）
+  const openPanelLogin = () => {
+    window.open('http://127.0.0.1:3425/', '_blank', 'noopener')
+  }
+
+  const openLogin = async () => {
+    setDialog(true)
+    setMethods(null)
+    try {
+      const r = await api.magpieLoginMethods((p.providers || [])[0])
+      setMethods(r.methods || [])
+    } catch (e) {
+      toast(`获取登录方式失败：${e.message}`, 'err')
+      setMethods([])
+    }
+  }
+
+  const doLogin = async (method) => {
+    setDialog(false)
+    setWorking(true)
+    try {
+      const r = await api.magpieLogin((p.providers || [])[0], method)
+      setLoginState({ status: r.started ? 'awaiting-browser' : 'interactive', url: r.url, message: r.message })
+      if (r.url) toast('已打开浏览器授权页，请完成登录')
+      else toast(r.message || '登录进程已启动', r.started ? 'ok' : 'err')
+    } catch (e) {
+      toast(`登录失败：${e.message}`, 'err')
+    } finally {
+      setWorking(false)
+    }
+  }
+
+  const doLogout = async () => {
+    setWorking(true)
+    try {
+      const r = await api.magpieLogout((p.providers || [])[0])
+      if (r.ok) { toast(`${p.name} 已登出`); setLoginState(null); onChanged && onChanged() }
+      else toast(`登出失败：${(r.stderr || r.stdout || '').slice(0, 200)}`, 'err')
+    } finally {
+      setWorking(false)
+    }
+  }
+
+  const signedIn = !!p.signedIn
+  const pending = !!loginState && !['signed-in', 'failed', 'cancelled', 'interactive'].includes(loginState.status)
+  const dot = signedIn ? 'healthy' : 'stopped'
+  const statusText = signedIn ? '已登录' : (p.installed ? '待登录' : '未安装')
+
+  return (
+    <div className="card plat-card" data-kind="plugin">
+      <div className="plat-head">
+        <span className={`dot ${dot}`} />
+        <div className="grow">
+          <div className="name">
+            {p.name}
+            <span className="badge purple" title="magpie 社区插件">插件平台</span>
+            {signedIn
+              ? <span className="badge green">已登录</span>
+              : <span className="badge gray">未登录</span>}
+          </div>
+          <div className="meta mono">{p.package.replace('@magpie-community/', '')}</div>
+        </div>
+      </div>
+
+      <div className="plat-stats">
+        <span>类型 <b>provider</b></span>
+        <span className="ellipsis" title={(p.providers || []).join(' / ')}>
+          provider <b>{(p.providers || []).join(' / ') || '—'}</b>
+        </span>
+        <span>状态 <b>{statusText}</b></span>
+      </div>
+
+      {/* 登录中提示与描述共用同一块区域，避免额外撑高卡片 */}
+      {pending ? (
+        <div className="catalog-desc" style={{ color: 'var(--blue)' }}>
+          等待浏览器授权…{loginState.url && (
+            <a href={loginState.url} target="_blank" rel="noreferrer">点此打开授权页</a>
+          )}
+        </div>
+      ) : (
+        <div className="catalog-desc">
+          {(p.summary && (p.summary.zh || p.summary.en)) || '\u00a0'}
+        </div>
+      )}
+
+      <div className="plat-actions">
+        {signedIn
+          ? <button className="btn ghost" disabled={working || busy} onClick={doLogout}>登出</button>
+          : <button className="btn primary" disabled={working || busy} onClick={openLogin}>
+              {working ? '启动登录…' : '登录'}
+            </button>}
+        <button className="btn sm" disabled={busy} onClick={openPanelLogin}>管理</button>
+        <span style={{ flex: 1 }} />
+        <button className="btn sm ghost" disabled={busy} onClick={onRemove}>{busy ? '卸载中…' : '卸载'}</button>
+      </div>
+
+      {dialog && (
+        <div className="modal-mask" onClick={() => setDialog(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-title">登录 {p.name}</div>
+            {methods === null && <div style={{ fontSize: 12.5, color: 'var(--text-3)' }}>读取登录方式…</div>}
+            {methods && methods.length === 0 && (
+              <div style={{ fontSize: 12.5, color: 'var(--text-3)' }}>
+                该插件没有可用的非交互登录方式，请用命令行：<br />
+                <span className="mono">magpie plugin login {(p.providers || [])[0]}</span>
+              </div>
+            )}
+            {methods && methods.map((m) => (
+              <button key={m.index} className="btn" style={{ justifyContent: 'flex-start' }} onClick={() => doLogin(m.index)}>
+                {m.label}
+              </button>
+            ))}
+            <div className="modal-actions">
+              <button className="btn ghost" onClick={() => setDialog(false)}>取消</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function InstalledPlugins({ rev, onRemoved }) {
   const fetchPlugins = useCallback(() => api.magpiePlugins(false), [])
   const { data, error, refresh } = usePolling(fetchPlugins, 0)
   const toast = useToast()
@@ -121,8 +272,11 @@ function InstalledPlugins({ rev }) {
     setBusy((s) => ({ ...s, [p.package]: true }))
     try {
       const r = await api.magpieRemovePlugin(p.package)
-      if (r.ok) { toast(`${p.name} 已卸载`); refresh() }
-      else toast(`卸载失败：${(r.stderr || r.stdout || '').slice(0, 200)}`, 'err')
+      if (r.ok) {
+        toast(`${p.name} 已卸载`)
+        refresh()
+        if (onRemoved) onRemoved()
+      } else toast(`卸载失败：${(r.stderr || r.stdout || '').slice(0, 200)}`, 'err')
     } finally {
       setBusy((s) => { const n = { ...s }; delete n[p.package]; return n })
     }
@@ -130,52 +284,28 @@ function InstalledPlugins({ rev }) {
 
   if (error && !data) {
     return (
-      <div style={{ marginTop: 16, fontSize: 12.5, color: 'var(--red)' }}>
-        读取已安装插件失败：{error.message}
+      <div className="card plat-card" data-kind="plugin">
+        <div className="plat-head"><span className="dot error" /><div className="grow">
+          <div className="name">已安装插件</div>
+          <div className="meta">读取失败：{error.message}</div>
+        </div></div>
       </div>
     )
   }
   if (!installed.length) return null
 
   return (
-    <div className="platform-grid" style={{ marginTop: 16 }}>
+    <>
       {installed.map((p) => (
-        <div className="card plat-card" key={p.package}>
-          <div className="plat-head">
-            <span className="dot healthy" />
-            <div className="grow">
-              <div className="name">
-                {p.name}
-                <span className="badge purple" title="magpie 社区插件">插件平台</span>
-              </div>
-              <div className="meta mono">{p.package.replace('@magpie-community/', '')}</div>
-            </div>
-          </div>
-
-          <div className="plat-stats">
-            <span>类型 <b>provider</b></span>
-            <span>provider <b>{(p.providers || []).join(' / ') || '—'}</b></span>
-            <span>状态 <b>已安装</b></span>
-          </div>
-
-          {(p.summary?.zh || p.summary?.en) && (
-            <div className="catalog-desc" style={{ marginTop: 0 }}>
-              {p.summary.zh || p.summary.en}
-            </div>
-          )}
-
-          <div className="plat-actions">
-            <button className="btn ghost" disabled={!!busy[p.package]} onClick={() => remove(p)}>
-              {busy[p.package] ? '卸载中…' : '卸载'}
-            </button>
-            <span style={{ flex: 1 }} />
-            <span className="sub" style={{ fontSize: 11.5, color: 'var(--text-3)' }}>
-              登录用 <span className="mono">magpie plugin login</span>
-            </span>
-          </div>
-        </div>
+        <PluginPlatformCard
+          key={p.package}
+          p={p}
+          busy={!!busy[p.package]}
+          onRemove={() => remove(p)}
+          onChanged={refresh}
+        />
       ))}
-    </div>
+    </>
   )
 }
 
@@ -601,7 +731,7 @@ function PlatformCard({ p, busy, onAction, onOpenPanel }) {
   const running = ['healthy', 'degraded', 'unhealthy', 'starting', 'updating'].includes(p.state)
 
   return (
-    <div className="card plat-card">
+    <div className="card plat-card" data-kind={p.type === 'external' ? 'core' : 'own'}>
       <div className="plat-head">
         <StateDot state={p.state} />
         <div className="grow">
