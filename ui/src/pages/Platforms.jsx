@@ -420,8 +420,13 @@ function PluginMarket({ onInstalled }) {
     setBusy((s) => ({ ...s, [p.package]: 'remove' }))
     try {
       const r = await api.magpieRemovePlugin(p.package)
-      if (r.ok) { toast(`${p.name} 已卸载`); refresh() }
-      else toast(`卸载失败：${(r.stderr || r.stdout || '').slice(0, 200)}`, 'err')
+      if (r.ok) {
+        toast(`${p.name} 已卸载`)
+        refresh()
+        // 必须通知外层：上方「已安装插件」区只拉一次数据，
+        // 不刷新会残留已卸载的平台卡。
+        if (onRemoved) onRemoved()
+      } else toast(`卸载失败：${(r.stderr || r.stdout || '').slice(0, 200)}`, 'err')
     } finally {
       setBusy((s) => { const n = { ...s }; delete n[p.package]; return n })
     }
@@ -636,7 +641,9 @@ function InstallDialog({ preset, installing, onCancel, onSubmit }) {
   })
 
   const extraArgs = Object.entries(params).filter(([, v]) => v.trim()).map(([k, v]) => `${k}=${v.trim()}`)
-  const canSubmit = !installing && (!preset.needsKey || key.trim()) && (preset.params || []).every((p) => !params[p].trim() || true)
+  // 需要 key 的 preset 必须填 key；具名参数（project=…）由用户决定填不填，
+// 不参与提交门槛（原表达式里 `|| true` 让整项恒真，等于没校验）。
+  const canSubmit = !installing && (!preset.needsKey || !!key.trim())
 
   return (
     <div className="modal-mask" onClick={onCancel}>

@@ -194,8 +194,9 @@ export default function Hub() {
                 </tr>
               </thead>
               <tbody>
-                {(reqs.data.rows || []).map((r) => (
-                  <tr key={r.route_id}>
+                {(reqs.data.rows || []).map((r, i) => (
+                  // 该接口没有稳定唯一 id（无 route_id），用时间+来源+模型+序号兜底
+                  <tr key={`${r.t}|${r.agent}|${r.model}|${i}`}>
                     <td style={{ fontSize: 11.5, whiteSpace: 'nowrap' }}>{fmtTime(r.t)}</td>
                     <td style={{ fontSize: 12 }}>{r.agentName || r.agent || '—'}</td>
                     <td className="mono" style={{ fontSize: 11.5 }}>{r.req || r.model}</td>

@@ -82,6 +82,8 @@ function defaultPlatforms() {
           shell: false,
         },
         port: 7863,
+        // 收养时用于确认端口上确实是它（健康响应里应出现该标记）
+        adoptHints: ['workbuddy2api'],
         health: {
           url: 'http://127.0.0.1:7863/healthz',
           intervalSec: 15,
@@ -114,6 +116,7 @@ function defaultPlatforms() {
           shell: false,
         },
         port: 7866,
+        adoptHints: ['codearts2api'],
         health: {
           url: 'http://127.0.0.1:7866/healthz',
           intervalSec: 15,
@@ -144,6 +147,7 @@ function defaultPlatforms() {
           env: { NO_PROXY: '*', PYTHONIOENCODING: 'utf-8' },
         },
         port: 17990,
+        adoptHints: ['loomy2api'],
         health: {
           url: 'http://127.0.0.1:17990/health',
           intervalSec: 15,
@@ -207,6 +211,7 @@ function defaultPlatforms() {
           shell: false,
         },
         port: 6789,
+        adoptHints: ['lingxi2api'],
         health: {
           url: 'http://127.0.0.1:6789/healthz',
           intervalSec: 15,
@@ -243,7 +248,8 @@ function defaultPlatforms() {
           okThreshold: 1,
         },
         // 管理界面是 magpie 自己的 Web UI（另一个端口），不是网关 API 根。
-        adminPanel: 'http://127.0.0.1:17899/',
+        // 带 k 参数才能通过鉴权（无 key 直接 401）。
+        adminPanel: 'http://127.0.0.1:17899/?k=wanneng2api-magpie-web-2026',
       },
       {
         // magpie 的网页控制台：插件管理、用量页、page 型插件都渲染在这里。
@@ -331,6 +337,23 @@ class ConfigStore {
       this.platforms = this._readJson(this.platformsPath, defaultPlatforms());
       if (!this.platforms || !Array.isArray(this.platforms.platforms)) {
         this.platforms = defaultPlatforms();
+      } else {
+        // 与内置默认值按 id 合并：老 platforms.json 也能拿到新平台
+        // （如本次新增的 magpie-web）和默认项的修正（如 workbuddy 面板地址）。
+        // 用户显式设置的字段优先 —— 只补缺失键，不覆盖。
+        const defs = defaultPlatforms().platforms;
+        const byId = new Map(this.platforms.platforms.map((p) => [p.id, p]));
+        for (const def of defs) {
+          const cur = byId.get(def.id);
+          if (!cur) {
+            byId.set(def.id, def);           // 新平台：整条补上
+          } else {
+            for (const k of Object.keys(def)) {
+              if (!(k in cur)) cur[k] = def[k];   // 只补缺失键
+            }
+          }
+        }
+        this.platforms.platforms = [...byId.values()];
       }
     }
   }

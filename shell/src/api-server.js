@@ -110,8 +110,11 @@ class ApiServer {
     // 去掉前导分隔符：path.resolve(dir, '/x') 在 Windows 上会解析成盘符根 D:\x
     rel = rel.replace(/^[/\\]+/, '');
     const file = path.resolve(dir, rel);
-    // 目录穿越防护
-    if (!file.startsWith(path.resolve(dir))) {
+    // 目录穿越防护：不能用 startsWith 比较（`dist-private` 也以 `dist` 开头，
+    // 会被判成合法）。改用 path.relative，逃出去时首段是 `..`。
+    const base = path.resolve(dir);
+    const relToBase = path.relative(base, file);
+    if (relToBase.startsWith('..') || path.isAbsolute(relToBase)) {
       res.writeHead(403).end('forbidden');
       return;
     }

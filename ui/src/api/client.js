@@ -75,10 +75,13 @@ export const api = {
   getOverview: async () => {
     const d = await request('/api/overview')
     const platforms = adaptPlatformList(d)
+    // 壳返回的 alerts 是数字（告警条数），不是数组；UI 需要明细列表。
+    // 口径必须与后端一致：只算 unhealthy / error，不把 lastError 也算进去
+    // （error 态的平台本身已计入，再按 lastError 数一次会重复）。
     const alerts = Array.isArray(d.alerts)
       ? d.alerts
       : platforms
-        .filter((p) => p.state === 'unhealthy' || p.state === 'error' || p.lastError)
+        .filter((p) => p.state === 'unhealthy' || p.state === 'error')
         .map((p) => ({ id: p.id, level: p.state === 'error' ? 'error' : 'warn', message: p.lastError || `平台处于 ${p.state} 状态` }))
     return {
       ...d,

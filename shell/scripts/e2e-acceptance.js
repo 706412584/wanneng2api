@@ -80,7 +80,7 @@ async function main() {
 
   console.log('[平台清单]')
   const plats = store.platforms.platforms
-  ok('平台数量 = 6', plats.length === 6, `实际 ${plats.length}`)
+  ok('平台数量 = 7', plats.length === 7, `实际 ${plats.length}`)
   const ids = plats.map((p) => p.id)
   ok('包含 workbuddy', ids.includes('workbuddy'))
   ok('包含 codearts', ids.includes('codearts'))
@@ -198,7 +198,7 @@ async function main() {
   ok('overview 含 platforms', ov.json && Array.isArray(ov.json.platforms))
   const pl = await getJson(`${base}/api/platforms`)
   ok('GET /api/platforms 200', pl.status === 200)
-  ok('平台列表 6 条', pl.json && pl.json.platforms && pl.json.platforms.length === 6,
+  ok('平台列表 7 条', pl.json && pl.json.platforms && pl.json.platforms.length === 7,
     `实际 ${pl.json?.platforms?.length}`)
   const set = await getJson(`${base}/api/settings`)
   ok('GET /api/settings 200', set.status === 200)

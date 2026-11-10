@@ -190,7 +190,8 @@ async function main() {
   ok('GET settings 200 含 general', sg.status === 200 && 'general' in sg.json && 'sub2api' in sg.json);
   const sp2 = await req('PUT', '/api/settings', { general: { closeAction: 'quit' }, update: { channel: 'beta' } });
   ok('PUT settings 200 且合并', sp2.status === 200 && sp2.json.general.closeAction === 'quit' && sp2.json.update.channel === 'beta');
-  ok('PUT settings 保留未提交键', sp2.json.general.autoStartPlatforms.length === 5);
+  ok('PUT settings 保留未提交键', sp2.json.general.autoStartPlatforms.length === 6,
+    `实际 ${sp2.json.general.autoStartPlatforms.length}`);
   const sg2 = await req('GET', '/api/settings');
   ok('PUT 后 GET 读到新值', sg2.json.general.closeAction === 'quit');
 

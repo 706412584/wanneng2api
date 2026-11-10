@@ -351,25 +351,82 @@ class PlatformManager extends EventEmitter {
    * （语义是"上游不可服务"，但进程确实在跑），健康判据会判不健康，
    * 而收养只需要确认进程活着。
    */
-  _probeAlive(url, timeoutSec) {
+  _probeAlive(url, timeoutSec, expect) {
     return new Promise((resolve) => {
       let settled = false;
-      const done = (ok) => { if (!settled) { settled = true; resolve(ok); } };
-      const req = http.get(url, { timeout: Math.max(1, timeoutSec) * 1000 }, (res) => {
-        res.resume();
-        done(true); // 任何 HTTP 响应都算活
+      let watchdog = null;
+      let req = null;
+      const done = (ok) => {
+        if (settled) return;
+        settled = true;
+        if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+        try { req.destroy(); } catch { /* 已关闭 */ }
+        resolve(ok);
+      };
+
+      // 关键：端口上可能是任意 TCP 服务（比如测试里裸 net.createServer），
+      // 它接受连接却永远不发响应。只靠 req 的 timeout 不够 —— 那管的是
+      // socket 空闲，而对方有时会持续发点什么；必须再加一个总时限，
+      // 否则整个 start() 会挂死在这里。
+      const budgetMs = Math.max(1000, Math.max(1, timeoutSec) * 1000);
+      // agent:false + Connection: close：不复用连接、响应后立刻断开。
+      // 否则 keep-alive 的 socket 会留在池里，占用方 close() 时等它，
+      // 探活就把别人的关闭卡住了（测试里实测会永久挂起）。
+      req = http.get(url, {
+        timeout: budgetMs,
+        agent: false,
+        headers: { Connection: 'close' },
+      }, (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => {
+          if (body.length < 4096) body += c;
+        });
+        res.on('end', () => {
+          // 任何 HTTP 响应都证明端口上有人；但"是不是本平台"还要看响应内容，
+          // 否则端口被别的程序占用时会被误认成该平台。
+          if (!expect || !expect.length) return done(true);
+          const hay = `${res.headers['content-type'] || ''} ${body}`.toLowerCase();
+          done(res.statusCode < 500 && expect.some((f) => hay.includes(String(f).toLowerCase())));
+        });
+        res.on('error', () => done(false));
       });
-      req.on('timeout', () => { req.destroy(); done(false); });
+      watchdog = setTimeout(() => done(false), budgetMs);
+      req.on('timeout', () => done(false));
       req.on('error', () => done(false));
     });
   }
 
   _scheduleHealthTimer(rt) {
     if (rt.healthTimer) clearInterval(rt.healthTimer);
+    // 收养来的实例没有子进程，_healthTick 的 `!rt.proc` 早退会跳过它，
+    // 导致进程死了也一直显示 healthy。这类走独立探活。
+    if (rt.adopted) return this._scheduleAdoptedTimer(rt);
     const h = rt.cfg.health || {};
     const iv = Math.max(0.5, Number(h.intervalSec) || 15) * 1000;
     rt.healthTimer = setInterval(() => this._healthTick(rt), iv);
     this._healthTick(rt);
+  }
+
+  /** 收养实例的存活巡检（只探活，不重启 —— 进程不归我们管） */
+  _scheduleAdoptedTimer(rt) {
+    const h = rt.cfg.health || {};
+    const iv = Math.max(1, Number(h.intervalSec) || 15) * 1000;
+    const tick = async () => {
+      if (this._stopping || rt.stopping || ['stopped', 'updating'].includes(rt.status)) return;
+      const ok = await this._probeHealth(
+        h.url || `http://127.0.0.1:${rt.cfg.port}/`,
+        Number(h.timeoutSec) || 3,
+      );
+      rt.lastHealthAt = Date.now();
+      if (!ok && rt.status === 'healthy') {
+        rt.setStatus('unhealthy', '承载的外部实例已不可达（该进程不归壳管理）');
+      } else if (ok && rt.status === 'unhealthy') {
+        rt.setStatus('healthy');
+      }
+    };
+    rt.healthTimer = setInterval(tick, iv);
+    tick();
   }
 
   async _healthTick(rt) {
@@ -468,9 +525,11 @@ class PlatformManager extends EventEmitter {
         const h = cfg.health || {};
         // 用存活探针而非健康探针：灵犀无账号时健康端点返回 503，
         // 但进程确实在跑，应当收养而不是判成冲突。
+        // adoptHints 用来确认"端口上这个程序确实是它"，避免把别的服务认错。
         const adoptable = await this._probeAlive(
           h.url || `http://127.0.0.1:${cfg.port}/`,
           Number(h.timeoutSec) || 3,
+          Array.isArray(cfg.adoptHints) ? cfg.adoptHints : null,
         ).catch(() => false);
         if (adoptable) {
           rt.adopted = true;

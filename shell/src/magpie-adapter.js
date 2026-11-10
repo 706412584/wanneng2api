@@ -493,8 +493,16 @@ function addProvider(binaryPath, { id, key, args = [] }, { timeoutMs = 180000 } 
       return resolve({ ok: false, stdout: '', stderr: `非法 provider id: ${id}` });
     }
     const argv = ['provider', 'add', id];
-    if (key) argv.push(key);
-    for (const a of args) argv.push(String(a));
+    if (key) argv.push(String(key));
+    // 具名参数只接受 key=value（如 project=xxx）；拒绝以 - 开头的串，
+    // 否则等于让调用方往 magpie CLI 里塞任意 flag。
+    for (const a of args) {
+      const s = String(a);
+      if (!/^[A-Za-z][\w-]*=/.test(s)) {
+        return resolve({ ok: false, stdout: '', stderr: `非法参数: ${s}` });
+      }
+      argv.push(s);
+    }
     execFile(binaryPath, argv, { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
       // 安装后 presets 缓存不必失效（目录没变），但 provider 列表要重读
       resolve({
@@ -535,10 +543,18 @@ function listLoginStates() {
   return Object.fromEntries(loginStates);
 }
 
+/** provider id 合法性：magpie 的 id 都是小写字母数字加连字符 */
+const PROVIDER_ID_RE = /^[a-z0-9][a-z0-9-]*$/;
+
 /** 解析 `magpie plugin login <p>` 不带 method 时的选项列表 */
-function probeLoginMethods(binaryPath, provider, { timeoutMs = 20000 } = {}) {
+function probeLoginMethods(binaryPath, provider, { timeoutMs = 8000 } = {}) {
   return new Promise((resolve) => {
     if (!binaryPath) return resolve({ methods: [], error: '未找到 magpie 可执行文件' });
+    if (!PROVIDER_ID_RE.test(String(provider || ''))) {
+      return resolve({ methods: [], error: `非法 provider: ${provider}` });
+    }
+    // 不给 method 时 CLI 会列出选项并等 stdin：读够就关掉 stdin，让它立刻退出，
+    // 否则每次探测都要白等一个超时。
     const child = execFile(binaryPath, ['plugin', 'login', provider], { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
       const text = `${stdout || ''}${stderr || ''}`;
       // 形如：\nHow do you sign in to Qoder?\n  1. Sign in with Qoder\n  2. Sign in with Qoder PAT\n>
@@ -549,8 +565,8 @@ function probeLoginMethods(binaryPath, provider, { timeoutMs = 20000 } = {}) {
       if (methods.length) resolve({ methods });
       else resolve({ methods: [], error: text.trim().slice(0, 300) || (err && err.message) || '' });
     });
-    // 这只是探测，拿到选项就结束
-    child.on('exit', () => {});
+    try { child.stdin.end(); } catch { /* 可能已关闭 */ }
+    child.on('error', () => resolve({ methods: [], error: '无法启动 magpie' }));
   });
 }
 
@@ -558,53 +574,79 @@ function probeLoginMethods(binaryPath, provider, { timeoutMs = 20000 } = {}) {
  * 启动登录流程。
  * @returns {Promise<{started:boolean, url?:string, message?:string}>}
  */
-function startLogin(binaryPath, provider, method, { urlTimeoutMs = 45000 } = {}) {
+function startLogin(binaryPath, provider, method, { urlTimeoutMs = 45000, totalTimeoutMs = 600000 } = {}) {
   return new Promise((resolve) => {
     if (!binaryPath) return resolve({ started: false, message: '未找到 magpie 可执行文件' });
     if (!/^[a-z0-9][a-z0-9-]*$/.test(String(provider || ''))) {
       return resolve({ started: false, message: `非法 provider: ${provider}` });
     }
+    // method 只接受数字序号：magpie 会把它当位置参数，传字符串等于给 CLI 塞了
+    // 一个任意 argv（execFile 无 shell，不会命令注入，但能改行为）。
+    const methodArg = method === undefined || method === null || method === '' ? null : String(method);
+    if (methodArg !== null && !/^\d{1,2}$/.test(methodArg)) {
+      return resolve({ started: false, message: `非法登录方式: ${method}` });
+    }
+
+    // 同一 provider 重复登录：先收掉上一次的进程与状态，避免失控子进程堆积
+    const prev = loginStates.get(provider);
+    if (prev && prev.child) {
+      try { prev.child.kill(); } catch { /* 已退出 */ }
+    }
 
     const argv = ['plugin', 'login', provider];
-    if (method !== undefined && method !== null && method !== '') argv.push(String(method));
+    if (methodArg !== null) argv.push(methodArg);
 
-    const child = require('child_process').spawn(binaryPath, argv, {
-      cwd: path.dirname(binaryPath),
-      env: { ...process.env },
-      windowsHide: true,
-    });
+    let child;
+    try {
+      child = require('child_process').spawn(binaryPath, argv, {
+        cwd: path.dirname(binaryPath),
+        env: { ...process.env },
+        windowsHide: true,
+      });
+    } catch (e) {
+      return resolve({ started: false, message: `启动登录进程失败：${e.message}` });
+    }
 
     const state = {
       status: 'pending',
       url: '',
       message: '',
-      method: method || null,
+      method: methodArg,
       startedAt: Date.now(),
       finishedAt: null,
+      child,
     };
     loginStates.set(provider, state);
 
     let buf = '';
-    let settledUrl = false;
+    let settled = false;        // 主 Promise 是否已 resolve
+    let urlTimer = null;
+    let killTimer = null;
+
+    const done = (payload) => {
+      if (settled) return;
+      settled = true;
+      if (urlTimer) { clearTimeout(urlTimer); urlTimer = null; }
+      resolve(payload);
+    };
 
     const onData = (chunk) => {
       buf += String(chunk);
-      if (!settledUrl) {
+      if (!state.url && !state.code) {
         // 设备码链接：https://...（同一行常有 "If it didn't open, go to:"）
         const m = /(https?:\/\/\S+)/.exec(buf);
         if (m) {
-          settledUrl = true;
           state.url = m[1].replace(/[),.]+$/, '');
           state.status = 'awaiting-browser';
-          resolve({ started: true, url: state.url, message: '请在浏览器完成授权' });
-        }
-        // 也可能直接给到 "code: XXXXX"
-        const code = /enter (?:this )?code[:\s]+([A-Z0-9-]{4,})/i.exec(buf);
-        if (code && !state.url) {
-          settledUrl = true;
-          state.code = code[1];
-          state.status = 'awaiting-code';
-          resolve({ started: true, message: `设备码：${code[1]}` });
+          done({ started: true, url: state.url, message: '请在浏览器完成授权' });
+        } else {
+          // 也可能直接给到 "code: XXXXX"
+          const code = /enter (?:this )?code[:\s]+([A-Z0-9-]{4,})/i.exec(buf);
+          if (code) {
+            state.code = code[1];
+            state.status = 'awaiting-code';
+            done({ started: true, message: `设备码：${code[1]}` });
+          }
         }
       }
       state.output = (state.output || '') + String(chunk);
@@ -613,47 +655,75 @@ function startLogin(binaryPath, provider, method, { urlTimeoutMs = 45000 } = {})
     child.stdout.on('data', onData);
     child.stderr.on('data', onData);
 
-    child.on('exit', (code) => {
+    // spawn 失败（如 ENOENT）只会触发 'error' 与 'close'，不会触发 'exit'。
+    // 没有这个监听，Promise 永不 settle，纯 Node 模式下进程直接挂死。
+    child.on('error', (e) => {
+      state.status = 'failed';
+      state.message = `启动登录进程失败：${e.message}`;
       state.finishedAt = Date.now();
-      if (!settledUrl && !state.url && !state.code) {
+      delete state.child;
+      if (killTimer) { clearTimeout(killTimer); killTimer = null; }
+      done({ started: false, message: state.message });
+    });
+
+    child.on('close', (code) => {
+      state.finishedAt = Date.now();
+      delete state.child;
+      if (killTimer) { clearTimeout(killTimer); killTimer = null; }
+      if (!state.url && !state.code) {
         // 没拿到链接就退出了：把对话输出交给用户自己处理
         state.status = 'interactive';
         state.message = '该 provider 需要交互式登录（输入验证码等），请用命令行完成';
-        resolve({ started: false, interactive: true, message: state.message, output: state.output });
-        return;
+        return done({ started: false, interactive: true, message: state.message, output: state.output });
       }
+      if (state.status === 'cancelled') return done({ started: true, message: state.message });
       const ok = code === 0;
       state.status = ok ? 'signed-in' : 'failed';
       state.message = ok ? '登录成功' : `登录未完成（exit ${code}）`;
-      if (!settledUrl) resolve({ started: true, message: state.message });
+      done({ started: true, url: state.url, message: state.message });
     });
 
+    // 总时长兜底：设备码链接可能一直等不到用户操作，超时就收进程
+    killTimer = setTimeout(() => {
+      if (!state.child) return;
+      try { state.child.kill(); } catch { /* 已退出 */ }
+      state.status = 'failed';
+      state.message = '登录超时（10 分钟未完成）';
+      state.finishedAt = Date.now();
+      done({ started: true, url: state.url, message: state.message });
+    }, totalTimeoutMs);
+
     // 拿到链接才算启动成功；超时也算"已在后台等待"
-    setTimeout(() => {
-      if (!settledUrl) {
-        resolve({
-          started: true,
-          message: '登录进程已启动，暂未拿到授权链接',
-          note: '如长时间无响应，用命令行执行 magpie plugin login',
-        });
-      }
+    urlTimer = setTimeout(() => {
+      urlTimer = null;
+      done({
+        started: true,
+        message: '登录进程已启动，暂未拿到授权链接',
+        note: '如长时间无响应，用命令行执行 magpie plugin login',
+      });
     }, urlTimeoutMs);
   });
 }
 
 function cancelLogin(provider) {
   const st = loginStates.get(provider);
-  if (st) {
-    st.status = 'cancelled';
-    st.message = '已取消';
-    st.finishedAt = Date.now();
+  if (!st) return false;
+  if (st.child) {
+    try { st.child.kill(); } catch { /* 已退出 */ }
+    delete st.child;
   }
+  st.status = 'cancelled';
+  st.message = '已取消';
+  st.finishedAt = Date.now();
   return true;
 }
 
 function logoutProvider(binaryPath, provider, { timeoutMs = 60000 } = {}) {
   return new Promise((resolve) => {
     if (!binaryPath) return resolve({ ok: false, stderr: '未找到 magpie 可执行文件' });
+    if (!PROVIDER_ID_RE.test(String(provider || ''))) {
+      return resolve({ ok: false, stderr: `非法 provider: ${provider}` });
+    }
     execFile(binaryPath, ['plugin', 'logout', provider], { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
       if (!err) loginStates.delete(provider);
       resolve({ ok: !err, stdout: String(stdout || '').trim(), stderr: String(stderr || '').trim() || (err && err.message) || '' });

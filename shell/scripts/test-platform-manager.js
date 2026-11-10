@@ -183,7 +183,13 @@ async function main() {
   const errSnap = mgr.statusOf('portconflict');
   ok('冲突平台状态 error', errSnap.status === 'error', `got ${errSnap.status}`);
   ok('冲突平台无进程', errSnap.pid === 0);
-  await new Promise((r) => occupier.close(r));
+  // Windows 上 net.Server.close() 若仍有连接（哪怕已半关）会不回调。
+// 先强制断开再关，并加超时兜底，避免整个测试挂死。
+  await new Promise((resolve) => {
+    const t = setTimeout(resolve, 2000);
+    try { occupier.closeAllConnections?.(); } catch (_e) { /* 老 Node 无此 API */ }
+    occupier.close(() => { clearTimeout(t); resolve(); });
+  });
 
   // ── 6. enable/disable ──
   console.log('\n[6] enable/disable');

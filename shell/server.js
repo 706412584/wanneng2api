@@ -36,37 +36,6 @@ const log = {
   error: (m) => console.error(`${new Date().toISOString()} [error] ${m}`),
 };
 
-const MIME = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.ico': 'image/x-icon',
-  '.json': 'application/json; charset=utf-8',
-  '.woff2': 'font/woff2',
-};
-
-function serveStatic(req, res) {
-  // SPA 路由：非资源路径一律回 index.html
-  let rel = decodeURIComponent(req.url.split('?')[0]);
-  if (rel === '/' || !path.extname(rel)) rel = '/index.html';
-  const file = path.join(UI_DIR, rel);
-
-  // 目录穿越防护：解析后的路径必须仍在 UI_DIR 内
-  if (!path.resolve(file).startsWith(path.resolve(UI_DIR))) {
-    res.writeHead(403).end('forbidden');
-    return;
-  }
-  fs.readFile(file, (err, buf) => {
-    if (err) {
-      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }).end('not found');
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' }).end(buf);
-  });
-}
-
 async function main() {
   if (!fs.existsSync(path.join(UI_DIR, 'index.html'))) {
     log.error(`UI 构建产物不存在：${UI_DIR}/index.html`);
