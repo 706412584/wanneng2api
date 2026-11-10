@@ -277,7 +277,10 @@ class PlatformManager extends EventEmitter {
     } else if (/[/\\]/.test(binary)) {
       command = path.join(workDir, binary);           // 相对 workDir（如 bin/xxx.exe）
     } else {
-      command = binary;                               // 裸命令名 → PATH 查找（测试用 node 等）
+      // 裸文件名：先看 workDir 里有没有（Windows 的 spawn 不搜索 cwd，
+      // 直接用裸名会 ENOENT），否则退回 PATH 查找（测试用的 node/python 等）。
+      const inWorkDir = path.join(workDir, binary);
+      command = fs.existsSync(inWorkDir) ? inWorkDir : binary;
     }
     return { command, args: (run.args || []).slice(), cwd: workDir };
   }
@@ -415,14 +418,23 @@ class PlatformManager extends EventEmitter {
     if (cfg.type === 'external' || cfg.managed === false) {
       rt.setStatus('starting');
       const h = cfg.health || {};
-      const ok = await this._probeHealth(h.url || `http://127.0.0.1:${cfg.port}/`, Number(h.timeoutSec) || 3).catch(() => false);
-      if (ok) {
-        rt.setStatus('healthy');
-      } else {
-        rt.setStatus('unhealthy', '外部服务未运行（由该应用自己启动）');
-      }
-      this._startHealthLoop(rt);
-      return;
+      const probe = () =>
+        this._probeHealth(h.url || `http://127.0.0.1:${cfg.port}/`, Number(h.timeoutSec) || 3);
+      const ok = await probe().catch(() => false);
+      rt.setStatus(ok ? 'healthy' : 'unhealthy', ok ? '' : '外部服务未运行（由该应用自己启动）');
+      // 外部平台没有子进程，用独立定时器轮询存活（_healthTick 依赖 rt.proc）。
+      const iv = Math.max(1, Number(h.intervalSec) || 20) * 1000;
+      if (rt.healthTimer) clearInterval(rt.healthTimer);
+      rt.healthTimer = setInterval(async () => {
+        if (rt.stopping || rt.status === 'stopped') return;
+        const alive = await probe().catch(() => false);
+        rt.lastHealthAt = Date.now();
+        if (alive && rt.status !== 'healthy') rt.setStatus('healthy');
+        else if (!alive && rt.status === 'healthy') {
+          rt.setStatus('unhealthy', '外部服务已停止（由该应用自己启动）');
+        }
+      }, iv);
+      return rt.snapshot();
     }
 
     // 1. 端口预检

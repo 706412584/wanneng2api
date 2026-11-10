@@ -181,7 +181,8 @@ async function main() {
   const hs = await req('GET', '/api/hub/status');
   ok('hub/status 200', hs.status === 200);
   const hr = await req('POST', '/api/hub/reload');
-  ok('hub/reload 400（无 hub 平台）', hr.status === 404, `got ${hr.status}`);
+  // 聚合层已交给 magpie：此端点改为刷新上游状态，恒返回 200 + ok
+  ok('hub/reload 200 且返回 refreshed', hr.status === 200 && hr.json && hr.json.ok === true, `got ${hr.status}`);
 
   // ── settings ──
   console.log('\n[settings GET/PUT]');

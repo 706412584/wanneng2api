@@ -136,7 +136,8 @@ class ApiServer {
         total: platforms.length,
         alerts: platforms.filter((p) => p.status === 'unhealthy' || p.status === 'error').length,
         platforms,
-        hub: manager.statusOf('hub'),
+        // 上游聚合由 magpie 承担；这里给出它的存活状态，UI 的 Hub 页用它。
+        hub: manager.statusOf('magpie'),
       };
     }
 
@@ -189,20 +190,43 @@ class ApiServer {
       return undefined;
     }
 
-    // GET /api/hub/status
+    // GET /api/hub/status —— 聚合层已交给 magpie，这里返回它的存活摘要，
+    // 并附上四个自研网关作为 provider 的地址，供 UI 展示接入配置。
     if (method === 'GET' && parts[1] === 'hub' && parts[2] === 'status') {
       if (this.deps.getHubStatus) return this.deps.getHubStatus();
-      const rt = manager.statusOf('hub');
-      return { status: rt ? rt.status : 'unknown', detail: rt };
+      const magpie = manager.statusOf('magpie');
+      const upstreams = manager.statusList()
+        .filter((p) => ['workbuddy', 'codearts', 'loomy', 'lingxi'].includes(p.id))
+        .map((p) => ({
+          id: p.id,
+          name: p.name,
+          baseUrl: `http://127.0.0.1:${p.port}`,
+          state: p.status,
+          managed: true,
+        }));
+      return {
+        backend: 'magpie',
+        status: magpie ? magpie.status : 'unknown',
+        gateway: 'http://127.0.0.1:3425',
+        detail: magpie,
+        upstreams,
+      };
     }
 
-    // POST /api/hub/reload
+    // POST /api/hub/reload —— magpie 不归壳管，重载请用 `magpie provider refresh`。
+    // 这里改为刷新各上游网关的健康状态，供 UI 一键刷新。
     if (method === 'POST' && parts[1] === 'hub' && parts[2] === 'reload') {
       if (this.deps.reloadHub) return this.deps.reloadHub();
-      // 兜底：重启 hub 平台（等效热重载配置）
-      const rt = manager.getRuntime('hub');
-      if (!rt) throw new Error('未找到 hub 平台');
-      return manager.restart('hub');
+      const refreshed = [];
+      for (const p of manager.statusList()) {
+        if (p.id === 'magpie') continue;
+        try {
+          refreshed.push({ id: p.id, state: p.status });
+        } catch (e) {
+          refreshed.push({ id: p.id, error: e.message });
+        }
+      }
+      return { ok: true, note: '聚合由 magpie 负责；此操作只刷新上游状态', refreshed };
     }
 
     // GET/PUT /api/settings
