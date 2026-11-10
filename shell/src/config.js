@@ -1,0 +1,306 @@
+'use strict';
+/**
+ * config.js — manager.json / platforms.json 读写 + 默认值（纯 Node 模块）
+ *
+ * 数据目录：%AppData%/wanneng2api（可用 WANENG_DATA_DIR 覆盖，供测试）
+ * - manager.json  : 壳子全局配置（§4.1）
+ * - platforms.json: 平台注册表（§4.2），首次不存在时生成默认值
+ */
+
+const fs = require('fs');
+const path = require('path');
+
+function appDataDir() {
+  if (process.env.WANENG_DATA_DIR) return process.env.WANENG_DATA_DIR;
+  if (process.env.APPDATA) return path.join(process.env.APPDATA, 'wanneng2api');
+  // 非 Windows 回落（开发/CI）
+  return path.join(process.env.HOME || process.env.USERPROFILE || '.', '.wanneng2api');
+}
+
+function defaultManagerConfig() {
+  return {
+    general: {
+      language: 'zh-CN',
+      theme: 'auto',
+      closeAction: 'tray',            // tray | quit
+      autoStart: false,               // 开机自启（app.setLoginItemSettings）
+      startMinimized: false,
+      autoStartPlatforms: ['workbuddy', 'codearts', 'loomy', 'hub'],
+      autoStartDelaySec: 0,
+    },
+    manager: {
+      listen: '127.0.0.1:17800',
+      logLevel: 'info',
+    },
+    update: {
+      checkOnLaunch: true,
+      channel: 'stable',
+      githubToken: '',
+      keepBackups: 3,
+    },
+    sub2api: {
+      pgPort: 5433,
+      redisPort: 6380,
+      dbPassword: '',                 // 首次启用 sub2api 时随机生成
+      dataDir: '',
+    },
+  };
+}
+
+/** 展开 "x/%APPDATA%/y" 中的环境变量（正斜杠统一） */
+function expandPath(p) {
+  if (!p) return p;
+  let out = String(p).replace(/\\/g, '/');
+  out = out.replace(/%APPDATA%/gi, process.env.APPDATA || '');
+  out = out.replace(/%([^%]+)%/g, (m, name) => process.env[name] || m);
+  return out;
+}
+
+/**
+ * 五个默认平台（§4.2 + 已核实事实）：
+ * - workbuddy : server.exe（不是 wb2api.exe），cwd=D:/软件/workbuddy2api（导入），7863 /healthz /__admin/
+ * - codearts  : codearts2api-panel.exe 在 bin/ 子目录，cwd=D:/app/codearts2api-panel（导入），7866 /healthz
+ * - loomy     : python -m loomy2api serve，cwd=D:/app/loomy2api（导入），17990 /health /panel
+ * - sub2api   : server.exe + 编排 PG:5433 / Redis:6380，/health（routes/common.go:12 已确认），默认关闭
+ * - hub       : ../hub/hub.exe（另一代理交付），17810，/health
+ */
+function defaultPlatforms() {
+  return {
+    version: 1,
+    platforms: [
+      {
+        id: 'workbuddy',
+        name: 'WorkBuddy2API',
+        type: 'go-binary',
+        enabled: true,
+        mode: 'import',
+        workDir: 'D:/软件/workbuddy2api',
+        run: {
+          binary: 'server.exe',
+          args: [],
+          env: { NO_PROXY: '*' },
+          shell: false,
+        },
+        port: 7863,
+        health: {
+          url: 'http://127.0.0.1:7863/healthz',
+          intervalSec: 15,
+          timeoutSec: 3,
+          failThreshold: 3,
+          okThreshold: 1,
+        },
+        adminPanel: 'http://127.0.0.1:7863/__admin/',
+        updater: {
+          repo: '',
+          assetPattern: 'workbuddy2api.*windows.*amd64\\.exe$',
+          strategy: 'replace-binary',
+          preserveGlobs: ['config.json', 'auths/**', 'data/**'],
+        },
+        restart: { baseBackoffSec: 2, maxBackoffSec: 300, maxRetries: 0 },
+      },
+      {
+        id: 'codearts',
+        name: 'CodeArts2API Panel',
+        type: 'go-binary',
+        enabled: true,
+        mode: 'import',
+        workDir: 'D:/app/codearts2api-panel',
+        run: {
+          binary: 'bin/codearts2api-panel.exe',
+          args: [],
+          env: { NO_PROXY: '*' },
+          shell: false,
+        },
+        port: 7866,
+        health: {
+          url: 'http://127.0.0.1:7866/healthz',
+          intervalSec: 15,
+          timeoutSec: 3,
+          failThreshold: 3,
+          okThreshold: 1,
+        },
+        adminPanel: 'http://127.0.0.1:7866/',
+        updater: {
+          repo: '',
+          assetPattern: '.*windows.*\\.exe$',
+          strategy: 'replace-binary',
+          preserveGlobs: ['config.json', 'auths/**', 'data/**'],
+        },
+        restart: { baseBackoffSec: 2, maxBackoffSec: 300, maxRetries: 0 },
+      },
+      {
+        id: 'loomy',
+        name: 'Loomy2API',
+        type: 'python-module',
+        enabled: true,
+        mode: 'import',
+        workDir: 'D:/app/loomy2api',
+        run: {
+          pythonPath: 'bundled',       // bundled=壳子捆绑 python-embed，找不到回落系统 python
+          module: 'loomy2api',
+          args: ['serve'],
+          env: { NO_PROXY: '*', PYTHONIOENCODING: 'utf-8' },
+        },
+        port: 17990,
+        health: {
+          url: 'http://127.0.0.1:17990/health',
+          intervalSec: 15,
+          timeoutSec: 3,
+          failThreshold: 3,
+          okThreshold: 1,
+        },
+        adminPanel: 'http://127.0.0.1:17990/panel',
+        updater: {
+          repo: 'Patrick130306/loomy2api',
+          assetPattern: '.*\\.zip$',
+          strategy: 'replace-dir',
+          preserveGlobs: ['config.json', 'accounts.json', 'accounts.json.bak*', 'auths/**', 'data/**', 'logs/**'],
+        },
+        restart: { baseBackoffSec: 2, maxBackoffSec: 300, maxRetries: 0 },
+      },
+      {
+        id: 'sub2api',
+        name: 'Sub2API（可选）',
+        type: 'go-binary',
+        enabled: false,                // 默认关闭；启用时自动托管 PG + Redis
+        mode: 'managed',
+        workDir: '%APPDATA%/wanneng2api/platforms/sub2api',
+        requires: ['pg', 'redis'],
+        run: {
+          binary: 'server.exe',
+          args: [],
+          env: { NO_PROXY: '*' },
+          shell: false,
+        },
+        port: 8080,
+        health: {
+          url: 'http://127.0.0.1:8080/health',   // 源码 routes/common.go:12 确认
+          intervalSec: 20,
+          timeoutSec: 5,
+          failThreshold: 3,
+          okThreshold: 1,
+        },
+        adminPanel: 'http://127.0.0.1:8080/',
+        updater: {
+          repo: 'Wei-Shaw/sub2api',
+          assetPattern: '.*windows.*amd64\\.zip$',
+          strategy: 'replace-dir',
+          preserveGlobs: ['config.yaml', 'data/**', 'auths/**'],
+        },
+        restart: { baseBackoffSec: 5, maxBackoffSec: 600, maxRetries: 0 },
+      },
+      {
+        id: 'hub',
+        name: 'Hub 聚合层',
+        type: 'go-binary',
+        enabled: true,
+        mode: 'managed',
+        workDir: '%APPDATA%/wanneng2api/hub',
+        run: {
+          // 相对 shell 根目录的编译产物（另一代理交付到 ../hub）
+          binary: '../hub/hub.exe',
+          args: ['-config', 'hub.json'],
+          env: { NO_PROXY: '*' },
+          shell: false,
+        },
+        port: 17810,
+        health: {
+          url: 'http://127.0.0.1:17810/health',
+          intervalSec: 15,
+          timeoutSec: 3,
+          failThreshold: 3,
+          okThreshold: 1,
+        },
+        adminPanel: 'http://127.0.0.1:17810/',
+        updater: {
+          repo: '',
+          assetPattern: 'hub.*windows.*amd64\\.exe$',
+          strategy: 'replace-binary',
+          preserveGlobs: ['hub.json'],
+        },
+        restart: { baseBackoffSec: 2, maxBackoffSec: 300, maxRetries: 0 },
+      },
+    ],
+  };
+}
+
+class ConfigStore {
+  constructor(dataDir = appDataDir()) {
+    this.dataDir = dataDir;
+    this.managerPath = path.join(dataDir, 'manager.json');
+    this.platformsPath = path.join(dataDir, 'platforms.json');
+    this.manager = null;
+    this.platforms = null;
+    this.loadAll();
+  }
+
+  _ensureDir() {
+    fs.mkdirSync(this.dataDir, { recursive: true });
+  }
+
+  _readJson(file, fallback) {
+    try {
+      return JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (_e) {
+      return fallback;
+    }
+  }
+
+  _writeJson(file, obj) {
+    this._ensureDir();
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+    fs.renameSync(tmp, file);
+  }
+
+  loadAll() {
+    this._ensureDir();
+    this.manager = { ... defaultManagerConfig(), ...this._readJson(this.managerPath, {}) };
+    // 深合并一级子对象，保留新增默认键
+    const defM = defaultManagerConfig();
+    for (const k of Object.keys(defM)) {
+      if (typeof defM[k] === 'object' && !Array.isArray(defM[k])) {
+        this.manager[k] = { ...defM[k], ...(this.manager[k] || {}) };
+      }
+    }
+    if (!fs.existsSync(this.platformsPath)) {
+      this.platforms = defaultPlatforms();
+      this._writeJson(this.platformsPath, this.platforms);
+    } else {
+      this.platforms = this._readJson(this.platformsPath, defaultPlatforms());
+      if (!this.platforms || !Array.isArray(this.platforms.platforms)) {
+        this.platforms = defaultPlatforms();
+      }
+    }
+  }
+
+  saveManager() {
+    this._writeJson(this.managerPath, this.manager);
+  }
+
+  savePlatforms() {
+    this._writeJson(this.platformsPath, this.platforms);
+  }
+
+  getPlatform(id) {
+    return this.platforms.platforms.find((p) => p.id === id) || null;
+  }
+
+  updatePlatform(id, patch) {
+    const p = this.getPlatform(id);
+    if (!p) return null;
+    Object.assign(p, patch);
+    this.savePlatforms();
+    return p;
+  }
+
+  /** 平台 workDir 绝对路径（展开 %APPDATA% 等） */
+  platformWorkDir(p) {
+    const expanded = expandPath(p.workDir);
+    if (path.isAbsolute(expanded)) return expanded;
+    // 相对路径相对壳子根目录（如 hub 的 ../hub/hub.exe 场景）
+    return path.resolve(this.dataDir, expanded);
+  }
+}
+
+module.exports = { ConfigStore, defaultManagerConfig, defaultPlatforms, appDataDir, expandPath };

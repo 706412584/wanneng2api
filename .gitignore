@@ -1,0 +1,29 @@
+# 构建产物
+hub/hub.exe
+hub/hub
+ui/node_modules/
+ui/dist/
+shell/node_modules/
+shell/dist/
+shell/out/
+
+# 运行时数据（本地开发）
+*.log
+hub/usage/
+hub/state.json
+hub/hub.json
+shell/manager.json
+shell/platforms.json
+
+# 环境与密钥
+.env
+.env.*
+*.key
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+.playwright-mcp/

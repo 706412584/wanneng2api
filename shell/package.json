@@ -1,0 +1,21 @@
+{
+  "name": "wanneng2api-shell",
+  "version": "0.1.0",
+  "description": "Wanneng2API desktop shell: process supervision, platform management, remote updates, tray/autostart",
+  "main": "src/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test:manager": "node scripts/test-platform-manager.js",
+    "check": "node --check src/main.js && node --check src/platform-manager.js && node --check src/updater.js && node --check src/api-server.js && node --check src/tray.js && node --check src/config.js && node --check src/logs.js"
+  },
+  "author": "wanneng2api",
+  "license": "MIT",
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  }
+}
