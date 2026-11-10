@@ -130,11 +130,13 @@ function PluginPlatformCard({ p, busy, onRemove, onChanged }) {
     }
   }, [loginState?.status])
 
-  // provider 插件没有自己的前端：管理入口 = magpie 控制台（magpie-web 平台）
+  // provider 插件没有自己的前端：管理入口 = magpie 控制台的该 provider 详情页。
+// 前端支持 ?view=providers&edit=<providerId>，直接落到详情弹窗。
   const openPanelLogin = async () => {
+    const providerId = (p.providers || [])[0]
     try {
-      await api.openPanel('magpie-web')
-      toast('已在系统浏览器打开 Magpie 控制台')
+      await api.openPanel('magpie-web', providerId ? { view: 'providers', edit: providerId } : undefined)
+      toast(providerId ? `已打开 Magpie 控制台的 ${p.name} 详情` : '已在系统浏览器打开 Magpie 控制台')
     } catch (e) {
       toast(`打开控制台失败：${e.message}`, 'err')
     }

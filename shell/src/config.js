@@ -274,7 +274,11 @@ function defaultPlatforms() {
           failThreshold: 3,
           okThreshold: 1,
         },
-        adminPanel: 'http://127.0.0.1:17899/?k=wanneng2api-magpie-web-2026',
+        // magpie 控制台的页面内深链接（见前端 syncURL）：
+        //   ?view=providers&edit=<providerId>  直接打开某个 provider 的详情
+        //   ?view=usage|routing|plugins|masking|settings&tab=<tab>
+        // 我们用 `k` 参数触发鉴权并下发 cookie，再带 view/edit 落到具体页面。
+        adminPanel: 'http://127.0.0.1:17899/?k=wanneng2api-magpie-web-2026&view=providers',
         restart: { baseBackoffSec: 3, maxBackoffSec: 300, maxRetries: 0 },
       },
     ],

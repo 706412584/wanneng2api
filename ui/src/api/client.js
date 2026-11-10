@@ -101,7 +101,7 @@ export const api = {
 
   checkUpdate: (id) => request(`/api/platforms/${encodeURIComponent(id)}/update/check`, { method: 'POST' }),
   applyUpdate: (id, checkInfo) => request(`/api/platforms/${encodeURIComponent(id)}/update/apply`, { method: 'POST', body: checkInfo ? { checkInfo } : undefined }),
-  openPanel: (id) => request(`/api/platforms/${encodeURIComponent(id)}/open-panel`, { method: 'POST' }),
+  openPanel: (id, query) => request(`/api/platforms/${encodeURIComponent(id)}/open-panel`, { method: 'POST', body: query ? { query } : undefined }),
 
   updatesSummary: async () => {
     const d = await request('/api/updates/summary')

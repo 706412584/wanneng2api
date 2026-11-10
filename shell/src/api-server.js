@@ -418,7 +418,21 @@ class ApiServer {
         if (action === 'open-panel') {
           const p = store.getPlatform(id);
           if (!p) throw new Error(`未知平台: ${id}`);
-          const url = p.adminPanel || `http://127.0.0.1:${p.port}/`;
+          let url = p.adminPanel || `http://127.0.0.1:${p.port}/`;
+          // 深链接：magpie-web 支持 ?view=<页面>&edit=<providerId>
+          // （前端 syncURL 实现），允许调用方指定落到哪个页面/详情。
+          const q = body && body.query;
+          if (q && typeof q === 'object' && (id === 'magpie-web' || id === 'magpie')) {
+            const u = new URL(url);
+            for (const [k, v] of Object.entries(q)) {
+              if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, String(v));
+            }
+            url = u.toString();
+          }
+          // magpie-web 深链接：?k=…&view=providers&edit=<id> 一次导航即可。
+          // 服务端 303 的 Location 会保留其余参数（实测
+          // `Location: /?edit=zcode&view=providers`），前端随后按初始
+          // edit 打开该 provider 的详情弹窗。
           if (this.deps.openExternal) this.deps.openExternal(url);
           else if (process.platform === 'win32') {
             // 测试环境无 Electron：start 命令兜底
