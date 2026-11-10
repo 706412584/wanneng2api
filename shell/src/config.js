@@ -25,7 +25,7 @@ function defaultManagerConfig() {
       closeAction: 'tray',            // tray | quit
       autoStart: false,               // 开机自启（app.setLoginItemSettings）
       startMinimized: false,
-      autoStartPlatforms: ['workbuddy', 'codearts', 'loomy', 'hub'],
+      autoStartPlatforms: ['workbuddy', 'codearts', 'loomy', 'lingxi', 'magpie'],
       autoStartDelaySec: 0,
     },
     manager: {
@@ -190,35 +190,55 @@ function defaultPlatforms() {
         restart: { baseBackoffSec: 5, maxBackoffSec: 600, maxRetries: 0 },
       },
       {
-        id: 'hub',
-        name: 'Hub 聚合层',
+        id: 'lingxi',
+        name: 'Lingxi2API（WPS 灵犀）',
         type: 'go-binary',
         enabled: true,
-        mode: 'managed',
-        workDir: '%APPDATA%/wanneng2api/hub',
+        mode: 'import',
+        workDir: 'D:/app/lingxi2api-panel',
         run: {
-          // 相对 shell 根目录的编译产物（另一代理交付到 ../hub）
-          binary: '../hub/hub.exe',
-          args: ['-config', 'hub.json'],
+          binary: 'lingxi2api.exe',
+          args: [],
           env: { NO_PROXY: '*' },
           shell: false,
         },
-        port: 17810,
+        port: 6789,
         health: {
-          url: 'http://127.0.0.1:17810/health',
+          url: 'http://127.0.0.1:6789/healthz',
           intervalSec: 15,
           timeoutSec: 3,
           failThreshold: 3,
           okThreshold: 1,
         },
-        adminPanel: 'http://127.0.0.1:17810/',
+        adminPanel: 'http://127.0.0.1:6789/panel/',
         updater: {
-          repo: '',
-          assetPattern: 'hub.*windows.*amd64\\.exe$',
+          repo: 'ketion/lingxi2api-panel',
+          assetPattern: '.*windows.*\\.exe$',
           strategy: 'replace-binary',
-          preserveGlobs: ['hub.json'],
+          preserveGlobs: ['config.json', 'auths/**', 'data/**'],
         },
         restart: { baseBackoffSec: 2, maxBackoffSec: 300, maxRetries: 0 },
+      },
+      {
+        // magpie 不是本机编译产物：它是独立安装的桌面应用，壳只做
+        // 存活探测与页面跳转，不负责启动/更新（由 magpie 自己负责）。
+        id: 'magpie',
+        name: 'Magpie 网关',
+        type: 'external',
+        enabled: true,
+        mode: 'external',
+        workDir: '',
+        run: { binary: '', args: [], env: {}, shell: false },
+        managed: false,
+        port: 3425,
+        health: {
+          url: 'http://127.0.0.1:3425/v1/models',
+          intervalSec: 20,
+          timeoutSec: 3,
+          failThreshold: 3,
+          okThreshold: 1,
+        },
+        adminPanel: 'http://127.0.0.1:3425/',
       },
     ],
   };

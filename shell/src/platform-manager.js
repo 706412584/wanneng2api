@@ -410,6 +410,21 @@ class PlatformManager extends EventEmitter {
     rt.failCount = 0;
     rt.okCount = 0;
 
+    // 0. 外部托管平台（如 magpie）：壳不启动它，只探测存活并反映到状态灯。
+    //    它的生命周期由应用自身/系统托盘负责，壳无权启停。
+    if (cfg.type === 'external' || cfg.managed === false) {
+      rt.setStatus('starting');
+      const h = cfg.health || {};
+      const ok = await this._probeHealth(h.url || `http://127.0.0.1:${cfg.port}/`, Number(h.timeoutSec) || 3).catch(() => false);
+      if (ok) {
+        rt.setStatus('healthy');
+      } else {
+        rt.setStatus('unhealthy', '外部服务未运行（由该应用自己启动）');
+      }
+      this._startHealthLoop(rt);
+      return;
+    }
+
     // 1. 端口预检
     if (cfg.port) {
       const { free, pid } = await checkPortFree(cfg.port, rt.pid);
@@ -522,6 +537,14 @@ class PlatformManager extends EventEmitter {
     const rt = this.getRuntime(id);
     if (!rt) throw new Error(`未知平台: ${id}`);
     if (rt.status === 'updating') throw new Error('平台更新中，禁止停止');
+    // 外部托管平台不归壳管，stop 只停止探测，不碰对方进程。
+    if (rt.cfg.type === 'external' || rt.cfg.managed === false) {
+      rt.clearTimers();
+      rt.proc = null;
+      rt.pid = 0;
+      rt.setStatus('stopped');
+      return rt.snapshot();
+    }
     rt.stopping = true;
     rt.clearTimers();
 
