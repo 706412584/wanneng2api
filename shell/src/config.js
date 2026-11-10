@@ -161,20 +161,22 @@ function defaultPlatforms() {
       {
         id: 'sub2api',
         name: 'Sub2API（可选）',
+        // 官方上游 Wei-Shaw/sub2api（不是本地定制分支）。它本身也是一个
+        // 订阅分发中转网关，与我们这套定位重叠，因此默认关闭、按需启用。
         type: 'go-binary',
-        enabled: false,                // 默认关闭；启用时自动托管 PG + Redis
+        enabled: false,
         mode: 'managed',
         workDir: '%APPDATA%/wanneng2api/platforms/sub2api',
         requires: ['pg', 'redis'],
         run: {
-          binary: 'server.exe',
+          binary: 'sub2api.exe',        // 官方 release 包内的可执行文件名
           args: [],
           env: { NO_PROXY: '*' },
           shell: false,
         },
         port: 8080,
         health: {
-          url: 'http://127.0.0.1:8080/health',   // 源码 routes/common.go:12 确认
+          url: 'http://127.0.0.1:8080/health',   // 源码 server/routes/common.go:12
           intervalSec: 20,
           timeoutSec: 5,
           failThreshold: 3,
@@ -183,9 +185,9 @@ function defaultPlatforms() {
         adminPanel: 'http://127.0.0.1:8080/',
         updater: {
           repo: 'Wei-Shaw/sub2api',
-          assetPattern: '.*windows.*amd64\\.zip$',
+          assetPattern: 'sub2api_[0-9.]+_windows_amd64\\.zip$',
           strategy: 'replace-dir',
-          preserveGlobs: ['config.yaml', 'data/**', 'auths/**'],
+          preserveGlobs: ['config.yaml', 'data/**', 'auths/**', '.env'],
         },
         restart: { baseBackoffSec: 5, maxBackoffSec: 600, maxRetries: 0 },
       },

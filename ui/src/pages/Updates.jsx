@@ -157,6 +157,8 @@ export default function Updates() {
         {!items.length && <Empty icon="⟳" text="暂无版本数据，点击「一键检查全部」开始" />}
       </div>
 
+      <MagpieCoreCard />
+
       {anyUpdating && (
         <div className="card">
           <div className="card-title">更新进度</div>
@@ -183,5 +185,116 @@ export default function Updates() {
         </div>
       </div>
     </>
+  )
+}
+
+/** Magpie 内核版本卡片：检测本机 CLI 版本与 GitHub 最新 release 的差异 */
+function MagpieCoreCard() {
+  const fetchVersion = useCallback(() => api.magpieVersion(), [])
+  // 更新进行中每 3 秒轮询一次，平时不轮询
+  const [pollMs, setPollMs] = useState(0)
+  const { data, error, loading, refresh } = usePolling(fetchVersion, pollMs)
+  const toast = useToast()
+  const [checking, setChecking] = useState(false)
+  const [updating, setUpdating] = useState(false)
+
+  // 更新开始后转为轮询，等 magpie 自己跑完
+  useEffect(() => {
+    if (updating && data?.updating === false && data?.lastUpdate) {
+      setUpdating(false)
+      setPollMs(0)
+      const ok = data.lastUpdate.ok
+      toast(ok ? 'magpie 内核更新完成，请重启 magpie 网关生效' : `更新失败：${data.lastUpdate.message}`, ok ? 'ok' : 'err')
+      refresh()
+    }
+  }, [data?.updating, data?.lastUpdate, updating, refresh, toast])
+
+  const doUpdate = async () => {
+    setUpdating(true)
+    try {
+      await api.magpieUpdate()
+      toast('已开始下载并安装最新内核…')
+      setPollMs(3000)
+      refresh()
+    } catch (e) {
+      setUpdating(false)
+      toast(`更新失败：${e.message}`, 'err')
+    }
+  }
+
+  const recheck = async () => {
+    setChecking(true)
+    try {
+      // usePolling.refresh() 不返回值，这里直接取一次以给出提示
+      const r = await api.magpieVersion()
+      refresh()
+      if (r && r.hasUpdate) toast(`magpie 有新版本 v${r.latest}（当前 v${r.current}）`)
+      else if (r && r.current) toast(`magpie 已是最新 v${r.current}`)
+      else toast('未检测到本机 magpie 可执行文件', 'err')
+    } catch (e) {
+      toast(`检测失败：${e.message}`, 'err')
+    } finally {
+      setChecking(false)
+    }
+  }
+
+  return (
+    <div className="card" style={{ marginTop: 16 }}>
+      <div className="card-title" style={{ justifyContent: 'space-between' }}>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          内核版本
+          <span className="badge blue">magpie</span>
+        </span>
+        <button className="btn sm" disabled={checking} onClick={recheck}>
+          {checking ? '检测中…' : '检查内核更新'}
+        </button>
+      </div>
+
+      {loading && !data && <div style={{ fontSize: 12.5, color: 'var(--text-3)' }}>检测中…</div>}
+      {error && <div style={{ fontSize: 12.5, color: 'var(--red)' }}>检测失败：{error.message}</div>}
+
+      {data && (
+        <>
+          <div className="table-wrap">
+            <table className="tbl">
+              <thead>
+                <tr><th>组件</th><th>本机版本</th><th>最新版本</th><th>状态</th><th style={{ textAlign: 'right' }}>操作</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><b>magpie 内核</b>
+                    {!data.binary && <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 2 }}>未找到可执行文件</div>}
+                  </td>
+                  <td className="num">{data.current ? `v${data.current}` : '—'}</td>
+                  <td className="num">{data.latest ? <span style={{ color: data.hasUpdate ? 'var(--blue)' : 'var(--text-3)', fontWeight: data.hasUpdate ? 700 : 400 }}>v{data.latest}</span> : '—'}</td>
+                  <td>
+                    {!data.current
+                      ? <span className="badge gray">未安装</span>
+                      : data.hasUpdate
+                        ? <span className="badge orange">有新版</span>
+                        : <span className="badge green">最新</span>}
+                  </td>
+                  <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                    {data.hasUpdate && !updating && (
+                      <button className="btn sm primary" onClick={doUpdate}>立即更新内核</button>
+                    )}{' '}
+                    {updating || data.updating
+                      ? <span className="badge blue">更新中…</span>
+                      : data.releaseUrl
+                        ? <a className="btn sm ghost" href={data.releaseUrl} target="_blank" rel="noreferrer">发布页</a>
+                        : <span style={{ color: 'var(--text-3)', fontSize: 12 }}>—</span>}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 8 }}>
+            magpie 内核以独立应用方式安装与自更新，管理台只检测版本、不代为升级。
+            发布源：<span className="mono">yetone/magpie-releases</span>
+            {data.checkedAt ? ` · 检测于 ${fmtAgo(data.checkedAt)}` : ''}
+          </div>
+        </>
+      )}
+    </div>
   )
 }

@@ -47,21 +47,99 @@ export async function pingManager() {
   }
 }
 
+// ---------- 形状适配 ----------
+// 壳的真实响应与 UI 组件的期望有两处差异，统一在这里抹平，
+// 这样 UI 组件本身不必关心数据来自 mock 还是壳：
+//   1. 壳用 `status` 表示平台状态，UI 用 `state`
+//   2. 壳把列表包在对象里（{platforms}/{updates}），UI 期望直接是数组
+const stateOf = (p) => p.state ?? p.status
+
+function adaptPlatform(p) {
+  if (!p || typeof p !== 'object') return p
+  return {
+    ...p,
+    state: stateOf(p),
+    health: p.health ?? (stateOf(p) === 'healthy' ? 'ok' : 'unknown'),
+    uptimeSec: p.uptimeSec ?? 0,
+    updateAvailable: p.updateAvailable ?? p.hasUpdate ?? false
+  }
+}
+
+function adaptPlatformList(r) {
+  const arr = Array.isArray(r) ? r : (Array.isArray(r?.platforms) ? r.platforms : [])
+  return arr.map(adaptPlatform)
+}
+
 // ---------- 平台 ----------
 export const api = {
-  getOverview: () => request('/api/overview'),
-  listPlatforms: () => request('/api/platforms'),
-  getPlatformDetail: (id) => request(`/api/platforms/${encodeURIComponent(id)}/detail`),
+  getOverview: async () => {
+    const d = await request('/api/overview')
+    const platforms = adaptPlatformList(d)
+    const alerts = Array.isArray(d.alerts)
+      ? d.alerts
+      : platforms
+        .filter((p) => p.state === 'unhealthy' || p.state === 'error' || p.lastError)
+        .map((p) => ({ id: p.id, level: p.state === 'error' ? 'error' : 'warn', message: p.lastError || `平台处于 ${p.state} 状态` }))
+    return {
+      ...d,
+      platforms,
+      hub: d.hub ? { ...d.hub, state: stateOf(d.hub) } : null,
+      alerts,
+      pendingUpdates: d.pendingUpdates ?? platforms.filter((p) => p.updateAvailable).length
+    }
+  },
+
+  listPlatforms: async () => adaptPlatformList(await request('/api/platforms')),
+
+  getPlatformDetail: async (id) => {
+    const d = await request(`/api/platforms/${encodeURIComponent(id)}/detail`)
+    return d && typeof d === 'object' ? adaptPlatform(d) : d
+  },
+
   platformAction: (id, action) => request(`/api/platforms/${encodeURIComponent(id)}/${action}`, { method: 'POST' }),
   getLogs: (id, tail = 200) => request(`/api/platforms/${encodeURIComponent(id)}/logs?tail=${tail}`),
 
   checkUpdate: (id) => request(`/api/platforms/${encodeURIComponent(id)}/update/check`, { method: 'POST' }),
-  applyUpdate: (id) => request(`/api/platforms/${encodeURIComponent(id)}/update/apply`, { method: 'POST' }),
+  applyUpdate: (id, checkInfo) => request(`/api/platforms/${encodeURIComponent(id)}/update/apply`, { method: 'POST', body: checkInfo ? { checkInfo } : undefined }),
   openPanel: (id) => request(`/api/platforms/${encodeURIComponent(id)}/open-panel`, { method: 'POST' }),
 
-  updatesSummary: () => request('/api/updates/summary'),
-  hubStatus: () => request('/api/hub/status'),
+  updatesSummary: async () => {
+    const d = await request('/api/updates/summary')
+    const items = Array.isArray(d?.items)
+      ? d.items
+      : (Array.isArray(d?.updates) ? d.updates : []).map((u) => ({
+          ...u,
+          updateAvailable: u.updateAvailable ?? u.hasUpdate ?? false,
+          latest: u.latest ?? u.current
+        }))
+    return { ...d, items }
+  },
+
+  hubStatus: async () => {
+    const d = await request('/api/hub/status')
+    // 聚合层是 magpie：把壳返回的字段映射成页面用的形状
+    return {
+      ...d,
+      state: stateOf(d),
+      baseUrl: d.baseUrl ?? d.gateway ?? 'http://127.0.0.1:3425',
+      listen: d.listen ?? '127.0.0.1:3425',
+      apiKey: d.apiKey ?? '',
+      modelRoutes: (d.modelRoutes ?? []).map((r) => ({
+        ...r,
+        // 壳给的是 {pattern, chain, routing}；页面用 {pattern, chain}
+        chain: Array.isArray(r.chain) ? r.chain : []
+      })),
+      upstreams: (d.upstreams || []).map((u) => ({ ...u, state: stateOf(u) }))
+    }
+  },
   hubReload: () => request('/api/hub/reload', { method: 'POST' }),
+
+  // magpie 内核实管的 provider 清单（origin: plugin=我们接入的 / official=官方插件）
+  magpieProviders: () => request('/api/magpie/providers'),
+  // magpie 内核版本与最新 release 对比
+  magpieVersion: () => request('/api/magpie/version'),
+  // 直接执行 magpie update（下载并替换内核）
+  magpieUpdate: () => request('/api/magpie/update', { method: 'POST', timeout: 30000 }),
 
   getSettings: () => request('/api/settings'),
   putSettings: (settings) => request('/api/settings', { method: 'PUT', body: settings })

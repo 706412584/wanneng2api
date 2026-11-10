@@ -114,6 +114,7 @@ class PlatformRuntime {
     this.healthTimer = null;
     this.restartTimer = null;
     this.stopping = false;
+    this.adopted = false;   // 端口上已有本平台实例，被认领而非 spawn
     this.version = null;
     this.lastHealthAt = 0;
     this.deps = { pg: { status: 'stopped', pid: 0 }, redis: { status: 'stopped', pid: 0 } };
@@ -167,6 +168,7 @@ class PlatformRuntime {
       uptimeSec: this.startedAt ? Math.floor((Date.now() - this.startedAt) / 1000) : 0,
       version: this.version || (cfg.updater && cfg.updater.currentVersion) || null,
       lastExitCode: this.lastExitCode,
+      adopted: this.adopted,
       lastError: this.lastError,
       restartAttempts: this.restartAttempts,
       lastHealthAt: this.lastHealthAt,
@@ -342,6 +344,26 @@ class PlatformManager extends EventEmitter {
     });
   }
 
+  /**
+   * 存活探针：只要端口上有人回 HTTP 就算活，不管状态码。
+   * 用于判定"这个端口上的实例是不是该平台自己"（收养用）。
+   * 与 _probeHealth 的区别：灵犀无账号时 /healthz 返回 503
+   * （语义是"上游不可服务"，但进程确实在跑），健康判据会判不健康，
+   * 而收养只需要确认进程活着。
+   */
+  _probeAlive(url, timeoutSec) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (ok) => { if (!settled) { settled = true; resolve(ok); } };
+      const req = http.get(url, { timeout: Math.max(1, timeoutSec) * 1000 }, (res) => {
+        res.resume();
+        done(true); // 任何 HTTP 响应都算活
+      });
+      req.on('timeout', () => { req.destroy(); done(false); });
+      req.on('error', () => done(false));
+    });
+  }
+
   _scheduleHealthTimer(rt) {
     if (rt.healthTimer) clearInterval(rt.healthTimer);
     const h = rt.cfg.health || {};
@@ -441,6 +463,25 @@ class PlatformManager extends EventEmitter {
     if (cfg.port) {
       const { free, pid } = await checkPortFree(cfg.port, rt.pid);
       if (!free) {
+        // 端口已被占用：先判断是不是该平台自己的实例（用户手动启动、
+        // 或上一次壳退出时没带走）。健康端点通过就"收养"它，只托管不重启。
+        const h = cfg.health || {};
+        // 用存活探针而非健康探针：灵犀无账号时健康端点返回 503，
+        // 但进程确实在跑，应当收养而不是判成冲突。
+        const adoptable = await this._probeAlive(
+          h.url || `http://127.0.0.1:${cfg.port}/`,
+          Number(h.timeoutSec) || 3,
+        ).catch(() => false);
+        if (adoptable) {
+          rt.adopted = true;
+          rt.pid = pid || 0;
+          rt.startedAt = Date.now();
+          rt.lastError = '';
+          rt.setStatus('healthy');
+          rt.appendLog('manager', `收养已运行实例（端口 ${cfg.port}，PID ${pid || '未知'}）`);
+          this._scheduleHealthTimer(rt);
+          return rt.snapshot();
+        }
         const msg = `port-conflict: 端口 ${cfg.port} 已被 PID ${pid} 占用（非本平台进程）`;
         rt.setStatus('error', msg);
         throw new Error(msg);
@@ -554,6 +595,21 @@ class PlatformManager extends EventEmitter {
       rt.clearTimers();
       rt.proc = null;
       rt.pid = 0;
+      rt.setStatus('stopped');
+      return rt.snapshot();
+    }
+    // 收养来的实例不是我们 spawn 的：只停止托管，不杀用户自己开的进程。
+    if (rt.adopted) {
+      rt.stopping = true;
+      rt.clearTimers();
+      rt.adopted = false;
+      rt.proc = null;
+      rt.pid = 0;
+      rt.startedAt = 0;
+      rt.failCount = 0;
+      rt.okCount = 0;
+      rt.stopping = false;
+      rt.appendLog('manager', '停止托管收养实例（进程未终止，仍由你自行管理）');
       rt.setStatus('stopped');
       return rt.snapshot();
     }

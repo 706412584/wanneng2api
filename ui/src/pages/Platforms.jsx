@@ -53,17 +53,123 @@ export default function Platforms() {
   if (error && !data) return <ErrorBox error={error} onRetry={refresh} />
   if (!data?.length) return <Empty icon="▦" text="尚无注册平台，请在壳子 platforms.json 中登记" />
 
+  const ourPlatforms = data.filter((p) => p.type !== 'external')
+  const corePlatforms = data.filter((p) => p.type === 'external')
+
   return (
-    <div className="platform-grid">
-      {data.map((p) => (
-        <PlatformCard
-          key={p.id}
-          p={p}
-          busy={acting[p.id]}
-          onAction={doAction}
-          onOpenPanel={openPanel}
-        />
-      ))}
+    <>
+      <div className="platform-grid">
+        {ourPlatforms.map((p) => (
+          <PlatformCard
+            key={p.id}
+            p={p}
+            busy={acting[p.id]}
+            onAction={doAction}
+            onOpenPanel={openPanel}
+          />
+        ))}
+      </div>
+
+      {corePlatforms.length > 0 && (
+        <div className="platform-grid" style={{ marginTop: 16 }}>
+          {corePlatforms.map((p) => (
+            <PlatformCard
+              key={p.id}
+              p={p}
+              busy={acting[p.id]}
+              onAction={doAction}
+              onOpenPanel={openPanel}
+            />
+          ))}
+        </div>
+      )}
+
+      <MagpieProviders />
+    </>
+  )
+}
+
+/** magpie 内核实管的 provider 清单：我们接入的标「插件」，其余标「官方」 */
+function MagpieProviders() {
+  const fetchProviders = useCallback(() => api.magpieProviders(), [])
+  const { data, error, loading, refresh } = usePolling(fetchProviders, 15000)
+
+  const providers = data?.providers || []
+
+  return (
+    <div className="card" style={{ marginTop: 16 }}>
+      <div className="card-title" style={{ justifyContent: 'space-between' }}>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          magpie 内核 Provider
+          <span className="sub">
+            插件 {data?.pluginCount ?? 0} · 官方 {data?.officialCount ?? 0}
+          </span>
+        </span>
+        <button className="btn sm" onClick={refresh}>刷新</button>
+      </div>
+
+      {loading && !data && <div style={{ fontSize: 12.5, color: 'var(--text-3)' }}>读取中…</div>}
+      {error && <div style={{ fontSize: 12.5, color: 'var(--red)' }}>读取失败：{error.message}</div>}
+
+      {data && !providers.length && (
+        <Empty icon="⇄" text="magpie 尚未配置任何 provider" />
+      )}
+
+      {providers.length > 0 && (
+        <div className="table-wrap">
+          <table className="tbl">
+            <thead>
+              <tr>
+                <th>来源</th>
+                <th>Provider</th>
+                <th>上游地址</th>
+                <th>协议</th>
+                <th>模型</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              {providers.map((p) => (
+                <tr key={p.id}>
+                  <td>
+                    {p.origin === 'plugin'
+                      ? <span className="badge purple" title="我们自研网关接入的 provider">插件</span>
+                      : <span className="badge blue" title="magpie 官方或社区插件提供">官方</span>}
+                  </td>
+                  <td>
+                    <b>{p.name}</b>
+                    <div style={{ fontSize: 11.5, color: 'var(--text-3)' }} className="mono">{p.id}</div>
+                  </td>
+                  <td className="mono" style={{ fontSize: 11.5 }}>{p.baseUrl || '—'}</td>
+                  <td style={{ fontSize: 12 }}>
+                    {p.anthropic ? (
+                      <span>
+                        <span className="badge green">OpenAI</span>{' '}
+                        <span className="badge blue">Anthropic</span>
+                      </span>
+                    ) : (
+                      <span className="badge green">OpenAI</span>
+                    )}
+                  </td>
+                  <td className="num">{p.models || '—'}</td>
+                  <td>
+                    {p.signedIn
+                      ? <span className="badge green">已配置</span>
+                      : <span className="badge gray">未登录</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {data?.configDir && (
+        <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 8 }}>
+          数据来源：<span className="mono">{data.configDir}</span>
+          （providers.json / plugin-providers.json）
+        </div>
+      )}
     </div>
   )
 }
@@ -79,6 +185,10 @@ function PlatformCard({ p, busy, onAction, onOpenPanel }) {
         <div className="grow">
           <div className="name">
             {p.name}
+            <span className={`badge ${p.type === 'external' ? 'blue' : 'purple'}`} title={p.type === 'external' ? 'magpie 内核，由它自己管理生命周期' : '我们自研接入的网关'}>
+              {p.type === 'external' ? '官方内核' : '插件'}
+            </span>
+            {p.adopted && <span className="badge gray" title="该端口上已有它自己的实例在运行，管理台只做监控，不负责启动">外部实例</span>}
             {!p.enabled && <span className="badge gray">已禁用</span>}
             {p.updateAvailable && <span className="badge orange">可更新</span>}
             {p.state === 'updating' && <span className="badge blue">更新中</span>}

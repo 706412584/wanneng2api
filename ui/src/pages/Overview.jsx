@@ -34,17 +34,17 @@ export default function Overview() {
           </span>
         </div>
         <div className="metric">
-          <div className="label">Hub 状态</div>
+          <div className="label">Magpie 内核</div>
           <div className="value" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <StateDot state={d.hub?.state || 'stopped'} />
             <span style={{ fontSize: 17 }}>{STATE_TEXT[d.hub?.state] || d.hub?.state || '—'}</span>
           </div>
-          <span className={`hint ${hubOk ? 'ok' : 'warn'}`}>统一入口 :17810</span>
+          <span className={`hint ${hubOk ? 'ok' : 'warn'}`}>统一入口 :3425</span>
         </div>
         <div className="metric">
           <div className="label">今日请求</div>
           <div className="value">{fmtNum(d.todayRequests)}</div>
-          <span className="hint neutral">经 Hub 转发</span>
+          <span className="hint neutral">经 magpie 转发</span>
         </div>
         <div className="metric">
           <div className="label">今日 Token</div>

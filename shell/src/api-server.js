@@ -7,7 +7,11 @@
  */
 
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const { URL } = require('url');
+
+const pathExtname = (p) => path.extname(p);
 
 const MAX_BODY = 1024 * 1024;
 
@@ -66,6 +70,60 @@ class ApiServer {
     });
   }
 
+  /** 纯前端模式：让同一个端口托管 UI 构建产物（SPA 路由回退 index.html） */
+  serveStatic(dir) {
+    this.deps.staticDir = dir;
+  }
+
+  /**
+   * 定位 magpie 可执行文件。
+   * 优先取 external 平台条目上配置的路径，其次本仓库 tools/magpie/magpie.exe。
+   */
+  _magpieBinary() {
+    const p = this.deps.store && this.deps.store.getPlatform('magpie');
+    const candidates = [];
+    if (p && p.run && p.run.binary) {
+      const raw = p.run.binary;
+      candidates.push(path.isAbsolute(raw) ? raw : path.resolve(this.deps.shellRoot || process.cwd(), raw));
+    }
+    candidates.push(path.resolve(__dirname, '..', '..', 'tools', 'magpie', 'magpie.exe'));
+    candidates.push(path.resolve(__dirname, '..', '..', 'tools', 'magpie', 'magpie'));
+    for (const c of candidates) {
+      if (c && fs.existsSync(c)) return c;
+    }
+    return null;
+  }
+
+  _serveStatic(req, res, dir) {
+    const MIME = {
+      '.html': 'text/html; charset=utf-8',
+      '.js': 'text/javascript; charset=utf-8',
+      '.css': 'text/css; charset=utf-8',
+      '.svg': 'image/svg+xml',
+      '.png': 'image/png',
+      '.ico': 'image/x-icon',
+      '.json': 'application/json; charset=utf-8',
+      '.woff2': 'font/woff2',
+    };
+    let rel = decodeURIComponent(req.url.split('?')[0]);
+    if (rel === '/' || !pathExtname(rel)) rel = '/index.html';
+    // 去掉前导分隔符：path.resolve(dir, '/x') 在 Windows 上会解析成盘符根 D:\x
+    rel = rel.replace(/^[/\\]+/, '');
+    const file = path.resolve(dir, rel);
+    // 目录穿越防护
+    if (!file.startsWith(path.resolve(dir))) {
+      res.writeHead(403).end('forbidden');
+      return;
+    }
+    fs.readFile(file, (err, buf) => {
+      if (err) {
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }).end('not found');
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': MIME[pathExtname(file)] || 'application/octet-stream' }).end(buf);
+    });
+  }
+
   close() {
     if (this.server) return new Promise((r) => this.server.close(r));
     return Promise.resolve();
@@ -96,7 +154,13 @@ class ApiServer {
       }
 
       const r = await this._route(req.method, parts, body, u, origin);
-      if (r === undefined) return json(res, 404, { error: `not found: ${req.method} ${u.pathname}` }, origin);
+      if (r === undefined) {
+        // 非 /api 路径交给静态托管（纯前端模式下 UI 与 API 同端口）
+        if (this.deps.staticDir && req.method === 'GET') {
+          return this._serveStatic(req, res, this.deps.staticDir);
+        }
+        return json(res, 404, { error: `not found: ${req.method} ${u.pathname}` }, origin);
+      }
       return json(res, r.__code || 200, r, origin);
     } catch (e) {
       const code = /未知平台|未配置|不存在|未找到/.test(e.message) ? 404 : 400;
@@ -144,6 +208,53 @@ class ApiServer {
     // GET /api/platforms
     if (method === 'GET' && parts[1] === 'platforms' && parts.length === 2) {
       return { platforms: manager.statusList() };
+    }
+
+    // GET /api/magpie/providers —— magpie 内核实管的 provider 清单。
+    // origin=plugin 表示我们自己接入的四个网关，official 表示 magpie 官方/社区插件。
+    if (method === 'GET' && parts[1] === 'magpie' && parts[2] === 'providers') {
+      const magpie = require('./magpie-adapter');
+      const providers = magpie.listProviders();
+      return {
+        configDir: magpie.magpieConfigDir(),
+        providers,
+        pluginCount: providers.filter((p) => p.origin === 'plugin').length,
+        officialCount: providers.filter((p) => p.origin === 'official').length,
+      };
+    }
+
+    // GET /api/magpie/version —— 内核版本与最新 release 对比
+    if (method === 'GET' && parts[1] === 'magpie' && parts[2] === 'version') {
+      const magpie = require('./magpie-adapter');
+      const bin = this._magpieBinary();
+      const current = await magpie.detectVersion(bin);
+      // 优先用 magpie 自己的更新通道（不受 GitHub 60/h 限流），失败再回落 GitHub API
+      let latest = await magpie.checkViaCli(bin).catch(() => null);
+      if (!latest || (!latest.tag && !latest.upToDate)) {
+        const gh = await magpie.latestRelease();
+        if (gh && gh.tag) latest = gh;
+      }
+      return {
+        binary: bin || null,
+        current,
+        latest: latest ? latest.tag || current : null,
+        hasUpdate: latest && latest.tag ? magpie.semverGt(latest.tag, current) : false,
+        releaseUrl: latest ? latest.url || '' : '',
+        checkedAt: Date.now(),
+        updating: magpie.isUpdating(),
+        lastUpdate: magpie.updateState().last,
+      };
+    }
+
+    // POST /api/magpie/update —— 直接执行 `magpie update`（下载并替换内核）
+    if (method === 'POST' && parts[1] === 'magpie' && parts[2] === 'update') {
+      const magpie = require('./magpie-adapter');
+      const bin = this._magpieBinary();
+      if (!bin) throw new Error('未找到 magpie 可执行文件，无法更新');
+      if (magpie.isUpdating()) throw new Error('更新已在进行中');
+      // 后台执行，避免 HTTP 请求挂住；结果通过 /api/magpie/version 的 updating 字段观察
+      magpie.runUpdate(bin);
+      return { ok: true, started: true, binary: bin, message: '已开始下载并安装最新版 magpie 内核' };
     }
 
     // /api/platforms/:id/...
@@ -195,6 +306,8 @@ class ApiServer {
     if (method === 'GET' && parts[1] === 'hub' && parts[2] === 'status') {
       if (this.deps.getHubStatus) return this.deps.getHubStatus();
       const magpie = manager.statusOf('magpie');
+      const adapter = require('./magpie-adapter');
+      const groups = adapter.listGroups();
       const upstreams = manager.statusList()
         .filter((p) => ['workbuddy', 'codearts', 'loomy', 'lingxi'].includes(p.id))
         .map((p) => ({
@@ -202,13 +315,23 @@ class ApiServer {
           name: p.name,
           baseUrl: `http://127.0.0.1:${p.port}`,
           state: p.status,
+          priority: 1,
+          enabled: p.enabled !== false,
           managed: true,
         }));
       return {
         backend: 'magpie',
         status: magpie ? magpie.status : 'unknown',
         gateway: 'http://127.0.0.1:3425',
+        listen: '127.0.0.1:3425',
+        baseUrl: 'http://127.0.0.1:3425',
         detail: magpie,
+        // 路由组（magpie group）→ 页面上的「模型路由表」
+        modelRoutes: groups.map((g) => ({
+          pattern: `group/${g.name}`,
+          chain: g.models,
+          routing: g.routing,
+        })),
         upstreams,
       };
     }
