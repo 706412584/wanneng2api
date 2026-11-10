@@ -14,6 +14,9 @@ export default function Platforms() {
   const { data, error, loading, refresh, setData } = usePolling(fetchPlatforms, 5000)
   const toast = useToast()
   const [acting, setActing] = useState({}) // id -> action 进行中
+  // 插件安装/卸载后递增，驱动上方「已安装插件」区块刷新
+  // （必须放在任何条件 return 之前：Hook 数量要稳定）
+  const [pluginRev, setPluginRev] = useState(0)
 
   /** 乐观更新 + POST，失败回滚并提示；成功后立即轮询校正 */
   const doAction = async (p, action, label) => {
@@ -84,7 +87,9 @@ export default function Platforms() {
         </div>
       )}
 
-      <PluginMarket />
+      <InstalledPlugins rev={pluginRev} />
+
+      <PluginMarket onInstalled={() => setPluginRev((v) => v + 1)} />
       <Collapsible title="已配置的内置 Provider" summaryKey="已接入的厂商 / 中转 / 订阅">
         <MagpieProviders />
       </Collapsible>
@@ -92,6 +97,85 @@ export default function Platforms() {
         <MagpieCatalog />
       </Collapsible>
     </>
+  )
+}
+
+/** 已安装的平台型插件：安装后出现在这里，与自研网关并列 */
+function InstalledPlugins({ rev }) {
+  const fetchPlugins = useCallback(() => api.magpiePlugins(false), [])
+  const { data, error, refresh } = usePolling(fetchPlugins, 0)
+  const toast = useToast()
+  const [busy, setBusy] = useState({})
+
+  // 安装/卸载后立即拉一次，不必等用户手动刷新
+  useEffect(() => {
+    if (rev > 0) refresh()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rev])
+
+  const installed = (data?.plugins || []).filter(
+    (p) => p.installed && p.kind === 'provider'   // 只有 provider 型插件才算「平台」
+  )
+
+  const remove = async (p) => {
+    setBusy((s) => ({ ...s, [p.package]: true }))
+    try {
+      const r = await api.magpieRemovePlugin(p.package)
+      if (r.ok) { toast(`${p.name} 已卸载`); refresh() }
+      else toast(`卸载失败：${(r.stderr || r.stdout || '').slice(0, 200)}`, 'err')
+    } finally {
+      setBusy((s) => { const n = { ...s }; delete n[p.package]; return n })
+    }
+  }
+
+  if (error && !data) {
+    return (
+      <div style={{ marginTop: 16, fontSize: 12.5, color: 'var(--red)' }}>
+        读取已安装插件失败：{error.message}
+      </div>
+    )
+  }
+  if (!installed.length) return null
+
+  return (
+    <div className="platform-grid" style={{ marginTop: 16 }}>
+      {installed.map((p) => (
+        <div className="card plat-card" key={p.package}>
+          <div className="plat-head">
+            <span className="dot healthy" />
+            <div className="grow">
+              <div className="name">
+                {p.name}
+                <span className="badge purple" title="magpie 社区插件">插件平台</span>
+              </div>
+              <div className="meta mono">{p.package.replace('@magpie-community/', '')}</div>
+            </div>
+          </div>
+
+          <div className="plat-stats">
+            <span>类型 <b>provider</b></span>
+            <span>provider <b>{(p.providers || []).join(' / ') || '—'}</b></span>
+            <span>状态 <b>已安装</b></span>
+          </div>
+
+          {(p.summary?.zh || p.summary?.en) && (
+            <div className="catalog-desc" style={{ marginTop: 0 }}>
+              {p.summary.zh || p.summary.en}
+            </div>
+          )}
+
+          <div className="plat-actions">
+            <button className="btn ghost" disabled={!!busy[p.package]} onClick={() => remove(p)}>
+              {busy[p.package] ? '卸载中…' : '卸载'}
+            </button>
+            <span style={{ flex: 1 }} />
+            <span className="sub" style={{ fontSize: 11.5, color: 'var(--text-3)' }}>
+              登录用 <span className="mono">magpie plugin login</span>
+            </span>
+          </div>
+        </div>
+      ))}
+    </div>
   )
 }
 
@@ -113,23 +197,25 @@ function Collapsible({ title, summaryKey, children, defaultOpen = false }) {
 }
 
 /** 插件市场：magpie 社区插件目录（Trae / Qoder / WorkBuddy / Loomy / CodeArts …） */
-function PluginMarket() {
+function PluginMarket({ onInstalled }) {
   const fetchPlugins = useCallback(() => api.magpiePlugins(false), [])
   const { data, error, loading, refresh } = usePolling(fetchPlugins, 0)
   const toast = useToast()
 
   const [kind, setKind] = useState('全部')
   const [search, setSearch] = useState('')
-  const [onlyUninstalled, setOnlyUninstalled] = useState(false)
+  const [scope, setScope] = useState('all')   // all | installed | available
   const [busy, setBusy] = useState({})
 
   const plugins = data?.plugins || []
   const kinds = ['全部', ...Object.keys(data?.kinds || {})]
   const KIND_ZH = { provider: '接入', middleware: '中间件', agent: 'Agent', tools: '工具', page: '页面' }
+  const installedCount = plugins.filter((p) => p.installed).length
 
   const shown = plugins.filter((p) => {
     if (kind !== '全部' && p.kind !== kind) return false
-    if (onlyUninstalled && p.installed) return false
+    if (scope === 'installed' && !p.installed) return false
+    if (scope === 'available' && p.installed) return false
     if (!search.trim()) return true
     const q = search.trim().toLowerCase()
     return p.name.toLowerCase().includes(q)
@@ -142,8 +228,9 @@ function PluginMarket() {
     try {
       const r = await api.magpieAddPlugin(p.package)
       if (r.ok) {
-        toast(`${p.name} 安装成功，登录后即可使用`)
+        toast(`${p.name} 安装成功，已出现在上方平台区`)
         refresh()
+        if (onInstalled) onInstalled()
       } else {
         toast(`安装失败：${(r.stderr || r.stdout || '未知错误').slice(0, 200)}`, 'err')
       }
@@ -165,8 +252,6 @@ function PluginMarket() {
     }
   }
 
-  const installedCount = plugins.filter((p) => p.installed).length
-
   return (
     <div className="card">
       <div className="card-title" style={{ justifyContent: 'space-between' }}>
@@ -182,21 +267,31 @@ function PluginMarket() {
 
       {data && (
         <>
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10 }}>
+            <span className="sub" style={{ fontSize: 12, color: 'var(--text-3)', marginRight: 2 }}>安装状态</span>
+            {[
+              ['all', `全部 ${plugins.length}`],
+              ['installed', `已安装 ${installedCount}`],
+              ['available', `未安装 ${plugins.length - installedCount}`],
+            ].map(([v, label]) => (
+              <button key={v} className={`btn sm ${scope === v ? 'primary' : 'ghost'}`} onClick={() => setScope(v)}>
+                {label}
+              </button>
+            ))}
+            <span style={{ flex: 1 }} />
+            <input
+              className="input sm" placeholder="搜索插件 / provider…" value={search}
+              onChange={(e) => setSearch(e.target.value)} style={{ width: 210 }}
+            />
+          </div>
+
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
+            <span className="sub" style={{ fontSize: 12, color: 'var(--text-3)', marginRight: 2 }}>类型</span>
             {kinds.map((k) => (
               <button key={k} className={`btn sm ${kind === k ? 'primary' : 'ghost'}`} onClick={() => setKind(k)}>
                 {k === '全部' ? `全部 ${plugins.length}` : `${KIND_ZH[k] || k} ${data.kinds[k] || 0}`}
               </button>
             ))}
-            <span style={{ flex: 1 }} />
-            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12.5, color: 'var(--text-2)' }}>
-              <input type="checkbox" checked={onlyUninstalled} onChange={(e) => setOnlyUninstalled(e.target.checked)} />
-              只看未安装
-            </label>
-            <input
-              className="input sm" placeholder="搜索插件 / provider…" value={search}
-              onChange={(e) => setSearch(e.target.value)} style={{ width: 210 }}
-            />
           </div>
 
           <div className="catalog-grid">
