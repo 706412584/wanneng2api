@@ -41,6 +41,36 @@ nsis:
 portable:
   artifactName: ${productName}-${version}-portable.${ext}
 
+# Linux：AppImage 便于直接运行且支持自更新；deb 适配 Debian/Ubuntu。
+# arm64 暂不产出——四个网关里只有 workbuddy/codearts 提供了 linux-arm64
+# 构建，其余两家要自己交叉编译，整包发出去在 arm 上跑不起来。
+linux:
+  target:
+    - target: AppImage
+      arch:
+        - x64
+    - target: deb
+      arch:
+        - x64
+  icon: build/icon.png
+  category: Development
+  synopsis: LLM 网关统一管理台
+  description: |
+    统一管理多个自研 LLM 网关（WorkBuddy / CodeArts / Loomy / Lingxi）
+    与 magpie 内核的桌面壳：进程启停、健康检查、更新、账号与签到管理。
+  artifactName: ${productName}-${version}-linux-${arch}.${ext}
+
+deb:
+  # 运行时需要能拉起网关进程并探测端口
+  depends:
+    - libgtk-3-0
+    - libnotify4
+    - libnss3
+    - libxss1
+    - libxtst6
+    - xdg-utils
+    - libatspi2.0-0
+
 # 壳自更新（main.js setupSelfUpdater → electron-updater）依赖这里的 publish：
 # 打包时它会写出 app-update.yml 与 latest.yml，前者告诉运行时去哪儿查新版本，
 # 后者是版本清单。没有它 autoUpdater.checkForUpdates() 拿不到更新源，

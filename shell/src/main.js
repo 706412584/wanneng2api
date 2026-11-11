@@ -333,7 +333,11 @@ function applyAutoStart() {
 
 // ── electron-updater（壳自身更新，§7.4）──
 function setupSelfUpdater() {
-  if (process.platform !== 'win32' || app.isPackaged !== true) return; // 开发环境跳过
+  // Linux 走 AppImage 自更新；deb/rpm 装出来的包没有可替换的镜像文件，
+  // electron-updater 会直接报错，所以只对 AppImage 启用。
+  if (app.isPackaged !== true) return; // 开发环境跳过
+  if (process.platform === 'darwin') return; // 未签名，macOS 自更新不可用
+  if (process.platform !== 'win32' && !process.env.APPIMAGE) return;
   try {
     const { autoUpdater } = require('electron-updater');
     autoUpdater.autoDownload = false;

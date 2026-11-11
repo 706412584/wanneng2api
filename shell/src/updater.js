@@ -366,6 +366,10 @@ class PlatformUpdater {
     if (!target) throw new Error(`未找到待替换的二进制: ${rel}（cwd=${workDir}）`);
     fs.copyFileSync(target, path.join(backupDir, path.basename(target))); // 备份
     fs.copyFileSync(dlPath, target);                                       // 覆盖（数据文件零接触）
+    // POSIX 下覆盖会把执行位一起抹掉（新文件是 0644），更新后启动 EACCES。
+    if (process.platform !== 'win32') {
+      try { fs.chmodSync(target, 0o755); } catch { /* 启动时会报 EACCES 并提示 chmod */ }
+    }
     try { fs.unlinkSync(dlPath); } catch (_e) { /* ignore */ }
     return { binaryPath: target };
   }
@@ -425,24 +429,43 @@ class PlatformUpdater {
 
   _unzip(zipPath, destDir) {
     return new Promise((resolve, reject) => {
-      // Windows 自带的 tar 是 libarchive：能解 zip，但两处坑必须同时处理：
-      //  1) 绝对路径 'C:\...' 会被当成「远端主机 C」→ --force-local；
-      //  2) 只看扩展名 + 魔数，遇到 .part 后缀的 zip 会判定「不是 tar」，
-      //     所以解压前先按真实内容把文件还原成 .zip。
-      // PowerShell Expand-Archive 作兜底（它同样要求 .zip 后缀）。
+      // 无论哪个平台，都先把 .part 还原成 .zip：
+      // cat 只看扩展名 + 魔数，.part 后缀的 zip 会被判「不是 tar」。
       const dir = path.dirname(zipPath);
       const base = path.basename(zipPath).replace(/\.part$/i, '');
       const zipDepot = path.join(dir, base.endsWith('.zip') ? base : base + '.zip');
       try {
         if (zipDepot !== zipPath && !fs.existsSync(zipDepot)) fs.copyFileSync(zipPath, zipDepot);
       } catch (_e) { /* 让下面的解压报出真实原因 */ }
-      execFile('tar.exe', ['--force-local', '-xf', zipDepot, '-C', destDir],
-        { windowsHide: true, timeout: 120000 }, (err, _so, se) => {
+
+      if (process.platform === 'win32') {
+        // Windows 自带 tar 是 libarchive：能解 zip，但绝对路径 'C:\...' 会被
+        // 当成「远端主机 C」→ 必须加 --force-local。
+        // PowerShell Expand-Archive 作兜底。
+        execFile('tar.exe', ['--force-local', '-xf', zipDepot, '-C', destDir],
+          { windowsHide: true, timeout: 120000 }, (err, _so, se) => {
+            if (!err) return resolve();
+            execFile('powershell.exe', ['-NoProfile', '-Command',
+              `Expand-Archive -LiteralPath '${zipDepot}' -DestinationPath '${destDir}' -Force`],
+              { windowsHide: true, timeout: 180000 }, (err2, _so2, se2) => {
+                if (err2) return reject(new Error(`解压失败: ${se || se2 || err2.message}`));
+                resolve();
+              });
+          });
+        return;
+      }
+
+      // POSIX：优先 unzip（存在最广），没有就退回 bsdtar/GNU tar。
+      // 两者都没有才报错，并把可执行的补救办法写进消息里。
+      execFile('unzip', ['-o', '-q', zipDepot, '-d', destDir],
+        { timeout: 180000 }, (err, _so, se) => {
           if (!err) return resolve();
-          execFile('powershell.exe', ['-NoProfile', '-Command',
-            `Expand-Archive -LiteralPath '${zipDepot}' -DestinationPath '${destDir}' -Force`],
-            { windowsHide: true, timeout: 180000 }, (err2, _so2, se2) => {
-              if (err2) return reject(new Error(`解压失败: ${se || se2 || err2.message}`));
+          execFile('tar', ['-xf', zipDepot, '-C', destDir],
+            { timeout: 180000 }, (err2, _so2, se2) => {
+              if (err2) {
+                return reject(new Error(
+                  `解压失败：需要 unzip 或支持 zip 的 tar（${se || se2 || err2.message}）`));
+              }
               resolve();
             });
         });
@@ -478,7 +501,17 @@ class PlatformUpdater {
       const rel = name;
       if (preserve.some((g) => simpleGlobMatch(g, rel)) && fs.existsSync(d)) continue;
       if (fs.statSync(s).isDirectory()) this._mergeTree(s, d, preserve);
-      else fs.copyFileSync(s, d);
+      else {
+        fs.copyFileSync(s, d);
+        // POSIX 下 copyFileSync 不保留权限位：zip 解出来的可执行文件
+        // 会变成 0644，更新「成功」但下次启动 EACCES。这里把源文件
+        // 的执行位带过去（非可执行文件不受影响）。
+        if (process.platform !== 'win32') {
+          try {
+            if (fs.statSync(s).mode & 0o111) fs.chmodSync(d, 0o755);
+          } catch { /* 权限设置失败不阻断更新，启动时会报 EACCES 并提示 chmod */ }
+        }
+      }
     }
   }
 

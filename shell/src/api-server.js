@@ -541,6 +541,9 @@ class ApiServer {
           else if (process.platform === 'win32') {
             // 测试环境无 Electron：start 命令兜底
             require('child_process').exec(`start "" "${url}"`, { windowsHide: true }, () => {});
+          } else {
+            // Linux/macOS 的对应做法；xdg-open 普遍存在，没有就静默失败
+            require('child_process').execFile('xdg-open', [url], () => {});
           }
           return { id, opened: url };
         }

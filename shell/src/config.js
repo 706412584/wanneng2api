@@ -64,6 +64,15 @@ function expandPath(p) {
  * - sub2api   : server.exe + 编排 PG:5433 / Redis:6380，/health（routes/common.go:12 已确认），默认关闭
  * - hub       : ../hub/hub.exe（另一代理交付），17810，/health
  */
+/**
+ * 默认可执行文件名。
+ *
+ * 各网关在 Windows 上带 .exe，POSIX 上不带。默认配置会落盘成 platforms.json，
+ * 所以这里必须按平台生成——否则 Linux 首次运行会写出 wb2api.exe 这种在
+ * 该平台根本不存在的文件名，启动时直接 ENOENT。
+ * 能力：strip 掉 .exe 即可，各家的基名一致。
+ */
+const EXE = process.platform === 'win32' ? '.exe' : '';
 function defaultPlatforms() {
   return {
     version: 1,
@@ -79,7 +88,7 @@ function defaultPlatforms() {
           // 必须是 wb2api.exe：它才是与 start.cmd 一致、含最新指纹/会话头修复的
           // 构建。server.exe 是 2026-09-27 的旧产物，缺 X-Conversation-Message-ID /
           // x-codebuddy-request / X-Agent-Intent，会被上游按渠道校验拒绝（11128）。
-          binary: 'wb2api.exe',
+          binary: `wb2api${EXE}`,
           args: [],
           env: { NO_PROXY: '*' },
           shell: false,
@@ -113,7 +122,7 @@ function defaultPlatforms() {
         mode: 'import',
         workDir: 'D:/app/codearts2api-panel/bin',
         run: {
-          binary: 'codearts2api-panel.exe',
+          binary: `codearts2api-panel${EXE}`,
           args: ['--config', 'config.json'],
           env: { NO_PROXY: '*' },
           shell: false,
@@ -178,7 +187,7 @@ function defaultPlatforms() {
         workDir: '%APPDATA%/wanneng2api/platforms/sub2api',
         requires: ['pg', 'redis'],
         run: {
-          binary: 'sub2api.exe',        // 官方 release 包内的可执行文件名
+          binary: `sub2api${EXE}`,        // 官方 release 包内的可执行文件名
           args: [],
           env: { NO_PROXY: '*' },
           shell: false,
@@ -208,7 +217,7 @@ function defaultPlatforms() {
         mode: 'import',
         workDir: 'D:/app/lingxi2api-panel',
         run: {
-          binary: 'lingxi2api.exe',
+          binary: `lingxi2api${EXE}`,
           args: [],
           env: { NO_PROXY: '*' },
           shell: false,
@@ -264,7 +273,7 @@ function defaultPlatforms() {
         mode: 'managed',
         workDir: 'D:/app/wanneng2api/tools/magpie',
         run: {
-          binary: 'magpie.exe',
+          binary: `magpie${EXE}`,
           args: ['web', '--gateway', '--no-open', '--addr', '127.0.0.1:17899'],
           env: {
             NO_PROXY: '*',

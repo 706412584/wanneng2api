@@ -29,17 +29,36 @@ const STATES = ['stopped', 'starting', 'healthy', 'degraded', 'unhealthy', 'upda
 
 /** netstat -ano 找出监听端口的 PID（Windows；失败返回 null） */
 function findListeningPid(port) {
+  // Windows: netstat -ano 的最后两列是 PID。
+  if (process.platform === 'win32') {
+    return new Promise((resolve) => {
+      execFile('netstat', ['-ano'], { windowsHide: true, timeout: 5000 }, (err, stdout) => {
+        if (err || !stdout) return resolve(null);
+        for (const line of stdout.split('\n')) {
+          const parts = line.trim().split(/\s+/);
+          // TCP  0.0.0.0:7866  0.0.0.0:0  LISTENING  1234
+          if (parts.length >= 5 && parts[0] === 'TCP' && /^LISTENING$/i.test(parts[3])) {
+            const local = parts[1] || '';
+            const m = local.match(/:(\d+)$/);
+            if (m && Number(m[1]) === port) return resolve(Number(parts[4]));
+          }
+        }
+        resolve(null);
+      });
+    });
+  }
+  // POSIX: `ss -ltnp` 输出形如
+  //   LISTEN 0 128 127.0.0.1:7866 0.0.0.0:* users:(("wb2api",pid=1234,fd=3))
+  // `-p` 需要足够权限才显示 pid；拿不到就回 null，交给 TCP 探测兜底。
   return new Promise((resolve) => {
-    execFile('netstat', ['-ano'], { windowsHide: true, timeout: 5000 }, (err, stdout) => {
+    execFile('ss', ['-ltnp'], { timeout: 5000 }, (err, stdout) => {
       if (err || !stdout) return resolve(null);
       for (const line of stdout.split('\n')) {
-        const parts = line.trim().split(/\s+/);
-        // TCP  0.0.0.0:7866  0.0.0.0:0  LISTENING  1234
-        if (parts.length >= 5 && parts[0] === 'TCP' && /^LISTENING$/i.test(parts[3])) {
-          const local = parts[1] || '';
-          const m = local.match(/:(\d+)$/);
-          if (m && Number(m[1]) === port) return resolve(Number(parts[4]));
-        }
+        if (!/LISTEN/i.test(line)) continue;
+        const mPort = line.match(/[:.](\d+)\s+\S+/);
+        if (!mPort || Number(mPort[1]) !== port) continue;
+        const mPid = line.match(/pid=(\d+)/);
+        if (mPid) return resolve(Number(mPid[1]));
       }
       resolve(null);
     });
@@ -123,11 +142,31 @@ async function checkPortFree(port, ownPid = 0) {
   return { free: false, pid };
 }
 
-function taskkillTree(pid) {
+/**
+ * 强杀整个进程树。
+ *
+ * Windows：taskkill /T 按父子关系杀整棵树。
+ * POSIX：没有等价命令，只能靠进程组 —— spawn 时设了 detached 让子进程
+ * 自成一个组（pgid == pid），这里 kill(-pid) 就能打到整组。
+ * 先 SIGTERM 给个收尾机会，再 SIGKILL 兜底；组不存在说明已经退干净了。
+ */
+function taskkillTree(pid, { graceMs = 1500 } = {}) {
+  if (!pid) return Promise.resolve();
+  if (process.platform === 'win32') {
+    return new Promise((resolve) => {
+      execFile('taskkill.exe', ['/pid', String(pid), '/T', '/F'],
+        { windowsHide: true, timeout: 8000, stdio: 'ignore' },
+        () => resolve());
+    });
+  }
   return new Promise((resolve) => {
-    execFile('taskkill.exe', ['/pid', String(pid), '/T', '/F'],
-      { windowsHide: true, timeout: 8000, stdio: 'ignore' },
-      () => resolve());
+    const signal = (sig) => { try { process.kill(-pid, sig); return true; } catch { return false; } };
+    if (!signal('SIGTERM')) return resolve(); // 组已不存在
+    const timer = setTimeout(() => {
+      signal('SIGKILL');
+      resolve();
+    }, graceMs);
+    if (timer.unref) timer.unref();
   });
 }
 
@@ -664,10 +703,23 @@ class PlatformManager extends EventEmitter {
       // 裸名（wb2api.exe）：_resolveCommand 已优先取 workDir 下的绝对路径，
       // 仍是裸名说明 workDir 里没有，可能命中 PATH；两者都不存在才算缺失。
       const exists = fs.existsSync(cmd.command) || (!/[/\\]/.test(cmd.command) && !!whichSync(cmd.command));
-      if (!exists && (/[/\\]/.test(cmd.command) || /\.(exe|bat|cmd|com)$/i.test(cmd.command))) {
+      // 只要确认不存在就直接报「文件不存在」。旧写法额外要求名字像可执行文件
+      // （.exe/.bat 或含路径），那是 Windows 视角：POSIX 上的裸名 wb2api 不带
+      // 扩展名，会漏判 → 静默进 spawn → 空等健康检查超时，报错方向完全错。
+      if (!exists && (path.isAbsolute(cmd.command) || /[/\\]/.test(cmd.command))) {
         const msg = `可执行文件不存在: ${cmd.command}（工作目录 ${cmd.cwd}）`;
         rt.setStatus('error', msg);
         throw new Error(msg);
+      }
+      // POSIX 下还要有执行位，否则 spawn 会 EACCES 而不是给「文件不存在」
+      if (exists && process.platform !== 'win32' && path.isAbsolute(cmd.command)) {
+        try {
+          fs.accessSync(cmd.command, fs.constants.X_OK);
+        } catch {
+          const msg = `可执行文件没有执行权限: ${cmd.command}（请 chmod +x）`;
+          rt.setStatus('error', msg);
+          throw new Error(msg);
+        }
       }
     }
 
@@ -680,6 +732,9 @@ class PlatformManager extends EventEmitter {
         env: this._buildEnv(rt),
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
+        // POSIX 下让子进程自成进程组（pgid == pid），taskkillTree 才能用
+        // kill(-pid) 把整棵子树带走。Windows 不用这个（有 taskkill /T）。
+        ...(process.platform === 'win32' ? {} : { detached: true }),
       });
     } catch (e) {
       rt.setStatus('error', `spawn 失败: ${e.message}`);
