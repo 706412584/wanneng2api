@@ -258,7 +258,40 @@ async function testDisabledPlatformUpdateSucceeds() {
   }
 }
 
+/**
+ * 跨平台分支的静态断言：不依赖真实 POSIX 环境，只保证分支存在且形状正确。
+ * 真正的行为验证在 CI 的 ubuntu-latest 上跑完整回归。
+ */
+function testCrossPlatformShape() {
+  const pm = fs.readFileSync(path.join(__dirname, '..', 'src', 'platform-manager.js'), 'utf8');
+  ok('POSIX 用进程组杀树（kill(-pid)）', /process\.kill\(-pid, sig\)/.test(pm));
+  ok('POSIX spawn 设 detached 自成进程组', /detached: true/.test(pm));
+  ok('POSIX 用 ss 替代 netstat', /execFile\('ss'/.test(pm));
+  ok('POSIX 校验可执行位（X_OK）', /fs\.constants\.X_OK/.test(pm));
+
+  const up = fs.readFileSync(path.join(__dirname, '..', 'src', 'updater.js'), 'utf8');
+  ok('POSIX 解压优先 unzip', /execFile\('unzip'/.test(up));
+  ok('POSIX 解压退回 tar', /execFile\('tar', \['-xf'/.test(up));
+  ok('解压合并补回执行位', /chmodSync\(d, 0o755\)/.test(up));
+  ok('replace-binary 补回执行位', /chmodSync\(target, 0o755\)/.test(up));
+  // Windows 专用路径必须保留，不能被跨平台改造误删
+  ok('Windows 仍用 --force-local 解 tar', /--force-local/.test(up));
+  ok('Windows 仍保留 PowerShell 兜底', /Expand-Archive/.test(up));
+  ok('Windows 仍用 taskkill /T', /taskkill\.exe/.test(pm));
+
+  const cfg = fs.readFileSync(path.join(__dirname, '..', 'src', 'config.js'), 'utf8');
+  ok('默认可执行名按平台推导', /const EXE = process\.platform === 'win32' \? '\.exe' : ''/.test(cfg));
+  const { defaultPlatforms } = require('../src/config');
+  const wb = defaultPlatforms().platforms.find((p) => p.id === 'workbuddy');
+  ok('Windows 下默认名带 .exe', process.platform !== 'win32' || wb.run.binary === 'wb2api.exe',
+    `got ${wb.run.binary}`);
+  ok('POSIX 下默认名不带 .exe', process.platform === 'win32' || wb.run.binary === 'wb2api',
+    `got ${wb.run.binary}`);
+}
+
 async function main() {
+  console.log('[跨平台分支：静态断言，不启动进程]');
+  testCrossPlatformShape();
   console.log('[replace-dir zip 解包回归：不启动进程]');
   await testReplaceDirUnzipsZip();
   console.log('[禁用平台更新回归：不启动进程]');

@@ -699,14 +699,19 @@ class PlatformManager extends EventEmitter {
     // 裸文件名（wb2api.exe / codearts2api-panel.exe）也要校验：spawn 找不到时
 // 只发 error 事件、不触发 exit，过去会先空等 120s 健康检查再报“unhealthy”，
 // 用户看到的是超时而不是“文件不存在”。
-    if (cmd.command !== 'node' && cmd.command !== 'python') {
-      // 裸名（wb2api.exe）：_resolveCommand 已优先取 workDir 下的绝对路径，
-      // 仍是裸名说明 workDir 里没有，可能命中 PATH；两者都不存在才算缺失。
+    // 解释器（node / python / python3…）由 _resolvePython 单独解析，
+// 这里不重复判断——但也不能因此整段跳过对「裸名是否存在于 PATH」的检查。
+    const isInterpreter = /^(node|python[0-9.]*|py)$/i.test(path.basename(cmd.command));
+    if (!isInterpreter) {
+      // 裸名（wb2api / wb2api.exe）：_resolveCommand 已优先取 workDir 下的
+      // 绝对路径，仍是裸名说明 workDir 里没有，可能命中 PATH。
       const exists = fs.existsSync(cmd.command) || (!/[/\\]/.test(cmd.command) && !!whichSync(cmd.command));
       // 只要确认不存在就直接报「文件不存在」。旧写法额外要求名字像可执行文件
       // （.exe/.bat 或含路径），那是 Windows 视角：POSIX 上的裸名 wb2api 不带
       // 扩展名，会漏判 → 静默进 spawn → 空等健康检查超时，报错方向完全错。
-      if (!exists && (path.isAbsolute(cmd.command) || /[/\\]/.test(cmd.command))) {
+      // exists 已经把「绝对路径存在」和「裸名能在 PATH 找到」都算进去了，
+      // 所以只要 !exists 就是真找不到。
+      if (!exists) {
         const msg = `可执行文件不存在: ${cmd.command}（工作目录 ${cmd.cwd}）`;
         rt.setStatus('error', msg);
         throw new Error(msg);
