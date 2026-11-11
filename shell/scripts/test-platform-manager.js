@@ -168,17 +168,28 @@ async function testReplaceDirUnzipsZip() {
     fs.mkdirSync(stage, { recursive: true });
     fs.writeFileSync(path.join(stage, 'sub2api.exe'), 'NEW-BINARY');
     fs.writeFileSync(path.join(stage, 'README.md'), 'docs');
-    // 用 .NET ZipFile 打 zip（tar -a 在 Windows 上认不出 zip 格式，
-    // Compress-Archive 又会按扩展名拒绝写 .part）。打成 .zip 再改名，
-    // 正好复刻「下载得到 .zip.part」的真实形态。
+    // 打一个真 zip 出来。两条路径都试过：
+    //   Windows: PowerShell 的 .NET ZipFile（tar -a 认不出 zip 格式，
+    //            Compress-Archive 又会按扩展名拒绝写 .part）
+    //   POSIX:   python3 -m zipfile（CI 的 ubuntu runner 自带）
+    // 打成 .zip 再改名成 .part，正好复刻「下载得到 .zip.part」的真实形态。
     const zipTmp = path.join(updDir, 'pkg_windows_amd64.zip');
     const zipPath = zipTmp + '.part';
-    await new Promise((resolve, reject) => {
-      require('child_process').execFile('powershell.exe', ['-NoProfile', '-Command',
-        `Add-Type -AssemblyName System.IO.Compression.FileSystem; ` +
-        `[System.IO.Compression.ZipFile]::CreateFromDirectory('${stage}', '${zipTmp}')`],
-        { windowsHide: true, timeout: 60000 }, (e) => (e ? reject(e) : resolve()));
+    const run = (cmd, args, opts = {}) => new Promise((resolve, reject) => {
+      require('child_process').execFile(cmd, args, { windowsHide: true, timeout: 60000, ...opts },
+        (e) => (e ? reject(e) : resolve()));
     });
+    if (process.platform === 'win32') {
+      await run('powershell.exe', ['-NoProfile', '-Command',
+        `Add-Type -AssemblyName System.IO.Compression.FileSystem; ` +
+        `[System.IO.Compression.ZipFile]::CreateFromDirectory('${stage}', '${zipTmp}')`]);
+    } else {
+      // 在 stage 的父目录执行并传目录名：传绝对路径会把整条路径写进 zip，
+      // 解出来多好几层，_stripSingleRoot 也就剥不掉了。
+      // python zipfile 不支持 -C，靠 cwd 控制根目录。
+      await run('python3', ['-m', 'zipfile', '-c', zipTmp, path.basename(stage)],
+        { cwd: path.dirname(stage) });
+    }
     fs.renameSync(zipTmp, zipPath);
 
     const store = {
