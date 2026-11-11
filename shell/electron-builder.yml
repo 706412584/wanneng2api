@@ -61,6 +61,9 @@ linux:
   artifactName: ${productName}-${version}-linux-${arch}.${ext}
 
 deb:
+  # deb 元数据必填：homepage 在 package.json，maintainer 必须带邮箱，
+  # 否则 fpm 直接拒绝打包（CI 首跑就是卡在 homepage）。
+  maintainer: wanneng2api <706412584@users.noreply.github.com>
   # 运行时需要能拉起网关进程并探测端口
   depends:
     - libgtk-3-0

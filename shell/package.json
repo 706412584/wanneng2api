@@ -11,6 +11,7 @@
   },
   "author": "wanneng2api",
   "license": "MIT",
+  "homepage": "https://github.com/706412584/wanneng2api",
   "dependencies": {
     "electron-updater": "^6.3.9"
   },
