@@ -18,6 +18,10 @@ const { simpleGlobMatch } = require('./platform-manager');
 
 const HEALTH_VERIFY_SEC = 60;
 
+// release 元数据缓存时长：未登录 GitHub 限额只有 60 次/小时，
+// 而更新中心会为每个平台各查一次；缓存后反复点击不再烧额度。
+const RELEASE_CACHE_MS = 30 * 60 * 1000;
+
 function semverParts(v) {
   const m = String(v || '0.0.0').trim().replace(/^v/i, '').match(/(\d+)\.(\d+)\.(\d+)/);
   return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
@@ -54,6 +58,7 @@ class PlatformUpdater {
     this.dataDir = dataDir;
     this.log = logger || { info: () => {}, warn: () => {}, error: () => {} };
     this.busy = new Set(); // 正在 apply 的平台
+    this._releaseCache = new Map(); // repo -> { at, data }
   }
 
   updatesDir(id) {
@@ -111,7 +116,21 @@ class PlatformUpdater {
     return (p.updater && p.updater.currentVersion) || null;
   }
 
+  /**
+   * 查 GitHub 最新 release。
+   *
+   * 未配置 token 时限额只有 60 次/小时，而更新中心会为每个平台各查一次，
+   * 几轮下来就会耗尽（表现为"除了没配 repo 的，其余全部检测失败"）。
+   * 因此：
+   *   - 成功结果缓存 30 分钟，反复点「检查更新」不再烧限额；
+   *   - 403 时把重置时间带进错误信息，让用户知道什么时候能再试。
+   */
   _fetchLatestRelease(repo, token) {
+    const now = Date.now();
+    const cached = this._releaseCache && this._releaseCache.get(repo);
+    if (cached && now - cached.at < RELEASE_CACHE_MS) {
+      return Promise.resolve(cached.data);
+    }
     const url = `https://api.github.com/repos/${repo}/releases/latest`;
     return new Promise((resolve, reject) => {
       const req = https.get(url, {
@@ -123,13 +142,30 @@ class PlatformUpdater {
         timeout: 15000,
       }, (res) => {
         if (res.statusCode === 404) { res.resume(); return reject(new Error(`仓库无 release: ${repo}`)); }
-        if (res.statusCode === 403) { res.resume(); return reject(new Error('GitHub API rate limit（可在设置中配置 githubToken）')); }
+        if (res.statusCode === 403) {
+          // x-ratelimit-reset 是 Unix 秒
+          const reset = Number(res.headers['x-ratelimit-reset'] || 0);
+          const when = reset ? new Date(reset * 1000).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+          res.resume();
+          // 有旧缓存就先给旧的，避免界面直接变红
+          if (cached) return resolve(cached.data);
+          return reject(new Error(
+            token
+              ? 'GitHub API 限流（token 也受限）' + (when ? `，约 ${when} 重置` : '')
+              : `GitHub API 未登录限额已用尽（60 次/小时）${when ? `，约 ${when} 重置` : ''}；在「设置」里填 GitHub Token 可提升到 5000 次/小时`,
+          ));
+        }
         if (res.statusCode !== 200) { res.resume(); return reject(new Error(`GitHub API ${res.statusCode}`)); }
         let buf = '';
         res.setEncoding('utf8');
         res.on('data', (d) => { buf += d; });
         res.on('end', () => {
-          try { resolve(JSON.parse(buf)); } catch (e) { reject(e); }
+          try {
+            const data = JSON.parse(buf);
+            if (!this._releaseCache) this._releaseCache = new Map();
+            this._releaseCache.set(repo, { at: Date.now(), data });
+            resolve(data);
+          } catch (e) { reject(e); }
         });
       });
       req.on('timeout', () => { req.destroy(); reject(new Error('GitHub API 超时')); });

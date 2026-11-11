@@ -47,6 +47,57 @@ function findListeningPid(port) {
 }
 
 /** TCP 连接探测端口是否有监听者 */
+/**
+ * 定位 magpie 可执行文件。magpie 是外部依赖（约 79MB），不随安装包分发，
+ * 所以装机后要在这些位置里找：
+ *   1. 源码目录旁的 tools/magpie（开发机）
+ *   2. 数据目录下的 magpie/（用户自己放进来的）
+ *   3. PATH（官方安装脚本会写进 PATH）
+ *   4. %LOCALAPPDATA%\Programs\magpie（官方 Windows 安装位置）
+ */
+function findMagpieBinary(dataDir) {
+  const cands = [];
+  cands.push(path.resolve(__dirname, '..', '..', 'tools', 'magpie', 'magpie.exe'));
+  cands.push(path.resolve(__dirname, '..', '..', 'tools', 'magpie', 'magpie'));
+  if (dataDir) {
+    cands.push(path.join(dataDir, 'magpie', 'magpie.exe'));
+    cands.push(path.join(dataDir, 'magpie', 'magpie'));
+  }
+  for (const name of ['magpie.exe', 'magpie']) {
+    const onPath = whichSync(name);
+    if (onPath) cands.push(onPath);
+  }
+  const local = process.env.LOCALAPPDATA;
+  if (local) {
+    cands.push(path.join(local, 'Programs', 'magpie', 'magpie.exe'));
+    cands.push(path.join(local, 'magpie', 'magpie.exe'));
+  }
+  for (const c of cands) {
+    try {
+      if (c && fs.existsSync(c)) return c;
+    } catch { /* 无权访问的路径跳过 */ }
+  }
+  return null;
+}
+
+/** 在 PATH 里找一个可执行文件（同步版） */
+function whichSync(name) {
+  const dirs = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  const exts = process.platform === 'win32'
+    ? String(process.env.PATHEXT || '.EXE;.CMD;.BAT').split(';').filter(Boolean).map((e) => e.toLowerCase())
+    : [''];
+  const lower = name.toLowerCase();
+  for (const d of dirs) {
+    for (const ext of exts) {
+      const f = path.join(d, lower.endsWith(ext) ? name : name + ext);
+      try {
+        if (fs.existsSync(f)) return f;
+      } catch { /* 跳过 */ }
+    }
+  }
+  return null;
+}
+
 function probePortOpen(port, timeoutMs = 800) {
   return new Promise((resolve) => {
     const sock = net.connect({ host: '127.0.0.1', port });
@@ -283,8 +334,21 @@ class PlatformManager extends EventEmitter {
       // 直接用裸名会 ENOENT），否则退回 PATH 查找（测试用的 node/python 等）。
       const inWorkDir = path.join(workDir, binary);
       command = fs.existsSync(inWorkDir) ? inWorkDir : binary;
+      // magpie 是外部依赖，不随安装包分发：装机后它可能在 PATH、标准安装
+      // 目录，或用户自己放在数据目录。这里统一探测一次。
+      if (command === binary && /^magpie(\.exe)?$/i.test(binary)) {
+        const found = findMagpieBinary(this.store && this.store.dataDir);
+        if (found) command = found;
+      }
     }
-    return { command, args: (run.args || []).slice(), cwd: workDir };
+    // magpie 不在预期位置时，cwd 也要跟着换成它自己的目录，否则它读不到
+    // 同目录下的资源；workDir 配置本身可能在任何机器上都不存在。
+    let cwd = workDir;
+    if (/^magpie(\.exe)?$/i.test(path.basename(command)) && path.isAbsolute(command)) {
+      const dir = path.dirname(command);
+      if (fs.existsSync(dir)) cwd = dir;
+    }
+    return { command, args: (run.args || []).slice(), cwd };
   }
 
   _resolvePython(rt) {
@@ -757,17 +821,20 @@ class PlatformManager extends EventEmitter {
   async startAutoStart() {
     const list = (this.store.manager.general && this.store.manager.general.autoStartPlatforms) || [];
     const delaySec = Number(this.store.manager.general && this.store.manager.general.autoStartDelaySec) || 0;
-    for (const id of list) {
+    // 并行启动：start() 会等到平台健康（最长 120s），串行时一个起不来的平台
+    // 会把后面所有的都堵住（例如 lingxi 无账号时健康检查一直不过，
+    // 排在它后面的 magpie-web 就永远轮不到）。
+    await Promise.all(list.map(async (id) => {
       const rt = this.getRuntime(id);
-      if (!rt) continue;
-      if (rt.cfg.enabled === false) continue;
+      if (!rt) return;
+      if (rt.cfg.enabled === false) return;
       if (delaySec > 0) await new Promise((r) => setTimeout(r, delaySec * 1000));
       try {
         await this.start(id);
       } catch (e) {
         this.log.error(`[platform:${id}] 自启失败: ${e.message}`);
       }
-    }
+    }));
   }
 
   /** 反序停止全部（托盘退出用） */
@@ -1004,4 +1071,5 @@ module.exports = {
   checkPortFree,
   findListeningPid,
   simpleGlobMatch,
+  findMagpieBinary,
 };

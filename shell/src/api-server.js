@@ -12,6 +12,7 @@ const path = require('path');
 const { URL } = require('url');
 
 const pathExtname = (p) => path.extname(p);
+const { findMagpieBinary } = require('./platform-manager');
 
 const MAX_BODY = 1024 * 1024;
 
@@ -81,17 +82,13 @@ class ApiServer {
    */
   _magpieBinary() {
     const p = this.deps.store && this.deps.store.getPlatform('magpie');
-    const candidates = [];
+    // 1. 平台配置里显式指定的绝对路径优先（用户可在 platforms.json 里改）
     if (p && p.run && p.run.binary) {
-      const raw = p.run.binary;
-      candidates.push(path.isAbsolute(raw) ? raw : path.resolve(this.deps.shellRoot || process.cwd(), raw));
+      const raw = String(p.run.binary);
+      if (path.isAbsolute(raw) && fs.existsSync(raw)) return raw;
     }
-    candidates.push(path.resolve(__dirname, '..', '..', 'tools', 'magpie', 'magpie.exe'));
-    candidates.push(path.resolve(__dirname, '..', '..', 'tools', 'magpie', 'magpie'));
-    for (const c of candidates) {
-      if (c && fs.existsSync(c)) return c;
-    }
-    return null;
+    // 2. 统一探测（tools/ → 数据目录 → PATH → 标准安装位置）
+    return findMagpieBinary(this.deps.store && this.deps.store.dataDir);
   }
 
   _serveStatic(req, res, dir) {

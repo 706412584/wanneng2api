@@ -1,0 +1,42 @@
+appId: ai.wanneng2api.shell
+productName: Wanneng2API
+copyright: MIT
+
+directories:
+  output: dist
+  buildResources: build
+
+# 只打包壳自己需要的代码；UI 产物走 extraResources（main.js 从
+# process.resourcesPath/ui/index.html 读取），各网关二进制不进包体。
+files:
+  - src/**/*
+  - package.json
+  - '!scripts/**'
+  - '!selftest.md'
+  - '!server.js'
+
+extraResources:
+  - from: ../ui/dist
+    to: ui
+    filter:
+      - '**/*'
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: build/icon.png
+  artifactName: ${productName}-${version}-setup.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Wanneng2API
+
+# 便携版：解压即用，适合不想安装的场景
+portable:
+  artifactName: ${productName}-${version}-portable.${ext}

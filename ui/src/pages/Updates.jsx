@@ -27,7 +27,11 @@ export default function Updates() {
     setChecking((c) => ({ ...c, [p.id]: true }))
     try {
       const r = await api.checkUpdate(p.id)
-      if (r.latest && r.latest !== r.current) {
+      // 后端对没有 updater.repo 的平台返回 checked:false + reason，
+      // 这不是失败，得跟真正的错误区分开。
+      if (r.checked === false) {
+        toast(`${p.name}：${r.reason || '该平台没有配置更新源'}`, 'err')
+      } else if (r.latest && r.latest !== r.current) {
         toast(`${p.name}：发现新版本 v${r.latest}（当前 v${r.current}）`)
       } else {
         toast(`${p.name}：已是最新 v${r.current}`)
@@ -124,12 +128,22 @@ export default function Updates() {
                       </div>
                       {it.notes && <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 2, maxWidth: 340 }}>{it.notes}</div>}
                     </td>
-                    <td className="num">v{it.current}</td>
-                    <td className="num">{it.updateAvailable ? <span style={{ color: 'var(--blue)', fontWeight: 700 }}>v{it.latest}</span> : <span style={{ color: 'var(--text-3)' }}>v{it.latest}</span>}</td>
+                    <td className="num">{it.current ? `v${it.current}` : '—'}</td>
+                    <td className="num">
+                      {it.latest
+                        ? (it.updateAvailable
+                            ? <span style={{ color: 'var(--blue)', fontWeight: 700 }}>v{it.latest}</span>
+                            : <span style={{ color: 'var(--text-3)' }}>v{it.latest}</span>)
+                        : <span style={{ color: 'var(--text-3)' }}>—</span>}
+                    </td>
                     <td>
-                      {it.updateAvailable
-                        ? <span className="badge orange">有新版</span>
-                        : <span className="badge green">最新</span>}
+                      {it.checkError
+                        ? <span className="badge red" title={it.checkError}>检测失败</span>
+                        : !it.hasUpdater
+                          ? <span className="badge gray" title="该平台没有配置 updater.repo，无法检查远程版本">无更新源</span>
+                          : it.updateAvailable
+                            ? <span className="badge orange">有新版</span>
+                            : <span className="badge green">最新</span>}
                     </td>
                     <td>{plat ? <span className={`state-pill ${plat.state}`}>{STATE_TEXT[plat.state]}</span> : '—'}</td>
                     <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>

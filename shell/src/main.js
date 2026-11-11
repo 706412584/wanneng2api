@@ -7,7 +7,7 @@
  * Electron 相关（窗口/托盘/自启）只在本文件引用，其余模块均为纯 Node。
  */
 
-const { app, BrowserWindow, dialog, shell } = require('electron');
+const { app, BrowserWindow, dialog, shell, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
@@ -48,8 +48,10 @@ function shellLog(level, msg) {
 // ── UI 路径：../ui/dist/index.html 存在则用之，否则占位页 ──
 function uiIndexHtml() {
   const candidates = [
-    path.resolve(__dirname, '..', '..', 'ui', 'dist', 'index.html'),
+    // 打包后：extraResources 把 ui/dist 整个拷到 resources/ui
     path.join(process.resourcesPath || '', 'ui', 'index.html'),
+    // 开发时：仓库里的 ui/dist
+    path.resolve(__dirname, '..', '..', 'ui', 'dist', 'index.html'),
   ];
   for (const c of candidates) {
     if (c && fs.existsSync(c)) return { file: c, placeholder: false };
@@ -74,6 +76,32 @@ function placeholderHtml() {
 </div></body></html>`;
 }
 
+/**
+ * 优先用 Manager API 的 http 地址加载 UI（同源，iframe cookie 才生效）。
+ * 服务还没起来时轮询最多 15s，仍失败则回退 file://，保证界面可见。
+ */
+function loadUiFromManager(port, fileFallback) {
+  const url = `http://127.0.0.1:${port}/`;
+  let tries = 0;
+  const attempt = () => {
+    tries += 1;
+    const probe = require('http').get(url, { timeout: 1500 }, (res) => {
+      res.resume();
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(url);
+    });
+    probe.on('error', () => {
+      if (tries >= 15) {
+        shellLog('warn', 'Manager API 未就绪，回退 file:// 加载 UI');
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadFile(fileFallback);
+        return;
+      }
+      setTimeout(attempt, 1000);
+    });
+    probe.on('timeout', () => { probe.destroy(); });
+  };
+  attempt();
+}
+
 function createMainWindow() {
   const ui = uiIndexHtml();
   mainWindow = new BrowserWindow({
@@ -84,13 +112,26 @@ function createMainWindow() {
     title: 'Wanneng2API',
     show: false,
     backgroundColor: '#111723',
+    // 去掉 Electron 自带的菜单栏（File/Edit/View…）与标题栏文字，
+    // 让界面像原生应用。保留系统的最小化/最大化/关闭按钮
+    // （frame:true + titleBarStyle:'hidden' 在 Windows 下即为此效果）。
+    autoHideMenuBar: true,
+    titleBarStyle: 'hidden',
     webPreferences: { contextIsolation: true, nodeIntegration: false },
   });
+  // 彻底移除菜单（autoHideMenuBar 只是隐藏，按 Alt 还会冒出来）
+  Menu.setApplicationMenu(null);
 
+  // 用 http:// 加载 UI，而不是 file://。
+  // 原因：内嵌 magpie 控制台（iframe 指向 http://127.0.0.1:17899）需要 cookie；
+  // 页面从 file:// 发起请求属于跨站，SameSite=Lax 的 cookie 会被丢弃，
+  // 每次都落回 magpie 的登录页。走同源 http 就没有这个问题。
+  const apiPort = (store.manager.manager && store.manager.manager.listen || '127.0.0.1:17800').split(':').pop();
   if (ui.placeholder) {
     mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(placeholderHtml()));
   } else {
-    mainWindow.loadFile(ui.file);
+    // ApiServer 尚未 listen 时先等它；失败则回退 file://（至少界面能显示）
+    loadUiFromManager(apiPort, ui.file);
   }
   mainWindow.once('ready-to-show', () => {
     if (!store.manager.general.startMinimized || !tray) mainWindow.show();
@@ -154,17 +195,23 @@ function closeSplash() {
   if (splashWindow && !splashWindow.isDestroyed()) { splashWindow.close(); splashWindow = null; }
 }
 
-/** 参考 AAR waitForBackend：等待任一平台健康/或总超时，期间推进度条 */
-function waitForPlatforms(sec = 60) {
+/**
+ * 参考 AAR waitForBackend：等平台起来，期间推进度条。
+ *
+ * 注意不能把 starting 当成"已就绪"：平台可能长时间停在 starting（例如网关
+ * 起来了但健康检查一直不过），那样 anyUp 会永远为真，Splash 就再也关不掉。
+ * 所以判据只认"有平台真到过 healthy"，或"全部都有结论"，再加硬超时兜底。
+ */
+function waitForPlatforms(sec = 45) {
   return new Promise((resolve) => {
     let n = 0;
     const timer = setInterval(() => {
       n += 1;
       splashProgress(n, sec);
       const list = manager.statusList().filter((s) => s.enabled !== false);
-      const anyUp = list.some((s) => ['healthy', 'starting'].includes(s.status));
-      const settled = list.every((s) => ['healthy', 'stopped', 'error', 'unhealthy'].includes(s.status));
-      if (anyUp || settled || n >= sec) {
+      const anyHealthy = list.some((s) => s.status === 'healthy');
+      const settled = list.every((s) => !['starting', 'updating'].includes(s.status));
+      if (anyHealthy || settled || n >= sec) {
         clearInterval(timer);
         resolve();
       }
@@ -232,6 +279,12 @@ app.whenReady().then(async () => {
   manager = new PlatformManager({ store, dataDir, shellRoot: path.resolve(__dirname, '..'), logger });
   updater = new PlatformUpdater({ manager, store, dataDir, logger });
   api = new ApiServer({ manager, updater, store, openExternal: (u) => shell.openExternal(u) });
+  // 同一个端口托管 UI：主窗口走 http://127.0.0.1:17800/ 而不是 file://
+  // （见 loadUiFromManager 的说明），所以这里必须把静态目录挂上。
+  const uiInfo = uiIndexHtml();
+  if (!uiInfo.placeholder && uiInfo.file) {
+    api.serveStatic(path.dirname(uiInfo.file));
+  }
   const listen = (store.manager.manager && store.manager.manager.listen) || '127.0.0.1:17800';
   try {
     const addr = await api.listen(listen);
@@ -248,12 +301,11 @@ app.whenReady().then(async () => {
   // 3. Splash → 按需 spawn autoStartPlatforms → 等健康 → 主窗口 → 托盘
   createSplash();
   createMainWindow(); // 先建好（ready-to-show 后才显示）
-  try {
-    await manager.startAutoStart();
-  } catch (e) {
-    logger.error(`自启编排失败: ${e.message}`);
-  }
-  await waitForPlatforms(60);
+  // 自启不阻塞启动流程：start() 内部会等平台健康（最长 120s），
+  // 若有平台起不来，整个界面会一起卡在 Splash 上。让它在后台跑，
+  // Splash 只等"有平台健康"或总超时。
+  manager.startAutoStart().catch((e) => logger.error(`自启编排失败: ${e.message}`));
+  await waitForPlatforms(45);
   closeSplash();
   showMainWindow();
 
