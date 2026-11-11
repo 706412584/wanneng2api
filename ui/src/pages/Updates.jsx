@@ -30,7 +30,8 @@ export default function Updates() {
       // 后端对没有 updater.repo 的平台返回 checked:false + reason，
       // 这不是失败，得跟真正的错误区分开。
       if (r.checked === false) {
-        toast(`${p.name}：${r.reason || '该平台没有配置更新源'}`, 'err')
+        // 「没配远程源」与「仓库还没发 Release」都是正常状态，不是失败
+        toast(`${p.name}：${r.reason || '该平台没有配置更新源'}`)
       } else if (r.latest && r.latest !== r.current) {
         toast(`${p.name}：发现新版本 v${r.latest}（当前 v${r.current}）`)
       } else {
@@ -49,9 +50,26 @@ export default function Updates() {
     setCheckAllBusy(true)
     try {
       const results = await Promise.allSettled(platforms.map((p) => api.checkUpdate(p.id)))
-      const found = results.filter((r) => r.status === 'fulfilled' && r.value.latest !== r.value.current).length
+      // 只有 checked:true 且确实拿到更新的才算「有新版本」；
+      // 没配远程源的平台返回 latest=null，不能拿 null!==null 之外的口径误报。
+      const found = results.filter((r) => r.status === 'fulfilled'
+        && r.value.checked !== false && r.value.latest && r.value.latest !== r.value.current).length
+      // checked:false 现在同时表示两种情况，必须拆开统计：
+      //   noRelease=true → 仓库还没发 Release（上游状态，不是失败）
+      //   否则           → 没配 updater.repo（本地自研，本就不检查）
+      // 早先前端只从 rejected 里数 noRelease，而后端已把 noRelease 归一成
+      // 200 + checked:false，于是它们全被算进「N 个本地自研」，提示里消失。
+      const skippedRes = results.filter((r) => r.status === 'fulfilled' && r.value.checked === false)
+      const noRelease = skippedRes.filter((r) => r.value.noRelease === true).length
+      const skipped = skippedRes.length - noRelease
       const failed = results.filter((r) => r.status === 'rejected').length
-      toast(`检查完成：${found} 个平台有新版本${failed ? `，${failed} 个检查失败` : ''}`, failed ? 'err' : 'ok')
+      const parts = [
+        `${found} 个平台有新版本`,
+        skipped ? `${skipped} 个本地自研` : '',
+        noRelease ? `${noRelease} 个仓库暂无 Release` : '',
+        failed ? `${failed} 个检查失败` : '',
+      ].filter(Boolean)
+      toast(`检查完成：${parts.join('，')}`, failed ? 'err' : 'ok')
       sum.refresh()
       pf.refresh()
     } finally {
@@ -127,6 +145,13 @@ export default function Updates() {
                         <b>{it.name}</b>
                       </div>
                       {it.notes && <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 2, maxWidth: 340 }}>{it.notes}</div>}
+                      {/* 有仓库就给出发布页入口：仓库暂无 Release 时用户能自己去看为什么 */}
+                      {it.repo && (
+                        <div style={{ fontSize: 11, marginTop: 2 }}>
+                          <a href={`https://github.com/${it.repo}/releases`} target="_blank" rel="noreferrer"
+                            style={{ color: 'var(--text-3)' }}>{it.repo}</a>
+                        </div>
+                      )}
                     </td>
                     <td className="num">{it.current ? `v${it.current}` : '—'}</td>
                     <td className="num">
@@ -137,13 +162,21 @@ export default function Updates() {
                         : <span style={{ color: 'var(--text-3)' }}>—</span>}
                     </td>
                     <td>
-                      {it.checkError
-                        ? <span className="badge red" title={it.checkError}>检测失败</span>
-                        : !it.hasUpdater
-                          ? <span className="badge gray" title="该平台没有配置 updater.repo，无法检查远程版本">无更新源</span>
-                          : it.updateAvailable
-                            ? <span className="badge orange">有新版</span>
-                            : <span className="badge green">最新</span>}
+                      {/* 四种状态必须分开：把「仓库还没发 Release」和「网络/限流失败」
+                          都染成红色「检测失败」会让用户去查网络，方向完全错。 */}
+                      {it.noRelease
+                        ? <span className="badge gray" title={it.checkError}>仓库暂无 Release</span>
+                        : it.noAsset
+                          // 有 Release 但没有匹配本平台的资产（如只发了 APK）：
+                          // 不能显示「最新」，否则等于把「装不了」说成「不用装」
+                          ? <span className="badge gray" title={`该 Release 没有匹配 ${it.assetPattern || '所需格式'} 的资产；现有资产：${(it.allAssets || []).join(', ') || '无'}`}>无匹配资产</span>
+                          : it.checkError
+                            ? <span className="badge red" title={it.checkError}>检测失败</span>
+                            : !it.hasUpdater
+                              ? <span className="badge gray" title="该平台没有配置 updater.repo，按本地自研维护，不存在远程版本">本地自研</span>
+                              : it.updateAvailable
+                                ? <span className="badge orange">有新版</span>
+                                : <span className="badge green">最新</span>}
                     </td>
                     <td>{plat ? <span className={`state-pill ${plat.state}`}>{STATE_TEXT[plat.state]}</span> : '—'}</td>
                     <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
@@ -252,6 +285,44 @@ function MagpieCoreCard() {
     }
   }
 
+  // 未安装时的一键安装：后台下载，这里轮询进度
+  const [inst, setInst] = useState(null)
+  const [installing, setInstalling] = useState(false)
+  // 挂载时先取一次，拿到安装目录（未安装时引导文案要用）
+  useEffect(() => {
+    api.magpieInstallStatus().then(setInst).catch(() => {})
+  }, [])
+  useEffect(() => {
+    if (!installing) return
+    const t = setInterval(async () => {
+      try {
+        const s = await api.magpieInstallStatus()
+        setInst(s)
+        const st = s?.progress?.status
+        if (s?.installed || st === 'failed' || st === 'done') {
+          setInstalling(false)
+          refresh()
+          if (s?.installed) toast('magpie 已安装，正在启动控制台…')
+          else toast(s?.progress?.message || '安装失败', 'err')
+        }
+      } catch { /* 轮询失败忽略，下轮再试 */ }
+    }, 1500)
+    return () => clearInterval(t)
+  }, [installing, refresh, toast])
+
+  const doInstall = async () => {
+    setInstalling(true)
+    try {
+      await api.magpieInstall()
+      toast('开始下载 magpie…')
+    } catch (e) {
+      setInstalling(false)
+      toast(`安装启动失败：${e.message}`, 'err')
+    }
+  }
+
+  const missing = data && !data.current   // 没有本机版本 = 未安装
+
   return (
     <div className="card" style={{ marginTop: 16 }}>
       <div className="card-title" style={{ justifyContent: 'space-between' }}>
@@ -289,10 +360,14 @@ function MagpieCoreCard() {
                         : <span className="badge green">最新</span>}
                   </td>
                   <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
-                    {data.hasUpdate && !updating && (
+                    {missing && !installing && (
+                      <button className="btn sm primary" onClick={doInstall}>一键安装</button>
+                    )}{' '}
+                    {installing && <span className="badge blue">安装中…</span>}
+                    {!missing && data.hasUpdate && !updating && (
                       <button className="btn sm primary" onClick={doUpdate}>立即更新内核</button>
                     )}{' '}
-                    {updating || data.updating
+                    {!missing && (updating || data.updating)
                       ? <span className="badge blue">更新中…</span>
                       : data.releaseUrl
                         ? <a className="btn sm ghost" href={data.releaseUrl} target="_blank" rel="noreferrer">发布页</a>
@@ -302,11 +377,44 @@ function MagpieCoreCard() {
               </tbody>
             </table>
           </div>
-          <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 8 }}>
-            magpie 内核以独立应用方式安装与自更新，管理台只检测版本、不代为升级。
-            发布源：<span className="mono">yetone/magpie-releases</span>
-            {data.checkedAt ? ` · 检测于 ${fmtAgo(data.checkedAt)}` : ''}
-          </div>
+          {/* 安装进度 */}
+          {inst?.progress && ['resolving', 'downloading'].includes(inst.progress.status) && (
+            <div style={{ marginTop: 10 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 }}>
+                <span>{inst.progress?.message || '下载中…'}</span>
+                {inst.progress?.total > 0 && (
+                  <span style={{ color: 'var(--text-3)' }}>
+                    {(inst.progress.received / 1048576).toFixed(1)} / {(inst.progress.total / 1048576).toFixed(1)} MB
+                  </span>
+                )}
+              </div>
+              <div className="progress">
+                <div className="bar" style={{
+                  width: inst.progress?.total
+                    ? `${Math.round((inst.progress.received / inst.progress.total) * 100)}%`
+                    : '15%',
+                }} />
+              </div>
+            </div>
+          )}
+
+          {missing ? (
+            <div style={{ fontSize: 12.5, color: 'var(--text-2)', marginTop: 10, lineHeight: 1.8 }}>
+              未检测到 magpie 内核。它是约 79MB 的独立程序，不随安装包分发——
+              点「一键安装」会自动下载到{' '}
+              <span className="mono">{inst?.target || '%APPDATA%\\wanneng2api\\magpie'}</span>
+              ，装好后插件市场、登录与内嵌控制台都会自动可用。
+              <br />
+              也可以自行安装（<a href="https://usemagpie.ai" target="_blank" rel="noreferrer">usemagpie.ai</a>），
+              或把 <span className="mono">magpie.exe</span> 放进上面的目录。
+            </div>
+          ) : (
+            <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 8 }}>
+              magpie 内核以独立应用方式安装与自更新，管理台只检测版本、不代为升级。
+              发布源：<span className="mono">yetone/magpie-releases</span>
+              {data.checkedAt ? ` · 检测于 ${fmtAgo(data.checkedAt)}` : ''}
+            </div>
+          )}
         </>
       )}
     </div>

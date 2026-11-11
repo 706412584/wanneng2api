@@ -118,6 +118,17 @@ async function main() {
   const localOrigin = await req('GET', '/api/overview', null, { origin: 'http://127.0.0.1:5173' });
   ok('127.0.0.1 Origin 放行', localOrigin.status === 200);
   ok('isAllowedOrigin 单元', isAllowedOrigin('file://app') || true);
+  // 安全回归：Origin=null 也来自沙箱 iframe / 外部网页的表单提交，
+  // 放行它等于让任意网页能经 CSRF 杀掉占用端口的进程（force）。
+  const nullPost = await req('POST', '/api/platforms/mocka/stop', {}, { origin: 'null' });
+  ok('Origin=null 且无客户端头的写操作被拒绝', nullPost.status === 403, `got ${nullPost.status}`);
+  const nullForce = await req('POST', '/api/platforms/mocka/start', { force: true }, { origin: 'null' });
+  ok('Origin=null 且无客户端头的 force 启动被拒绝', nullForce.status === 403, `got ${nullForce.status}`);
+  // 壳自己的 file:// UI 带客户端头，必须仍可用
+  const trusted = await req('POST', '/api/platforms/mocka/stop', {}, {
+    origin: 'null', headers: { 'X-Wanneng-Client': 'wanneng2api' },
+  });
+  ok('Origin=null 但带客户端头（壳 UI）放行', trusted.status === 200, `got ${trusted.status}`);
   const opts = await req('OPTIONS', '/api/overview', null, { origin: 'http://127.0.0.1:5173' });
   ok('OPTIONS 预检 204', opts.status === 204);
 

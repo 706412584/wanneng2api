@@ -4,8 +4,12 @@ import { Link } from 'react-router-dom'
 import { api, isMock } from '../api/client'
 import { usePolling } from '../hooks/usePolling'
 import { useToast } from '../components/Toast'
+import { useBusy, useConfirm } from '../components/Busy'
 import { Empty, ErrorBox, Loading, StateDot, STATE_TEXT } from '../components/Bits'
 import { fmtUptime } from '../utils/format'
+import PluginManager from '../components/PluginManager'
+import GatewayManager from '../components/GatewayManager'
+import RoutingGroups from '../components/RoutingGroups'
 
 const BUSY_STATES = ['starting', 'updating']
 
@@ -13,13 +17,15 @@ export default function Platforms() {
   const fetchPlatforms = useCallback(() => api.listPlatforms(), [])
   const { data, error, loading, refresh, setData } = usePolling(fetchPlatforms, 5000)
   const toast = useToast()
+  const { run } = useBusy()
+  const confirmAsync = useConfirm()
   const [acting, setActing] = useState({}) // id -> action 进行中
   // 插件安装/卸载后递增，驱动上方「已安装插件」区块刷新
   // （必须放在任何条件 return 之前：Hook 数量要稳定）
   const [pluginRev, setPluginRev] = useState(0)
 
   /** 乐观更新 + POST，失败回滚并提示；成功后立即轮询校正 */
-  const doAction = async (p, action, label) => {
+  const doAction = async (p, action, label, { force = false } = {}) => {
     if (acting[p.id]) return
     const prev = p
     // 乐观更新
@@ -31,11 +37,32 @@ export default function Platforms() {
     setData((list) => list.map((x) => (x.id === p.id ? optimistic : x)))
     setActing((a) => ({ ...a, [p.id]: action }))
     try {
-      await api.platformAction(p.id, action)
-      toast(`${prev.name} ${label}指令已下发`)
+      // 起停/重启要等进程真的起来，耗时可达几十秒：用统一遮罩给出明确反馈
+      await run(
+        `正在${label} ${prev.name}…`,
+        () => api.platformAction(p.id, action, force ? { force: true } : undefined),
+        { detail: action === 'restart' ? '停止 → 重新启动 → 等待健康检查' : undefined },
+      )
+      toast(`${prev.name} ${label}完成`)
     } catch (e) {
       setData((list) => list.map((x) => (x.id === p.id ? prev : x)))
-      toast(`${prev.name} ${label}失败：${e.message}`, 'err')
+      const msg = e.message || ''
+      // 端口被占：提供一次性强杀
+      if (/port-conflict/i.test(msg) && (action === 'start' || action === 'restart')) {
+        const pid = (/PID\s*(\d+)/i.exec(msg) || [])[1]
+        const ok = await confirmAsync(
+          `${msg}\n\n是否结束占用该端口的进程${pid ? `（PID ${pid}）` : ''}并启动 ${prev.name}？`,
+          { title: '端口被占用', danger: true, okText: '结束进程并启动' },
+        )
+        if (ok) {
+          // 必须 await：否则外层 finally 先清掉 acting、放行新一轮点击，
+          // 强制启动还在跑时用户再点一次就会并发起两个启动。
+          return await doAction(p, action, label, { force: true })
+        }
+        toast(`${prev.name} 未强制启动：端口仍被占用`, 'err')
+      } else {
+        toast(`${prev.name} ${label}失败：${msg}`, 'err')
+      }
     } finally {
       setActing((a) => { const n = { ...a }; delete n[p.id]; return n })
       setTimeout(refresh, 400)
@@ -70,6 +97,7 @@ export default function Platforms() {
             busy={acting[p.id]}
             onAction={doAction}
             onOpenPanel={openPanel}
+            onRefresh={refresh}
           />
         ))}
         {corePlatforms.map((p) => (
@@ -79,12 +107,14 @@ export default function Platforms() {
             busy={acting[p.id]}
             onAction={doAction}
             onOpenPanel={openPanel}
+            onRefresh={refresh}
           />
         ))}
         <InstalledPlugins rev={pluginRev} onRemoved={() => setPluginRev((v) => v + 1)} />
       </div>
 
       <PluginMarket onInstalled={() => setPluginRev((v) => v + 1)} onRemoved={() => setPluginRev((v) => v + 1)} />
+      <RoutingGroups />
       <Collapsible title="已配置的内置 Provider" summaryKey="已接入的厂商 / 中转 / 订阅">
         <MagpieProviders />
       </Collapsible>
@@ -99,96 +129,11 @@ export default function Platforms() {
 /**
  * 插件平台卡片 —— 与自研网关卡同模板、同高度：
  *   head（名称+徽标 / 包名）→ stats（三栏）→ desc（固定 3 行）→ actions（贴底）
- * 登录走设备码流程：选方式 → 拿浏览器链接 → 轮询结果。
+ * 登录和账号操作统一在原生插件面板中完成，支持多 provider。
  */
 function PluginPlatformCard({ p, busy, onRemove, onChanged }) {
-  const toast = useToast()
-  const [methods, setMethods] = useState(null)
-  const [loginState, setLoginState] = useState(null)
-  const [working, setWorking] = useState(false)
-  const [dialog, setDialog] = useState(false)
-
-  // 有进行中的登录就轮询状态
-  useEffect(() => {
-    if (!loginState || ['signed-in', 'failed', 'cancelled', 'interactive'].includes(loginState.status)) return
-    const t = setInterval(async () => {
-      try {
-        const r = await api.magpieLoginStatus((p.providers || [])[0])
-        if (r?.state) setLoginState(r.state)
-      } catch { /* 轮询失败忽略 */ }
-    }, 2000)
-    return () => clearInterval(t)
-  }, [loginState, p.providers])
-
-  // 登录成功后提示并刷新列表
-  useEffect(() => {
-    if (loginState?.status === 'signed-in') {
-      toast(`${p.name} 登录成功`)
-      onChanged && onChanged()
-    } else if (loginState?.status === 'failed') {
-      toast(`${p.name} 登录未完成：${loginState.message || ''}`, 'err')
-    }
-  }, [loginState?.status])
-
-  // provider 插件没有自己的前端：管理界面来自 magpie 控制台。
-// 控制台没设 X-Frame-Options，可内嵌；桌面端 Electron 也可用。
-  const [embedOpen, setEmbedOpen] = useState(false)
-  const providerId = (p.providers || [])[0]
-  const embedUrl = providerId
-    ? `http://127.0.0.1:17899/?k=wanneng2api-magpie-web-2026&view=providers&edit=${encodeURIComponent(providerId)}`
-    : 'http://127.0.0.1:17899/?k=wanneng2api-magpie-web-2026&view=providers'
-
-  const openPanelLogin = () => setEmbedOpen(true)
-
-  const openExternalPanel = async () => {
-    try {
-      await api.openPanel('magpie-web', providerId ? { view: 'providers', edit: providerId } : undefined)
-      toast('已在系统浏览器打开')
-    } catch (e) {
-      toast(`打开失败：${e.message}`, 'err')
-    }
-  }
-
-  const openLogin = async () => {
-    setDialog(true)
-    setMethods(null)
-    try {
-      const r = await api.magpieLoginMethods((p.providers || [])[0])
-      setMethods(r.methods || [])
-    } catch (e) {
-      toast(`获取登录方式失败：${e.message}`, 'err')
-      setMethods([])
-    }
-  }
-
-  const doLogin = async (method) => {
-    setDialog(false)
-    setWorking(true)
-    try {
-      const r = await api.magpieLogin((p.providers || [])[0], method)
-      setLoginState({ status: r.started ? 'awaiting-browser' : 'interactive', url: r.url, message: r.message })
-      if (r.url) toast('已打开浏览器授权页，请完成登录')
-      else toast(r.message || '登录进程已启动', r.started ? 'ok' : 'err')
-    } catch (e) {
-      toast(`登录失败：${e.message}`, 'err')
-    } finally {
-      setWorking(false)
-    }
-  }
-
-  const doLogout = async () => {
-    setWorking(true)
-    try {
-      const r = await api.magpieLogout((p.providers || [])[0])
-      if (r.ok) { toast(`${p.name} 已登出`); setLoginState(null); onChanged && onChanged() }
-      else toast(`登出失败：${(r.stderr || r.stdout || '').slice(0, 200)}`, 'err')
-    } finally {
-      setWorking(false)
-    }
-  }
-
+  const [managerOpen, setManagerOpen] = useState(false)
   const signedIn = !!p.signedIn
-  const pending = !!loginState && !['signed-in', 'failed', 'cancelled', 'interactive'].includes(loginState.status)
   const dot = signedIn ? 'healthy' : 'stopped'
   const statusText = signedIn ? '已登录' : (p.installed ? '待登录' : '未安装')
 
@@ -216,83 +161,18 @@ function PluginPlatformCard({ p, busy, onRemove, onChanged }) {
         <span>状态 <b>{statusText}</b></span>
       </div>
 
-      {/* 登录中提示与描述共用同一块区域，避免额外撑高卡片 */}
-      {pending ? (
-        <div className="catalog-desc" style={{ color: 'var(--blue)' }}>
-          等待浏览器授权…{loginState.url && (
-            <a href={loginState.url} target="_blank" rel="noreferrer">点此打开授权页</a>
-          )}
-        </div>
-      ) : (
-        <div className="catalog-desc">
-          {(p.summary && (p.summary.zh || p.summary.en)) || '\u00a0'}
-        </div>
-      )}
+      <div className="catalog-desc">
+        {(p.summary && (p.summary.zh || p.summary.en)) || '\u00a0'}
+      </div>
 
       <div className="plat-actions">
-        {signedIn
-          ? <button className="btn ghost" disabled={working || busy} onClick={doLogout}>登出</button>
-          : <button className="btn primary" disabled={working || busy} onClick={openLogin}>
-              {working ? '启动登录…' : '登录'}
-            </button>}
-        <button className="btn sm" disabled={busy} onClick={openPanelLogin}>管理</button>
+        {!signedIn && <button className="btn primary" disabled={busy} onClick={() => setManagerOpen(true)}>登录</button>}
+        <button className="btn sm" disabled={busy} onClick={() => setManagerOpen(true)}>管理</button>
         <span style={{ flex: 1 }} />
         <button className="btn sm ghost" disabled={busy} onClick={onRemove}>{busy ? '卸载中…' : '卸载'}</button>
       </div>
 
-      {embedOpen && <EmbedPanel title={`${p.name} 管理`} url={embedUrl} onClose={() => setEmbedOpen(false)} onExternal={openExternalPanel} />}
-
-      {dialog && (
-        <div className="modal-mask" onClick={() => setDialog(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-title">登录 {p.name}</div>
-            {methods === null && <div style={{ fontSize: 12.5, color: 'var(--text-3)' }}>读取登录方式…</div>}
-            {methods && methods.length === 0 && (
-              <div style={{ fontSize: 12.5, color: 'var(--text-3)' }}>
-                该插件没有可用的非交互登录方式，请用命令行：<br />
-                <span className="mono">magpie plugin login {(p.providers || [])[0]}</span>
-              </div>
-            )}
-            {methods && methods.map((m) => (
-              <button key={m.index} className="btn" style={{ justifyContent: 'flex-start' }} onClick={() => doLogin(m.index)}>
-                {m.label}
-              </button>
-            ))}
-            <div className="modal-actions">
-              <button className="btn ghost" onClick={() => setDialog(false)}>取消</button>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-/**
- * 内嵌面板：把 magpie 控制台页面直接嵌进管理台（全屏抽屉）。
- * magpie web 未设 X-Frame-Options / CSP frame-ancestors，实测可嵌入。
- */
-function EmbedPanel({ title, url, onClose, onExternal }) {
-  const [loading, setLoading] = useState(true)
-  return (
-    <div className="embed-mask">
-      <div className="embed-bar">
-        <b>{title}</b>
-        <span className="mono sub" style={{ fontSize: 11 }}>{url.split('?')[0]}</span>
-        <span style={{ flex: 1 }} />
-        <button className="btn sm" onClick={onExternal}>新窗口打开</button>
-        <button className="btn sm" onClick={() => { const f = document.querySelector('.embed-frame'); if (f) f.src = url }}>刷新</button>
-        <button className="btn sm ghost" onClick={onClose}>关闭</button>
-      </div>
-      <div className="embed-body">
-        {loading && <div className="embed-loading"><span className="spinner" /> 加载 magpie 控制台…</div>}
-        <iframe
-          className="embed-frame"
-          title={title}
-          src={url}
-          onLoad={() => setLoading(false)}
-        />
-      </div>
+      {managerOpen && <PluginManager plugin={p} onClose={() => setManagerOpen(false)} onChanged={onChanged} />}
     </div>
   )
 }
@@ -322,6 +202,9 @@ function InstalledPlugins({ rev, onRemoved }) {
         refresh()
         if (onRemoved) onRemoved()
       } else toast(`卸载失败：${(r.stderr || r.stdout || '').slice(0, 200)}`, 'err')
+    } catch (e) {
+      // 缺这个 catch 会把失败静默成 unhandled rejection，用户只看到按钮弹回
+      toast(`卸载失败：${e.message}`, 'err')
     } finally {
       setBusy((s) => { const n = { ...s }; delete n[p.package]; return n })
     }
@@ -372,7 +255,7 @@ function Collapsible({ title, summaryKey, children, defaultOpen = false }) {
 }
 
 /** 插件市场：magpie 社区插件目录（Trae / Qoder / WorkBuddy / Loomy / CodeArts …） */
-function PluginMarket({ onInstalled }) {
+function PluginMarket({ onInstalled, onRemoved }) {
   const fetchPlugins = useCallback(() => api.magpiePlugins(false), [])
   const { data, error, loading, refresh } = usePolling(fetchPlugins, 0)
   const toast = useToast()
@@ -778,9 +661,12 @@ function MagpieProviders() {
   )
 }
 
-function PlatformCard({ p, busy, onAction, onOpenPanel }) {
+function PlatformCard({ p, busy, onAction, onOpenPanel, onRefresh }) {
   const disabled = BUSY_STATES.includes(p.state) || !!busy
   const running = ['healthy', 'degraded', 'unhealthy', 'starting', 'updating'].includes(p.state)
+  // 四家自研网关有原生管理面板；内核（external）没有，仍走「打开面板」
+  const hasManager = !!p.id && ['workbuddy', 'codearts', 'loomy', 'lingxi'].includes(p.id)
+  const [managerOpen, setManagerOpen] = useState(false)
 
   return (
     <div className="card plat-card" data-kind={p.type === 'external' ? 'core' : 'own'}>
@@ -826,9 +712,21 @@ function PlatformCard({ p, busy, onAction, onOpenPanel }) {
           ? <button className="btn ghost" disabled={disabled} onClick={() => onAction(p, 'disable', '禁用')}>禁用</button>
           : <button className="btn ghost" disabled={disabled} onClick={() => onAction(p, 'enable', '启用')}>启用</button>}
         <span style={{ flex: 1 }} />
+        {hasManager && (
+          <button className="btn sm primary" disabled={!running} onClick={() => setManagerOpen(true)}
+            title={running ? '原生管理：账号 / 签到 / 统计 / 日志' : '网关未在运行，先启动它'}>管理</button>
+        )}
         <button className="btn sm" onClick={() => onOpenPanel(p)} title={`http://127.0.0.1:${p.port}`}>打开面板</button>
         <Link className="btn sm" to={`/logs?id=${p.id}`}>日志</Link>
       </div>
+
+      {managerOpen && (
+        <GatewayManager
+          platform={p}
+          onClose={() => setManagerOpen(false)}
+          onChanged={onRefresh}
+        />
+      )}
     </div>
   )
 }

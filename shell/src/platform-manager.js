@@ -224,7 +224,9 @@ class PlatformRuntime {
       restartAttempts: this.restartAttempts,
       lastHealthAt: this.lastHealthAt,
       deps: cfg.requires ? this.deps : undefined,
-      adminPanel: cfg.adminPanel || null,
+      // 去掉查询串：magpie-web 的地址里带 ?k=<会话密钥>，
+// snapshot 会经 /api/platforms 与 /api/overview 直接回给前端。
+      adminPanel: typeof cfg.adminPanel === 'string' ? cfg.adminPanel.split('?')[0] : (cfg.adminPanel || null),
     };
   }
 
@@ -542,7 +544,7 @@ class PlatformManager extends EventEmitter {
   }
 
   // ── 启动 ──
-  async start(id) {
+  async start(id, { force = false } = {}) {
     const rt = this.getRuntime(id);
     if (!rt) throw new Error(`未知平台: ${id}`);
     const cfg = rt.cfg;
@@ -596,18 +598,43 @@ class PlatformManager extends EventEmitter {
           Array.isArray(cfg.adoptHints) ? cfg.adoptHints : null,
         ).catch(() => false);
         if (adoptable) {
+          // 端口上确实是该平台自己的实例：优先收养。
+          // **即使 force 也收养**——force 的语义是「结束占着端口的别人」，
+          // 不是「杀掉用户自己启动的本平台进程」。后者不归壳管，
+          // 杀了等于替用户终止他正在用的服务（曾经真实发生过）。
           rt.adopted = true;
           rt.pid = pid || 0;
           rt.startedAt = Date.now();
           rt.lastError = '';
           rt.setStatus('healthy');
-          rt.appendLog('manager', `收养已运行实例（端口 ${cfg.port}，PID ${pid || '未知'}）`);
+          rt.appendLog('manager', `收养已运行实例（端口 ${cfg.port}，PID ${pid || '未知'}）`
+            + (force ? '；force 只结束非本平台进程，故不重启它' : ''));
           this._scheduleHealthTimer(rt);
           return rt.snapshot();
         }
-        const msg = `port-conflict: 端口 ${cfg.port} 已被 PID ${pid} 占用（非本平台进程）`;
-        rt.setStatus('error', msg);
-        throw new Error(msg);
+        // 用户显式要求强制启动：结束占用者再继续
+        if (force && pid) {
+          rt.appendLog('manager', `强制启动：结束占用端口 ${cfg.port} 的进程 PID ${pid}`);
+          await taskkillTree(pid).catch(() => {});
+          // 等端口真正释放（最多 5s）
+          for (let i = 0; i < 20; i++) {
+            await new Promise((r) => setTimeout(r, 250));
+            const again = await checkPortFree(cfg.port, rt.pid);
+            if (again.free) break;
+          }
+          const after = await checkPortFree(cfg.port, rt.pid);
+          if (!after.free) {
+            const msg = `port-conflict: 已尝试结束 PID ${pid}，端口 ${cfg.port} 仍被占用`;
+            rt.setStatus('error', msg);
+            throw new Error(msg);
+          }
+          rt.appendLog('manager', `端口 ${cfg.port} 已释放，继续启动`);
+        } else {
+          const msg = `port-conflict: 端口 ${cfg.port} 已被 PID ${pid} 占用（非本平台进程）`;
+          rt.setStatus('error', msg);
+          throw new Error(msg);
+        }
+        // force 且不是本平台实例：才会走到 taskkill 分支（见上）
       }
     }
 
@@ -630,10 +657,18 @@ class PlatformManager extends EventEmitter {
       rt.setStatus('error', e.message);
       throw e;
     }
-    if (cmd.command !== 'node' && cmd.command !== 'python' && !fs.existsSync(cmd.command) && /[/\\]/.test(cmd.command)) {
-      const msg = `可执行文件不存在: ${cmd.command}`;
-      rt.setStatus('error', msg);
-      throw new Error(msg);
+    // 裸文件名（wb2api.exe / codearts2api-panel.exe）也要校验：spawn 找不到时
+// 只发 error 事件、不触发 exit，过去会先空等 120s 健康检查再报“unhealthy”，
+// 用户看到的是超时而不是“文件不存在”。
+    if (cmd.command !== 'node' && cmd.command !== 'python') {
+      // 裸名（wb2api.exe）：_resolveCommand 已优先取 workDir 下的绝对路径，
+      // 仍是裸名说明 workDir 里没有，可能命中 PATH；两者都不存在才算缺失。
+      const exists = fs.existsSync(cmd.command) || (!/[/\\]/.test(cmd.command) && !!whichSync(cmd.command));
+      if (!exists && (/[/\\]/.test(cmd.command) || /\.(exe|bat|cmd|com)$/i.test(cmd.command))) {
+        const msg = `可执行文件不存在: ${cmd.command}（工作目录 ${cmd.cwd}）`;
+        rt.setStatus('error', msg);
+        throw new Error(msg);
+      }
     }
 
     rt.setStatus('starting');
@@ -770,10 +805,10 @@ class PlatformManager extends EventEmitter {
     return rt.snapshot();
   }
 
-  async restart(id) {
+  async restart(id, { force = false } = {}) {
     await this.stop(id);
     await new Promise((r) => setTimeout(r, 300)); // 让端口完全释放
-    return this.start(id);
+    return this.start(id, { force });
   }
 
   enable(id) {

@@ -6,6 +6,8 @@ ui/dist/
 shell/node_modules/
 shell/dist/
 shell/out/
+# 本地预览打包产物（安装包约 80MB，不入库）
+shell/dist-preview/
 
 # 运行时数据（本地开发）
 *.log

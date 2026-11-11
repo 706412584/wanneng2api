@@ -59,7 +59,7 @@ function expandPath(p) {
 /**
  * 五个默认平台（§4.2 + 已核实事实）：
  * - workbuddy : server.exe（不是 wb2api.exe），cwd=D:/软件/workbuddy2api（导入），7863 /healthz /__admin/
- * - codearts  : codearts2api-panel.exe 在 bin/ 子目录，cwd=D:/app/codearts2api-panel（导入），7866 /healthz
+ * - codearts  : codearts2api-panel.exe 与原配置/账号库都在 bin/，cwd=D:/app/codearts2api-panel/bin（导入），7866 /healthz
  * - loomy     : python -m loomy2api serve，cwd=D:/app/loomy2api（导入），17990 /health /panel
  * - sub2api   : server.exe + 编排 PG:5433 / Redis:6380，/health（routes/common.go:12 已确认），默认关闭
  * - hub       : ../hub/hub.exe（另一代理交付），17810，/health
@@ -76,7 +76,10 @@ function defaultPlatforms() {
         mode: 'import',
         workDir: 'D:/软件/workbuddy2api',
         run: {
-          binary: 'server.exe',
+          // 必须是 wb2api.exe：它才是与 start.cmd 一致、含最新指纹/会话头修复的
+          // 构建。server.exe 是 2026-09-27 的旧产物，缺 X-Conversation-Message-ID /
+          // x-codebuddy-request / X-Agent-Intent，会被上游按渠道校验拒绝（11128）。
+          binary: 'wb2api.exe',
           args: [],
           env: { NO_PROXY: '*' },
           shell: false,
@@ -108,10 +111,10 @@ function defaultPlatforms() {
         type: 'go-binary',
         enabled: true,
         mode: 'import',
-        workDir: 'D:/app/codearts2api-panel',
+        workDir: 'D:/app/codearts2api-panel/bin',
         run: {
-          binary: 'bin/codearts2api-panel.exe',
-          args: [],
+          binary: 'codearts2api-panel.exe',
+          args: ['--config', 'config.json'],
           env: { NO_PROXY: '*' },
           shell: false,
         },
@@ -354,8 +357,50 @@ class ConfigStore {
           }
         }
         this.platforms.platforms = [...byId.values()];
+        // “只补缺失键”修不了 run.binary 这类**已存在但值错了**的字段。
+        // 这里做一次有针对性的迁移：只认之前确认过的错误旧值，命中才改，
+        // 用户自己改过的其它值一律不动。
+        if (this._migrateKnownBadDefaults(byId)) this.savePlatforms();
       }
     }
+  }
+
+  /**
+   * 修正历史上写错的默认值。只匹配「已知的错误旧值」，
+   * 用户改成任何别的值都不会被这里覆盖。
+   *
+   * 背景（两起真实事故）：
+   *  - WorkBuddy 指向 server.exe（2026-09-27 旧构建），缺客户端指纹/会话头，
+   *    被上游按渠道校验拒绝（11128）。正确产物是 start.cmd 用的 wb2api.exe。
+   *  - CodeArts 以根目录为 cwd 启动，读不到 bin/config.json 与 bin/auths，
+   *    表现为「无账号 / 密钥不符」。原配置一直放在 bin 下。
+   * @returns {boolean} 是否发生了修改
+   */
+  _migrateKnownBadDefaults(byId) {
+    let changed = false;
+    const wb = byId.get('workbuddy');
+    if (wb && wb.run && wb.run.binary === 'server.exe') {
+      wb.run.binary = 'wb2api.exe';
+      changed = true;
+    }
+    const ca = byId.get('codearts');
+    if (ca) {
+      // 根目录 cwd + bin/ 下的可执行文件 = 读错配置的老写法
+      if (ca.workDir === 'D:/app/codearts2api-panel'
+        && ca.run && ca.run.binary === 'bin/codearts2api-panel.exe') {
+        ca.workDir = 'D:/app/codearts2api-panel/bin';
+        ca.run.binary = 'codearts2api-panel.exe';
+        ca.run.args = ['--config', 'config.json'];
+        changed = true;
+      }
+      // 已经指向 bin，但 args 里没有显式 --config：补上，避免依赖 cwd 隐式解析
+      if (ca.workDir === 'D:/app/codearts2api-panel/bin' && ca.run
+        && !(Array.isArray(ca.run.args) && ca.run.args.includes('--config'))) {
+        ca.run.args = ['--config', 'config.json'];
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   saveManager() {

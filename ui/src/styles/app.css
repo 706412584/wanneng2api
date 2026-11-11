@@ -148,6 +148,14 @@ html[data-theme='dark'] .banner { background: #3a1d1d; color: #f2a19d; border-co
 }
 .card-title .sub { font-size: 12px; color: var(--text-3); font-weight: 400; }
 
+/* ===== 通用工具类 =====
+   插件面板/路由组等新组件直接用 className="sub"/"mono"，
+   之前这两个类只在 .card-title 等父级下定义，导致样式落空。 */
+.sub { font-size: 12px; color: var(--text-3); font-weight: 400; }
+.mono { font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace); }
+.ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.grow { flex: 1; min-width: 0; }
+
 /* ===== 指标卡 ===== */
 .metrics {
   display: grid; gap: 12px;
@@ -538,35 +546,162 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 }
 .collapse-head .caret.open { transform: rotate(90deg); }
 
-/* ===== 内嵌控制台（全屏抽屉） ===== */
-.embed-mask {
-  position: fixed; inset: 0; z-index: 200;
-  background: var(--bg);
-  display: flex; flex-direction: column;
-  animation: embedIn 0.16s ease-out;
-}
-@keyframes embedIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
-.embed-bar {
-  display: flex; align-items: center; gap: 10px;
-  padding: 9px 14px;
-  border-bottom: 1px solid var(--border);
+/* ===== 自绘标题栏（frame:false） ===== */
+.titlebar {
+  position: fixed; top: 0; left: 0; right: 0; height: 34px; z-index: 300;
+  display: flex; align-items: stretch;
   background: var(--card);
-  flex: 0 0 auto;
+  border-bottom: 1px solid var(--border);
+  /* 整条可拖动窗口；按钮区域单独关掉 */
+  -webkit-app-region: drag;
+  user-select: none;
 }
-.embed-bar b { font-size: 13.5px; }
-.embed-body { flex: 1; position: relative; min-height: 0; }
-.embed-frame {
-  width: 100%; height: 100%;
-  border: 0; display: block;
-  background: var(--bg);
+.titlebar-drag {
+  flex: 1; display: flex; align-items: center;
+  padding-left: 14px; min-width: 0;
 }
-.embed-loading {
-  position: absolute; inset: 0;
-  display: flex; align-items: center; justify-content: center; gap: 10px;
-  font-size: 13px; color: var(--text-3);
-  background: var(--bg);
-  z-index: 1;
+.titlebar-title {
+  font-size: 12px; color: var(--text-3); letter-spacing: .3px;
 }
+.titlebar-actions { display: flex; -webkit-app-region: no-drag; }
+.tb-btn {
+  width: 44px; height: 34px;
+  display: flex; align-items: center; justify-content: center;
+  background: transparent; border: 0; color: var(--text-2);
+  cursor: pointer; padding: 0;
+}
+.tb-btn:hover { background: var(--card-hover); color: var(--text); }
+.tb-close:hover { background: #e5484d; color: #fff; }
+/* 有标题栏时整体下移：高度也要相应减掉 34px，否则出现滚动条
+   注意不能用 margin-top 让位：margin 会叠加在已减高的 100% 之外，
+   总高变成 100% + 34px，滚动条会冒到 html 外层（窗口最右侧）。
+   用绝对定位把壳固定在标题栏下方。 */
+html.has-titlebar { overflow: hidden; }
+html.has-titlebar .app-shell {
+  position: fixed;
+  top: 34px;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: auto;
+  margin-top: 0;
+}
+
+/* ===== 统一操作遮罩 ===== */
+.busy-mask {
+  position: fixed; inset: 0; z-index: 400;
+  background: rgba(8, 12, 10, 0.42);
+  backdrop-filter: blur(1.5px);
+  display: flex; align-items: center; justify-content: center;
+  animation: busyIn 0.12s ease-out;
+}
+@keyframes busyIn { from { opacity: 0 } to { opacity: 1 } }
+.busy-box {
+  min-width: 260px; max-width: 420px;
+  padding: 22px 26px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  text-align: center;
+}
+.busy-text { font-size: 13.5px; font-weight: 600; color: var(--text); }
+.busy-detail { font-size: 12px; color: var(--text-3); line-height: 1.6; }
+.busy-queue { font-size: 11.5px; color: var(--text-3); }
+
+/* ===== 原生插件管理抽屉 ===== */
+.plugin-manager-mask {
+  position: fixed; inset: 0; z-index: 90;
+  /* 固定黑色压暗：--text 在深色主题下是浅色，用它会变成一层白雾 */
+  background: rgba(0, 0, 0, 0.45);
+  display: flex; justify-content: flex-end;
+}
+html.has-titlebar .plugin-manager-mask { top: 34px; }
+.plugin-manager {
+  width: min(760px, 100%); height: 100%; min-width: 0;
+  display: flex; flex-direction: column; outline: none;
+  background: var(--card); border-left: 1px solid var(--border); box-shadow: var(--shadow-lg);
+  animation: pluginManagerIn 0.16s ease-out;
+}
+@keyframes pluginManagerIn { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: none; } }
+.plugin-manager-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 24px 24px 18px; }
+.plugin-manager-head h2 { font-size: 21px; line-height: 1.5; margin: 4px 0; }
+.plugin-manager-eyebrow { font-size: 12px; color: var(--primary); font-weight: 600; }
+.plugin-manager-package { color: var(--text-3); font-size: 11px; overflow-wrap: anywhere; }
+.plugin-manager-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; padding: 0 24px 18px; }
+.plugin-manager-toolbar .field { flex: 1; min-width: 0; font-size: 12px; color: var(--text-2); }
+.plugin-manager-toolbar .badge { margin-bottom: 6px; }
+.plugin-manager-tabs { display: flex; gap: 20px; padding: 0 24px; border-bottom: 1px solid var(--border); }
+.plugin-manager-tabs button { appearance: none; background: none; color: var(--text-3); padding: 12px 2px; border: 0; border-bottom: 2px solid transparent; font: inherit; font-weight: 600; cursor: pointer; }
+.plugin-manager-tabs button.active { color: var(--primary); border-bottom-color: var(--primary); }
+.plugin-manager-body { flex: 1; min-height: 0; overflow-y: auto; padding: 22px 24px; overscroll-behavior: contain; }
+.plugin-manager-section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.plugin-manager h3 { font-size: 14px; margin: 0; }
+.plugin-manager-empty { color: var(--text-3); font-size: 13px; line-height: 1.8; padding: 24px 16px; text-align: center; border: 1px dashed var(--border); border-radius: var(--radius); }
+.plugin-manager-error { color: var(--red); background: color-mix(in srgb, var(--red) 7%, var(--card)); border: 1px solid color-mix(in srgb, var(--red) 25%, transparent); border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; font-size: 12px; }
+.plugin-account-list, .plugin-model-list, .plugin-option-list { display: flex; flex-direction: column; gap: 10px; }
+.plugin-account { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); }
+.plugin-account-info { flex: 1; min-width: 160px; display: flex; flex-direction: column; gap: 4px; overflow-wrap: anywhere; }
+.plugin-account-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.plugin-login-section { border-top: 1px solid var(--border); margin-top: 24px; padding-top: 20px; }
+.plugin-login-section h3 { margin-bottom: 12px; }
+.plugin-login-methods { display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
+.plugin-login-methods .btn { justify-content: flex-start; white-space: normal; text-align: left; }
+.plugin-login-flow { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; padding: 16px; background: var(--bg); border-radius: var(--radius); }
+.plugin-login-flow .field { width: 100%; }
+.plugin-login-flow .sub { line-height: 1.7; }
+.plugin-device-code { font-size: 12px; color: var(--text-2); }
+.plugin-device-code code { font-size: 18px; letter-spacing: 2px; margin-left: 10px; }
+.plugin-model-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 16px; }
+.plugin-model-toolbar .input { flex: 1; min-width: 180px; }
+.plugin-model { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }
+.plugin-model.selected { background: color-mix(in srgb, var(--primary) 4%, var(--card)); border-color: color-mix(in srgb, var(--primary) 30%, var(--border)); }
+.plugin-model > span:first-of-type { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; overflow-wrap: anywhere; }
+.plugin-model input, .plugin-option input { accent-color: var(--primary); flex-shrink: 0; }
+.plugin-option { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 16px; border: 1px solid var(--border); border-radius: var(--radius); cursor: pointer; }
+.plugin-option > span { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.plugin-option .sub { line-height: 1.8; }
+.plugin-option input { width: 18px; height: 18px; margin-top: 2px; }
+.plugin-login-open { display: flex; flex-wrap: wrap; gap: 8px; }
+.routing-bind { display: flex; flex-direction: column; gap: 14px; padding: 16px; margin-bottom: 14px; background: var(--bg); border-radius: var(--radius); }
+.routing-bind-list { display: flex; flex-direction: column; gap: 8px; }
+.routing-bind-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }
+.routing-bind-item.selected { border-color: color-mix(in srgb, var(--primary) 35%, var(--border)); background: color-mix(in srgb, var(--primary) 5%, var(--card)); }
+.routing-bind-item input { accent-color: var(--primary); flex-shrink: 0; }
+.routing-bind-item > span:nth-of-type(1) { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; overflow-wrap: anywhere; }
+.routing-group-list { display: flex; flex-direction: column; gap: 8px; }
+.routing-group { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.routing-group-head { display: flex; align-items: center; gap: 10px; width: 100%; padding: 12px 14px; background: none; border: 0; font: inherit; color: var(--text); text-align: left; cursor: pointer; }
+.routing-group-head:hover { background: var(--card-hover); }
+.routing-group-members { margin: 0; padding: 0 14px 12px; list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.routing-member { display: flex; align-items: center; gap: 12px; padding: 9px 12px; border-radius: 8px; background: var(--bg); }
+.routing-rank { width: 20px; color: var(--text-3); font-size: 12px; font-variant-numeric: tabular-nums; }
+.routing-member-name { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; overflow-wrap: anywhere; }
+.routing-member-actions { display: flex; gap: 4px; }
+.routing-member-actions .btn { min-width: 34px; padding-left: 0; padding-right: 0; }
+.plugin-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); cursor: pointer; margin-bottom: 4px; }
+.plugin-toggle input { width: 16px; height: 16px; accent-color: var(--primary); cursor: pointer; }
+.plugin-toggle.off { color: var(--text-3); }
+.plugin-quota-list { display: flex; flex-direction: column; gap: 12px; }
+.plugin-quota { display: flex; flex-direction: column; gap: 9px; padding: 15px 16px; border: 1px solid var(--border); border-radius: var(--radius); }
+.plugin-quota-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.plugin-quota-foot { display: flex; justify-content: space-between; gap: 12px; font-size: 11.5px; color: var(--text-3); }
+.plugin-quota-nolimit { font-size: 12px; color: var(--text-3); }
+.plugin-quota .progress { height: 8px; }
+.plugin-checkin-list { display: flex; flex-direction: column; gap: 10px; }
+.plugin-checkin { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 14px 16px; border: 1px solid var(--border); border-radius: var(--radius); }
+.plugin-checkin-info { display: flex; flex-direction: column; gap: 7px; min-width: 0; overflow-wrap: anywhere; }
+.plugin-manager-save { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--border); }
+.plugin-manager-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 24px; border-top: 1px solid var(--border); color: var(--text-3); font-size: 11.5px; }
+@media (max-width: 600px) {
+  .plugin-manager-head { padding: 18px 16px 14px; }
+  .plugin-manager-toolbar, .plugin-manager-tabs { padding-left: 16px; padding-right: 16px; }
+  .plugin-manager-body { padding: 18px 16px; }
+  .plugin-manager-foot { padding: 12px 16px; }
+  .plugin-account-actions { width: 100%; }
+}
+@media (prefers-reduced-motion: reduce) { .plugin-manager { animation: none; } }
 
 /* ===== 弹窗 ===== */
 .modal-mask {

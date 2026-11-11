@@ -339,19 +339,23 @@ function localRegistryPath() {
 }
 
 async function listPluginCatalog({ force = false } = {}) {
+  let reg;
+  let source;
   if (!force && registryCache && Date.now() - registryCache.at < PLUGIN_REGISTRY_CACHE_MS) {
-    return registryCache.data;
-  }
-  let reg = await fetchJson(PLUGIN_REGISTRY_URL);
-  let source = 'remote';
-  if (!reg) {
-    const local = localRegistryPath();
-    if (local) {
-      reg = readJson(local, null);
-      source = 'local';
+    ({ reg, source } = registryCache);
+  } else {
+    reg = await fetchJson(PLUGIN_REGISTRY_URL);
+    source = 'remote';
+    if (!reg) {
+      const local = localRegistryPath();
+      if (local) {
+        reg = readJson(local, null);
+        source = 'local';
+      }
     }
+    if (!reg || !Array.isArray(reg.plugins)) return { plugins: [], source: 'none' };
+    registryCache = { reg, source, at: Date.now() };
   }
-  if (!reg || !Array.isArray(reg.plugins)) return { plugins: [], source: 'none' };
 
   // 已安装插件（按 package spec 匹配，含 @latest 后缀差异）
   const installedSpecs = (readJson(path.join(magpieConfigDir(), 'plugins.json'), { plugins: [] }).plugins || [])
@@ -385,9 +389,7 @@ async function listPluginCatalog({ force = false } = {}) {
     };
   });
 
-  const data = { plugins, source, fetchedAt: Date.now(), total: plugins.length };
-  registryCache = { at: Date.now(), data };
-  return data;
+  return { plugins, source, fetchedAt: registryCache.at, total: plugins.length };
 }
 
 /** 安装社区插件：magpie plugin add <package> */
@@ -762,6 +764,122 @@ function runUpdate(binaryPath, { timeoutMs = 600000 } = {}) {
   return true;
 }
 
+// ── 一键安装 magpie（未安装时的引导） ─────────────────────────────────
+// magpie 是约 79MB 的独立可执行文件，不随安装包分发。这里直接从它的
+// release 仓库取 CLI 版（magpie-cli-<os>-<arch>）存到数据目录，
+// 让打包版用户不必自己去找下载页。
+let installState = null; // { status, received, total, message }
+
+function installProgress() {
+  return installState;
+}
+
+/**
+ * 下载 magpie 到 <dataDir>/magpie/。
+ * @returns {Promise<{ok:boolean, path?:string, message?:string}>}
+ */
+function installMagpie(dataDir, { timeoutMs = 300000, onProgress } = {}) {
+  const asset = process.platform === 'win32'
+    ? `magpie-cli-windows-${process.arch === 'arm64' ? 'arm64' : 'amd64'}.exe`
+    : process.platform === 'darwin'
+      ? `magpie-cli-darwin-${process.arch === 'arm64' ? 'arm64' : 'amd64'}`
+      : `magpie-cli-linux-${process.arch === 'arm64' ? 'arm64' : 'amd64'}`;
+
+  const dir = path.join(dataDir, 'magpie');
+  const out = path.join(dir, process.platform === 'win32' ? 'magpie.exe' : 'magpie');
+  installState = { status: 'resolving', received: 0, total: 0, message: '正在获取最新版本…' };
+
+  return new Promise((resolve) => {
+    const metaUrl = `https://api.github.com/repos/${MAGPIE_RELEASES_REPO}/releases/latest`;
+    const req = require('https').get(metaUrl, {
+      headers: { 'User-Agent': 'wanneng2api-shell', Accept: 'application/vnd.github+json' },
+      timeout: 20000,
+    }, (res) => {
+      let body = '';
+      res.on('data', (c) => (body += c));
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          const msg = res.statusCode === 403
+            ? 'GitHub API 限流，请稍后重试，或在「设置」里填 GitHub Token'
+            : `获取版本信息失败（HTTP ${res.statusCode}）`;
+          installState = { status: 'failed', received: 0, total: 0, message: msg };
+          return resolve({ ok: false, message: msg });
+        }
+        let info;
+        try { info = JSON.parse(body); } catch {
+          installState = { status: 'failed', received: 0, total: 0, message: '版本信息解析失败' };
+          return resolve({ ok: false, message: '版本信息解析失败' });
+        }
+        const assetInfo = (info.assets || []).find((a) => a.name === asset);
+        if (!assetInfo) {
+          const msg = `发布包里没有 ${asset}`;
+          installState = { status: 'failed', received: 0, total: 0, message: msg };
+          return resolve({ ok: false, message: msg });
+        }
+        download(assetInfo.browser_download_url, assetInfo.size);
+      });
+    });
+    req.on('error', (e) => {
+      installState = { status: 'failed', received: 0, total: 0, message: `网络错误：${e.message}` };
+      resolve({ ok: false, message: `网络错误：${e.message}` });
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      installState = { status: 'failed', received: 0, total: 0, message: '获取版本信息超时' };
+      resolve({ ok: false, message: '获取版本信息超时' });
+    });
+
+    function download(url, size) {
+      try { fs.mkdirSync(dir, { recursive: true }); } catch { /* 已存在 */ }
+      // 先写 .part 再改名，避免半包被当成可执行文件
+      const part = `${out}.part`;
+      installState = { status: 'downloading', received: 0, total: size, message: '正在下载 magpie…' };
+      const file = fs.createWriteStream(part);
+      const follow = (u, depth = 0) => {
+        if (depth > 5) { finish(false, '下载重定向次数过多'); return; }
+        const dl = require('https').get(u, { headers: { 'User-Agent': 'wanneng2api-shell' }, timeout: timeoutMs }, (res) => {
+          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            res.resume();
+            return follow(res.headers.location, depth + 1);
+          }
+          if (res.statusCode !== 200) {
+            res.resume();
+            finish(false, `下载失败（HTTP ${res.statusCode}）`);
+            return;
+          }
+          res.on('data', (c) => {
+            installState.received += c.length;
+            if (onProgress) onProgress(installState);
+          });
+          res.pipe(file);
+          file.on('finish', () => {
+            file.close(() => {
+              try {
+                fs.renameSync(part, out);
+                if (process.platform !== 'win32') fs.chmodSync(out, 0o755);
+                installState = { status: 'done', received: installState.received, total: size, message: '安装完成' };
+                resolve({ ok: true, path: out });
+              } catch (e) {
+                finish(false, `写入失败：${e.message}`);
+              }
+            });
+          });
+          res.on('error', (e) => finish(false, `下载中断：${e.message}`));
+        });
+        dl.on('error', (e) => finish(false, `下载失败：${e.message}`));
+        dl.on('timeout', () => { dl.destroy(); finish(false, '下载超时'); });
+      };
+      const finish = (ok, message) => {
+        try { file.close(); } catch { /* ignore */ }
+        try { fs.unlinkSync(part); } catch { /* ignore */ }
+        installState = { status: ok ? 'done' : 'failed', received: 0, total: 0, message };
+        resolve({ ok, message });
+      };
+      follow(url);
+    }
+  });
+}
+
 function semverGt(a, b) {
   if (!a || !b) return false;
   const pa = a.split('.').map(Number);
@@ -774,7 +892,536 @@ function semverGt(a, b) {
   return false;
 }
 
+/**
+ * 路由组只读/排序：同一模型可能被多个平台提供，内核把它们合成一个 auto 组。
+ * 用户调整顺序时，内核会把该组“变成你的”（auto → 用户组），
+ * 所以保存必须原样带回它已有的其它字段，不能只发 members。
+ */
+class RoutingGroups {
+  constructor({ getConfig, timeoutMs = 15000 }) {
+    this.panel = new PluginPanel({ getConfig, timeoutMs });
+  }
+
+  async list() {
+    const data = await this.panel._api('groups');
+    const groups = Array.isArray(data) ? data : Array.isArray(data?.groups) ? data.groups : [];
+    return groups.filter((g) => g && typeof g.id === 'string').map((g) => ({
+      id: g.id,
+      name: typeof g.name === 'string' ? g.name : g.id,
+      auto: !!g.auto,
+      routing: typeof g.routing === 'string' ? g.routing : '',
+      ready: !!g.ready,
+      members: (Array.isArray(g.members) ? g.members : []).filter((m) => typeof m === 'string'),
+      memberInfo: (Array.isArray(g.memberInfo) ? g.memberInfo : [])
+        .filter((m) => m && typeof m.id === 'string')
+        .map((m) => ({ id: m.id, provider: typeof m.provider === 'string' ? m.provider : '',
+          name: typeof m.name === 'string' ? m.name : '', model: typeof m.model === 'string' ? m.model : '',
+          ready: !!m.ready, providerOff: !!m.providerOff })),
+      ref: typeof g.ref === 'string' ? g.ref : 'group/' + g.id,
+    }));
+  }
+
+  /** 同一模型被多个平台提供时，按成员数降序给出，便于优先展示“需要定顺序”的组 */
+  async shared() {
+    const groups = await this.list();
+    return groups.filter((g) => g.members.length > 1).sort((a, b) => b.members.length - a.members.length
+      || a.name.localeCompare(b.name));
+  }
+
+  /**
+   * 列出可绑定的平台：每个 provider 的 id/名称/是否启用/模型数。
+   * 只给「已安装的 provider」，不做成通用 provider 编辑器。
+   */
+  async bindable() {
+    const data = await this.panel._api('providers');
+    const rows = Array.isArray(data?.providers) ? data.providers : [];
+    return rows.filter((p) => p && typeof p.id === 'string' && !p.account?.builtin)
+      .map((p) => ({
+        id: p.id,
+        name: typeof p.name === 'string' ? p.name : p.id,
+        off: !!p.off,
+        ready: !!p.ready,
+        models: (Array.isArray(p.models) ? p.models : []).filter((m) => m && m.on && typeof m.id === 'string')
+          .map((m) => ({ id: m.id, name: typeof m.name === 'string' ? m.name : m.id })),
+      }));
+  }
+
+  /**
+   * 用勾选的平台新建（或更新）一个顺序路由组。
+   * members 由后台按「平台 + 该平台已启用模型」展开，前端不能塞任意 id。
+   */
+  async bind({ id, name, providers }) {
+    if (typeof name !== 'string' || !name.trim() || name.length > 80) throw new Error('分组名称无效');
+    if (!Array.isArray(providers) || !providers.length || providers.length > 50
+      || !providers.every((p) => typeof p === 'string')) throw new Error('请至少选择一个平台');
+    const avail = await this.bindable();
+    const picked = providers.filter((pid) => avail.some((p) => p.id === pid));
+    if (picked.length !== providers.length) throw new Error('所选平台不存在');
+    const members = [];
+    for (const pid of picked) {
+      const row = avail.find((p) => p.id === pid);
+      if (!row.models.length) throw new Error(`${row.name} 没有已启用的模型`);
+      for (const m of row.models) members.push(`${pid}/${m.id}`);
+    }
+    if (new Set(members).size !== members.length) throw new Error('所选平台产生了重复成员');
+    const hasId = typeof id === 'string' && !!id;
+    // 更新既有组时，除「名称 + 成员 + 顺序策略」外一律沿用原值：
+    // 否则 note/rules/weights/modelPrefs 等会被默认空值抹掉。
+    let base = {
+      note: '', match: [], pick: '', affinity: '', sink: false, noSink: false,
+      firstToken: 0, patience: 0, rules: [], effort: '', classifier: '', intentSure: null,
+      context: 0, levels: [], family: '', fast: [], off: [], weights: {}, effortMaps: {},
+      accounts: [], keys: [], unlists: false,
+    };
+    if (hasId) {
+      const current = await this.panel._api('groups');
+      const all = Array.isArray(current) ? current : Array.isArray(current?.groups) ? current.groups : [];
+      const target = all.find((g) => g && g.id === id);
+      if (!target) throw new Error('要更新的分组不存在');
+      if (target.auto) throw new Error('自动合并的分组不能用绑定覆盖，请新建');
+      // 只允许更新「已经全部来自本接口所选平台」的组，避免吞掉手工成员
+      const known = new Set();
+      for (const p of avail) for (const m of p.models) known.add(`${p.id}/${m.id}`);
+      const foreign = (Array.isArray(target.members) ? target.members : []).filter((m) => !known.has(m));
+      if (foreign.length) throw new Error('该分组含绑定之外的成员，不能在此覆盖');
+      // 保留原有的一切非成员配置
+      base = {
+        note: target.note || '', match: target.match || [], pick: target.pick || '',
+        affinity: target.affinity || '',
+        sink: !!target.sink,
+        noSink: !!target.noSink, firstToken: target.firstToken || 0, patience: target.patience || 0,
+        rules: target.rules || [], effort: target.effort || '', classifier: target.classifier || '',
+        intentSure: target.intentSure ?? null, context: target.context || 0, levels: target.levels || [],
+        family: target.family || '', fast: target.fast || [], off: target.off || [],
+        weights: target.weights || {}, effortMaps: target.effortMaps || {},
+        accounts: target.accounts || [], keys: target.keys || [], unlists: !!target.unlists,
+      };
+    }
+    const body = {
+      id: hasId ? id : undefined,
+      from: hasId ? id : undefined,
+      name: name.trim(), members, placed: members,
+      // 绑定入口的目标就是“按勾选顺序”，新建与更新都设为 order
+      routing: 'order',
+      ...base,
+    };
+    const result = await this.panel._api('groups/save', body);
+    const groups = Array.isArray(result) ? result : Array.isArray(result?.groups) ? result.groups : [];
+    const saved = groups.find((g) => g && g.name === body.name) || groups.find((g) => g && g.id === id);
+    return { name: body.name, members, id: saved?.id || id || '' };
+  }
+
+  async reorder(id, members) {
+    if (typeof id !== 'string' || !id) throw new Error('路由组标识无效');
+    const data = await this.panel._api('groups');
+    const groups = Array.isArray(data) ? data : Array.isArray(data?.groups) ? data.groups : [];
+    const g = groups.find((x) => x && x.id === id);
+    if (!g) throw new Error('路由组不存在');
+    const current = (Array.isArray(g.members) ? g.members : []).filter((m) => typeof m === 'string');
+    // 只允许重排，不允许借这个接口增删成员
+    if (!Array.isArray(members) || members.length !== current.length
+      || members.some((m) => typeof m !== 'string' || !current.includes(m))
+      || new Set(members).size !== members.length) {
+      throw new Error('只能调整现有成员的顺序');
+    }
+    // 空 routing 是**智能(Smart)**，不是顺序：内核 GROUP_HINT 的第一项（键 ""）
+    // 就是智能调度。把空值改写成 'order' 会静默把用户的智能路由换成顺序路由。
+    // 因此顺序调整只对显式的顺序型策略开放，其它一律拒绝，并保持原值回传。
+    const routing = typeof g.routing === 'string' ? g.routing : '';
+    // order = 严格按顺序；空 = 智能（顺序只作兜底，条件相同时才生效）。
+    // 其它策略（drain/rotate/usage/pace/weight/free/fast/cheap/expiring/manual）
+    // 根本不看顺序，改它不会有任何效果，直接拒绝而不是假装保存。
+    if (routing && routing !== 'order') {
+      throw new Error(`该组使用「${routing}」策略，成员顺序不影响路由，无法在此调整`);
+    }
+    // 含模式匹配（match / patterns / matched）的组：members 里混着自动匹配出来的
+    // 成员，原样写回会把它们固化成硬编码成员。这类组请在控制台调整。
+    const patterns = [g.match, g.matched, g.patterns].some((v) => Array.isArray(v) && v.length > 0);
+    if (patterns) {
+      throw new Error('该组包含按模式自动匹配的成员，不能只靠改顺序调整');
+    }
+    const body = {
+      id: g.id, from: g.id, name: g.name || g.id, note: g.note || '',
+      members: members, placed: members, match: g.match || [],
+      // 原样回传：空字符串保持空（智能），不擅自改成 order
+      routing,
+      pick: g.pick || '', affinity: g.affinity || '',
+      // 内核保存时 sink / noSink 都是**布尔**：
+      //   sink: !!g.sink && sinkable(routing)   （429 时排到队尾）
+      //   noSink: !!g.noSink                    （保留原位）
+      // 之前写成字符串 ''，等于把“排到队尾”重置掉。
+      sink: !!g.sink,
+      noSink: !!g.noSink,
+      firstToken: g.firstToken || 0, patience: g.patience || 0,
+      rules: g.rules || [], effort: g.effort || '', classifier: g.classifier || '',
+      intentSure: g.intentSure ?? null, context: g.context || 0, levels: g.levels || [],
+      family: g.family || '', fast: g.fast || [], off: g.off || [], weights: g.weights || {},
+      effortMaps: g.effortMaps || {}, accounts: g.accounts || [], keys: g.keys || [],
+      unlists: !!g.unlists,
+    };
+    await this.panel._api('groups/save', body);
+    const next = await this.panel._api('groups');
+    const all = Array.isArray(next) ? next : Array.isArray(next?.groups) ? next.groups : [];
+    const saved = all.find((x) => x && x.id === g.id) || g;
+    return {
+      id: g.id,
+      members: saved.members || members,
+      auto: !!saved.auto,
+      // 让界面如实说明这次调整的实际效力
+      routing: typeof saved.routing === 'string' ? saved.routing : '',
+      strictOrder: saved.routing === 'order',
+    };
+  }
+}
+
+// 原生插件面板只访问已配置的本机内核，不暴露通用 HTTP 代理。
+class PluginPanel {
+  constructor({ getConfig, timeoutMs = 15000, maxBytes = 4 * 1024 * 1024 }) {
+    this.getConfig = getConfig;
+    this.timeoutMs = timeoutMs;
+    this.maxBytes = maxBytes;
+    this.session = null;
+    this.signins = new Map();
+  }
+
+  _target() {
+    const cfg = this.getConfig();
+    if (!cfg?.adminPanel) throw new Error('未配置 magpie 控制台地址');
+    let url;
+    try { url = new URL(cfg.adminPanel); } catch { throw new Error('magpie 控制台地址无效'); }
+    if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
+      || url.username || url.password) throw new Error('插件管理仅允许访问本机 magpie 控制台');
+    const key = cfg.run?.env?.MAGPIE_WEB_KEY || url.searchParams.get('k') || '';
+    return { origin: url.origin, key };
+  }
+
+  _http(url, { cookie, body, signal } = {}) {
+    return new Promise((resolve, reject) => {
+      const payload = body === undefined ? undefined : JSON.stringify(body);
+      let size = 0;
+      const req = require('http').request(url, {
+        method: payload === undefined ? 'GET' : 'POST', agent: false,
+        headers: { ...(cookie ? { Cookie: cookie } : {}),
+          ...(payload === undefined ? {} : { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }) },
+        signal,
+      }, (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => {
+          size += chunk.length;
+          if (size > this.maxBytes) { res.destroy(); reject(new Error('内核管理响应过大')); }
+          else chunks.push(chunk);
+        });
+        res.on('error', () => reject(new Error('内核管理响应中断')));
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, text: Buffer.concat(chunks).toString('utf8') }));
+      });
+      req.on('error', (e) => reject(new Error(e.name === 'AbortError' ? '内核管理请求超时' : '无法连接本机 magpie 控制台')));
+      req.end(payload);
+    });
+  }
+
+  async _api(endpoint, body) {
+    const target = this._target();
+    const signal = AbortSignal.timeout(this.timeoutMs);
+    if (!this.session || this.session.origin !== target.origin || this.session.key !== target.key) {
+      const url = new URL('/', target.origin);
+      if (target.key) url.searchParams.set('k', target.key);
+      const r = await this._http(url, { signal });
+      if (r.status === 401 || r.status === 403) throw new Error('magpie 控制台鉴权失败，请检查其访问密钥配置');
+      if (r.status >= 300 && r.status < 400) {
+        const next = new URL(r.headers.location || '/', target.origin);
+        if (next.origin !== target.origin) throw new Error('拒绝 magpie 控制台跨站跳转');
+      } else if (r.status !== 200) throw new Error(`magpie 控制台不可用（HTTP ${r.status}）`);
+      const cookie = (r.headers['set-cookie'] || []).map((c) => c.split(';')[0]).join('; ');
+      this.session = { ...target, cookie };
+    }
+    const r = await this._http(new URL('/api/' + endpoint, target.origin), { body, cookie: this.session.cookie, signal });
+    if (r.status === 401 || r.status === 403) {
+      this.session = null;
+      throw new Error('magpie 控制台会话已失效，请重试');
+    }
+    // 不自动重试写操作；错误正文可能含 OAuth token，因此不直接转发。
+    if (r.status < 200 || r.status >= 300) throw new Error(`内核未能完成该操作（HTTP ${r.status}）`);
+    let data;
+    // 204 / 空 body 是合法的“已完成，无返回”，不是不兼容数据
+    if (!r.text || !r.text.trim()) return {};
+    try { data = JSON.parse(r.text); } catch { throw new Error('内核管理接口返回了不兼容的数据'); }
+    if (data?.error) throw new Error('内核拒绝该操作，请检查登录状态或配置');
+    return data;
+  }
+
+  async _context(pkg, pid) {
+    if (typeof pkg !== 'string' || pkg.length > 250 || typeof pid !== 'string' || !PROVIDER_ID_RE.test(pid)) {
+      throw new Error('插件或 provider 标识无效');
+    }
+    const state = await this._api('providers');
+    const installed = await this._api('plugins');
+    if (!Array.isArray(state?.plugins) || !Array.isArray(state.providers) || !Array.isArray(installed?.plugins)) {
+      throw new Error('当前内核不支持插件管理接口');
+    }
+    const packageOf = (spec) => String(spec || '').replace(/@[^/@]+$/, '');
+    const descriptors = state.plugins.filter((p) => packageOf(p.spec) === packageOf(pkg));
+    const plugin = descriptors.find((p) => p.pid === pid || p.id === pid);
+    const entry = installed.plugins.find((p) => packageOf(p.spec) === packageOf(pkg));
+    if (!plugin || !entry) throw new Error('该 provider 不属于所选的已安装插件');
+    const row = state.providers.find((p) => p.id === plugin.id);
+    return { plugin, descriptors, row, version: typeof entry.version === 'string' ? entry.version : '' };
+  }
+
+  _detail({ plugin, descriptors, row, version }) {
+    const text = (v) => typeof v === 'string' ? v : '';
+    const localized = (v) => this._labels(v);
+    const methods = (plugin.methods || []).map((m, index) => ({ index, type: text(m.type),
+      label: text(m.label), labels: localized(m.labels), placeholder: text(m.placeholder), keyless: !!m.keyless, keyAsked: !!m.keyAsked }));
+    const catalog = Array.isArray(row?.models) ? row.models : Array.isArray(plugin.models) ? plugin.models : [];
+    const models = catalog.filter((m) => m && typeof m.id === 'string').map((m) => ({
+      id: m.id, name: text(m.name), on: !!m.on, context: typeof m.context === 'number' ? m.context : null,
+      output: typeof m.output === 'number' ? m.output : null, images: !!m.images,
+    }));
+    const chosen = row?.noModels ? [] : Array.isArray(row?.chosen) ? row.chosen : models.filter((m) => m.on).map((m) => m.id);
+    return {
+      provider: plugin.pid || plugin.id, name: text(plugin.name), spec: text(plugin.spec), version,
+      providers: descriptors.map((p) => ({ id: p.pid || p.id, name: text(p.name) })),
+      signedIn: !!plugin.signedIn, ready: !!row?.ready, off: !!row?.off,
+      methods, models, chosen,
+      accounts: (row?.account?.logins || []).map((a) => ({ user: text(a.user), plan: text(a.plan),
+        active: !!a.active, on: a.on === undefined ? !!a.active : !!a.on, paused: !!a.paused })),
+      options: (plugin.options || []).filter((o) => typeof o.key === 'string').map((o) => ({
+        key: o.key, label: text(o.label), labels: localized(o.labels), description: text(o.description),
+        descriptions: localized(o.descriptions), on: !!o.on,
+      })),
+    };
+  }
+
+  async detail(pkg, pid) {
+    const ctx = await this._context(pkg, pid);
+    const detail = this._detail(ctx);
+    // 签到不支持时不该让整页失败：内核较早版本没有 quotas 接口。
+    detail.checkin = await this._checkin(detail.provider, ctx.row).catch(() => ({ supported: false, accounts: [] }));
+    detail.quota = await this._quota(detail.provider).catch(() => ({ available: false, windows: [] }));
+    return detail;
+  }
+
+  /**
+   * 额度：内核 /api/usage/quotas 每行可能带 windows（额度窗口）。
+   *
+   * 字段语义以内核自身实现为准（magpie 内嵌 app.js）：
+   *   `to100(w.used)`            → used 是已用百分比
+   *   `quotaCount` 的
+   *   `w.amount / w.limit`       → amount/limit 是计数
+   * 只取当前 provider 的行；没有 amount+limit 的窗口不编造计数，
+   * 仅透传上游的 display 文案。
+   */
+  async _quota(provider) {
+    const quotas = await this._api('usage/quotas');
+    if (!Array.isArray(quotas)) return { available: false, windows: [] };
+    const row = quotas.find((q) => q && q.provider === provider);
+    if (!row) return { available: false, windows: [] };
+    const windows = (Array.isArray(row.windows) ? row.windows : []).filter((w) => w && typeof w.name === 'string').map((w) => {
+      // 内核语义（app.js `to100(w.used)`、`quotaCount` 用 `w.amount / w.limit`）：
+      //   used  = **已用百分比**（0–100）
+      //   amount= 已用计数，limit = 总量
+      // 把 used 当计数去算 used/limit 会得出完全错误的比例。
+      const pctRaw = typeof w.used === 'number' && Number.isFinite(w.used) ? w.used : null;
+      const pct = pctRaw !== null ? Math.max(0, Math.min(100, Math.round(pctRaw))) : null;
+      const amount = typeof w.amount === 'number' && Number.isFinite(w.amount) ? w.amount : null;
+      const limit = typeof w.limit === 'number' && Number.isFinite(w.limit) ? w.limit : null;
+      return {
+        name: w.name,
+        used: pctRaw,
+        // 计数用 amount；上游没给 amount 时保留 null，由界面回退到 display
+        amount,
+        limit,
+        // 上游有时只给一句人话（"0 credits left"），原样透传，不当成数值
+        display: typeof w.display === 'string' ? w.display : '',
+        unit: typeof w.unit === 'string' ? w.unit : '',
+        percent: pct,
+        // 有 limit 才能画进度条；没有就只显示文字
+        resetsAt: typeof w.resetsAt === 'string' ? w.resetsAt : '',
+      };
+    });
+    return {
+      available: windows.length > 0,
+      plan: typeof row.plan === 'string' ? row.plan : '',
+      user: typeof row.user === 'string' ? row.user : '',
+      readAt: typeof row.readAt === 'string' ? row.readAt : '',
+      // 上游错误可能夹带 token/UUID/URL 片段：脱敏后再给前端
+      error: typeof row.error === 'string' ? this._redact(row.error) : '',
+      windows,
+    };
+  }
+
+  /**
+   * 签到状态：内核把每个账号的签到结果放在 /api/usage/quotas 的行里
+   * （checkinBy / checkinKey / checkin{day,outcome,msg}）。
+   * 只返回当前插件 provider 对应的账号，不暴露其它 provider 的用量数据。
+   */
+  async _checkin(provider, row) {
+    const quotas = await this._api('usage/quotas');
+    if (!Array.isArray(quotas)) return { supported: false, accounts: [] };
+    const prefix = 'plugin:' + provider;
+    const mine = quotas.filter((q) => q && (q.checkinBy === prefix || q.provider === provider));
+    // 必须同时有 checkinBy 与 checkinKey 才能签：只凭 checkins=true 就收，
+    // 会造出 key='' 的条目，点下去等于把空 key 下发内核。
+    const accounts = mine.filter((q) => q.checkinBy === prefix && typeof q.checkinKey === 'string' && q.checkinKey).map((q) => {
+      const c = q.checkin || null;
+      return {
+        user: typeof q.user === 'string' ? q.user : '',
+        key: q.checkinKey,
+        by: q.checkinBy,
+        day: c && typeof c.day === 'string' ? c.day : '',
+        outcome: c && typeof c.outcome === 'string' ? c.outcome : '',
+        message: c && typeof c.msg === 'string' ? this._redact(c.msg) : '',
+        // 内核的 credit 可能是数字（奖励点数），不能只收 string
+        credit: c && (typeof c.credit === 'string' || typeof c.credit === 'number') ? String(c.credit) : '',
+        streak: c && typeof c.streak === 'number' ? c.streak : 0,
+        // again：上游称今天已签，但内核还要再确认 → 不算完成
+        again: !!(c && c.again),
+      };
+    });
+    return {
+      supported: accounts.length > 0 || mine.some((q) => q.checkins === true),
+      accounts,
+      // 只有真正登录了才可签到；未登录时按钮应禁用
+      canCheck: !!row && accounts.length > 0,
+    };
+  }
+
+
+  _signinState(data) {
+    const result = {};
+    for (const key of ['id', 'state', 'code', 'opened', 'linkOnly']) {
+      if (['string', 'boolean'].includes(typeof data?.[key])) result[key] = data[key];
+    }
+    if (typeof data?.url === 'string') {
+      try {
+        const url = new URL(data.url);
+        if (['https:', 'http:'].includes(url.protocol) && !url.username && !url.password) result.url = url.href;
+      } catch { /* 非 URL 不作为链接展示 */ }
+    }
+    if (['failed', 'error'].includes(result.state)) result.message = '登录未完成，请重新尝试或选择其它登录方式';
+    return result;
+  }
+
+  /**
+   * 上游错误文本的脱敏：截断 + 抹掉长串凭据样式的 token/URL 查询参数。
+   * 上游的错误体可能包含 Authorization 回显、refresh token 或带密钥的 URL，
+   * 直接透传到前端等于把凭据交给渲染进程与 DevTools。
+   */
+  _redact(text) {
+    return String(text || '')
+      // 长的不透明串（token / key / JWT / base64）
+      .replace(/\b[A-Za-z0-9_-]{24,}\b/g, '[已隐藏]')
+      // URL 查询参数里的值
+      .replace(/([?&](?:k|key|token|access_token|refresh_token|api_key)=)[^&\s]+/gi, '$1[已隐藏]')
+      .slice(0, 200);
+  }
+
+  _labels(value) {
+    return value && typeof value === 'object' ? Object.fromEntries(Object.entries(value)
+      .filter(([key, text]) => /^[a-z-]{2,12}$/i.test(key) && typeof text === 'string')) : {};
+  }
+
+  _prompt(data) {
+    const inputs = data?.inputs && typeof data.inputs === 'object' && !Array.isArray(data.inputs) ? data.inputs : undefined;
+    if (!data?.prompt) return { inputs: inputs || {} };
+    const p = data.prompt;
+    return { inputs, prompt: { key: p.key, type: p.type, label: p.label, message: p.message, messages: this._labels(p.messages),
+      placeholder: p.placeholder, secret: !!p.secret || p.type === 'password', options: Array.isArray(p.options)
+        ? p.options.map((o) => ({ value: o.value, label: o.label, labels: this._labels(o.labels) })) : undefined } };
+  }
+
+  async action(pkg, pid, action, body = {}) {
+    // 登录轮询只访问已校验归属的会话，不反复拉取整个 provider/插件清单。
+    if (action === 'signin-status' || action === 'signin-cancel') {
+      const session = this.signins.get(body.id);
+      if (!session || session.pkg !== pkg || session.pid !== pid || session.origin !== this._target().origin
+        || Date.now() - session.at > 30 * 60 * 1000) throw new Error('登录会话不属于该插件或已过期');
+      const endpoint = 'signin/' + encodeURIComponent(body.id) + (action === 'signin-cancel' ? '/cancel' : '');
+      const result = this._signinState(await this._api(endpoint, action === 'signin-cancel' ? {} : undefined));
+      if (action === 'signin-cancel') this.signins.delete(body.id);
+      return result;
+    }
+    const ctx = await this._context(pkg, pid);
+    const { plugin, row } = ctx;
+    const provider = plugin.pid || plugin.id;
+    const id = plugin.id;
+    if (action === 'signin-prompt' || action === 'signin-start') {
+      if (!Number.isInteger(body.method) || !plugin.methods?.[body.method]) throw new Error('登录方式无效');
+      if (!body.inputs || typeof body.inputs !== 'object' || Array.isArray(body.inputs)
+        || JSON.stringify(body.inputs).length > 16384) throw new Error('登录输入无效');
+      if (body.user !== undefined && !row?.account?.logins?.some((a) => a.user === body.user)) throw new Error('账号不属于该插件');
+      const payload = { provider, method: body.method, inputs: body.inputs };
+      if (action === 'signin-prompt') {
+        if (body.key !== undefined) {
+          if (typeof body.key !== 'string' || typeof body.value !== 'string' || body.value.length > 8192) throw new Error('登录回答无效');
+          Object.assign(payload, { key: body.key, value: body.value });
+        }
+        return this._prompt(await this._api('plugin-signin/prompt', payload));
+      }
+      if (body.key !== undefined) {
+        if (typeof body.key !== 'string' || body.key.length > 16384) throw new Error('登录密钥无效');
+        payload.key = body.key;
+      }
+      if (body.user) payload.user = body.user;
+      const result = this._signinState(await this._api('plugin-signin', payload));
+      if (result.id) {
+        for (const [key, value] of this.signins) if (Date.now() - value.at > 30 * 60 * 1000) this.signins.delete(key);
+        this.signins.set(result.id, { pkg, pid, origin: this._target().origin, at: Date.now() });
+      }
+      return result;
+    }
+    if (['account-on', 'account-off', 'account-remove'].includes(action)) {
+      const account = row?.account?.logins?.find((a) => a.user === body.user);
+      if (!account || !row.account.agent) throw new Error('账号不属于该插件');
+      const op = { 'account-on': 'on', 'account-off': 'off', 'account-remove': 'forget' }[action];
+      await this._api('login/' + op, { agent: row.account.agent, user: account.user });
+    } else if (action === 'models-refresh') {
+      if (!row) throw new Error('请先登录该插件');
+      await this._api('provider/models', { id });
+    } else if (action === 'models-save') {
+      if (!row || !Array.isArray(body.models) || body.models.length > 2000
+        || !body.models.every((m) => typeof m === 'string' && row.models?.some((x) => x.id === m))) throw new Error('模型选择无效');
+      // 订阅 provider 的 Save 同时接收高级字段：从最新状态保留它们，不能用前端默认值覆盖。
+      const payload = { id };
+      // modelPrefs（每个模型的偏好）与 searches（搜索开关）是内核编辑器每次
+    // 都会带上的字段：漏掉它们，保存一次模型选择就会把用户这些设置清空。
+    for (const key of ['bestInFamily', 'unlisted', 'hiddenDrawers', 'hiddenVideomakers', 'fallback', 'contexts',
+        'outputs', 'compacts', 'proxy', 'accountProxies', 'maxConcurrency', 'maxAccounts', 'queueLimit', 'queueWait',
+        'maxRPM', 'priceRate', 'rateWindows', 'pinUpstream', 'unredacted', 'countFree', 'billing', 'nativeCompaction',
+        'routing', 'affinity', 'sink', 'modelPrefs', 'searches']) {
+        if (Object.hasOwn(row, key)) payload[key] = row[key];
+      }
+      payload.models = [...new Set(body.models)];
+      payload.noModels = payload.models.length === 0;
+      await this._api('provider/save', payload);
+    } else if (action === 'provider-toggle') {
+      // 启用/禁用某个 provider：禁用后它不参与路由，账号与配置保留。
+      if (typeof body.on !== 'boolean') throw new Error('开关状态无效');
+      await this._api('provider/' + (body.on ? 'on' : 'off'), { id });
+    } else if (action === 'option-save') {
+      if (typeof body.key !== 'string' || typeof body.on !== 'boolean'
+        || !plugin.options?.some((o) => o.key === body.key)) throw new Error('插件选项无效');
+      await this._api('settings/plugin-option', { provider, key: body.key, on: body.on });
+    } else if (action === 'checkin') {
+      // 签到按账号执行：key 必须是该 provider 的账号，不接受任意串。
+      const state = await this._checkin(provider, row);
+      if (!state.supported) throw new Error('该插件没有提供签到功能');
+      if (typeof body.key !== 'string' || !state.accounts.some((a) => a.key === body.key)) {
+        throw new Error('签到账号不属于该插件');
+      }
+      const account = state.accounts.find((a) => a.key === body.key);
+      await this._api('usage/checkin-account', { by: account.by, key: account.key });
+      return this.detail(pkg, pid);
+    } else {
+      throw new Error('不支持的插件管理操作');
+    }
+    return this.detail(pkg, pid);
+  }
+}
+
 module.exports = {
+  PluginPanel,
+  RoutingGroups,
   magpieConfigDir,
   listProviders,
   listGroups,
@@ -799,5 +1446,7 @@ module.exports = {
   isUpdating,
   updateState,
   runUpdate,
+  installMagpie,
+  installProgress,
   MAGPIE_RELEASES_REPO,
 };

@@ -16,9 +16,25 @@ const { findMagpieBinary } = require('./platform-manager');
 
 const MAX_BODY = 1024 * 1024;
 
+/**
+ * 来源判定。
+ *
+ * 写操作（POST/PUT）额外要求「不可被跨站伪造」的来源：
+ *  - Origin 缺失：非浏览器客户端（curl / 桌面主进程 fetch）→ 放行。
+ *  - Origin=null：**不**能无条件放行。它同时来自两种完全不同的东西：
+ *      1) 壳回退到 file:// 加载的 UI（可信，同为用户本机自己的页面）
+ *      2) 任意网页里的 sandbox iframe 或 no-referrer 表单提交（不可信）
+ *    浏览器在跨站写请求里会带 Origin，所以这里再要求自定义头
+ *    `X-Wanneng-Client`：跨站简单请求无法设置它（会触发预检且被 CORS 拒绝），
+ *    而壳自己的 UI 会带（见 api/client.js）。这样既保住 file:// 回退，
+ *    又堵住 CSRF 杀进程。
+ *  - 127.0.0.1/localhost：放行（本机页面）。
+ */
+const CLIENT_HEADER = 'x-wanneng-client';
+
 function isAllowedOrigin(origin) {
-  if (!origin) return true; // curl / 同源
-  if (origin === 'null') return true; // file:// 页面 fetch 的 Origin 是 "null"
+  if (!origin) return true; // curl / 同源 / 桌面主进程
+  if (origin === 'null') return true; // 具体写操作再由 _isTrustedWrite 二次校验
   try {
     const u = new URL(origin);
     return u.hostname === '127.0.0.1' || u.hostname === 'localhost';
@@ -27,11 +43,17 @@ function isAllowedOrigin(origin) {
   }
 }
 
+/** 写操作来源校验：Origin=null 时必须带壳自己的自定义头 */
+function isTrustedWrite(origin, headers) {
+  if (origin !== 'null') return true;
+  return String((headers && headers[CLIENT_HEADER]) || '') === 'wanneng2api';
+}
+
 function corsHeaders(origin) {
   return {
     'Access-Control-Allow-Origin': origin || '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Wanneng-Client',
     'Access-Control-Max-Age': '86400',
   };
 }
@@ -60,6 +82,16 @@ class ApiServer {
     this.deps = deps;
     this.opts = opts;
     this.server = null;
+    this.pluginPanel = deps.pluginPanel || new (require('./magpie-adapter').PluginPanel)({
+      getConfig: () => deps.store.getPlatform('magpie-web'),
+    });
+    this.routingGroups = deps.routingGroups || new (require('./magpie-adapter').RoutingGroups)({
+      getConfig: () => deps.store.getPlatform('magpie-web'),
+    });
+    // 自研网关原生管理：凭据由适配器自己从各网关工作目录读取，API 层不接触密钥
+    this.gatewayPanel = deps.gatewayPanel || new (require('./gateway-panel').GatewayPanel)({
+      getPlatform: (id) => deps.store.getPlatform(id),
+    });
   }
 
   listen(listenAddr = '127.0.0.1:17800') {
@@ -138,6 +170,10 @@ class ApiServer {
       res.writeHead(204, corsHeaders(origin));
       return res.end();
     }
+    // 写操作的二次来源校验：挡住「任意网页 → Origin=null → 杀进程」的 CSRF
+    if ((req.method === 'POST' || req.method === 'PUT') && !isTrustedWrite(origin, req.headers)) {
+      return json(res, 403, { error: 'origin not allowed for write' }, null);
+    }
 
     const u = new URL(req.url, `http://127.0.0.1`);
     const parts = u.pathname.split('/').filter(Boolean); // ['api', ...]
@@ -208,6 +244,47 @@ class ApiServer {
     // GET /api/platforms
     if (method === 'GET' && parts[1] === 'platforms' && parts.length === 2) {
       return { platforms: manager.statusList() };
+    }
+
+    // 原生插件面板：动作由适配器限定，不允许调用方指定内核 URL。
+    if (parts[1] === 'magpie' && parts[2] === 'plugin-panel' && parts.length === 3) {
+      const pkg = method === 'GET' ? u.searchParams.get('package') : body.package;
+      const provider = method === 'GET' ? u.searchParams.get('provider') : body.provider;
+      if (method === 'GET') return this.pluginPanel.detail(pkg, provider);
+      if (method === 'POST') return this.pluginPanel.action(pkg, provider, body.action, body);
+    }
+
+    // 自研网关原生管理面板（WorkBuddy / CodeArts / Loomy / Lingxi）。
+    // 适配器负责目标限定、动作白名单与凭据；这里只做参数转交。
+    //   GET  /api/platforms/:id/panel            → 统一只读视图
+    //   GET  /api/platforms/:id/panel/logs       → 最近日志
+    //   POST /api/platforms/:id/panel            → 受限动作 { action, ... }
+    if (parts[1] === 'platforms' && parts[3] === 'panel' && parts.length <= 5) {
+      const id = decodeURIComponent(parts[2]);
+      if (method === 'GET' && parts[4] === 'logs') {
+        return this.gatewayPanel.logs(id, { lines: u.searchParams.get('lines') });
+      }
+      if (method === 'GET' && parts.length === 4) return this.gatewayPanel.detail(id);
+      if (method === 'POST' && parts.length === 4) {
+        if (typeof body.action !== 'string') throw new Error('缺少管理动作');
+        return this.gatewayPanel.action(id, body.action, body);
+      }
+    }
+
+    // 路由组：同一模型被多个平台提供时的顺序（只重排、不增删成员）
+    if (parts[1] === 'magpie' && parts[2] === 'routing-groups') {
+      const groups = this.routingGroups;
+      if (method === 'GET') return { groups: await groups.shared(), bindable: await groups.bindable() };
+      if (method === 'POST') {
+        // action=bind 新建/更新一个只含所选平台的顺序组；否则按 id 重排
+        if (body.action === 'bind') {
+          const saved = await groups.bind({ id: body.id, name: body.name, providers: body.providers });
+          return { saved, groups: await groups.shared() };
+        }
+        if (typeof body.id !== 'string') throw new Error('缺少路由组标识');
+        await groups.reorder(body.id, body.members);
+        return { groups: await groups.shared() };
+      }
     }
 
     // GET /api/magpie/providers —— magpie 内核实管的 provider 清单。
@@ -324,6 +401,33 @@ class ApiServer {
       });
     }
 
+    // POST /api/magpie/install —— 未安装时一键下载 magpie 到数据目录
+    if (method === 'POST' && parts[1] === 'magpie' && parts[2] === 'install') {
+      const magpie = require('./magpie-adapter');
+      if (magpie.installProgress() && magpie.installProgress().status === 'downloading') {
+        return { ok: false, message: '已有安装任务在进行中' };
+      }
+      const dataDir = this.deps.store && this.deps.store.dataDir;
+      if (!dataDir) throw new Error('未知数据目录');
+      // 后台跑，前端轮询 /api/magpie/install 拿进度
+      magpie.installMagpie(dataDir).catch(() => {});
+      return { started: true, target: path.join(dataDir, 'magpie') };
+    }
+
+    // GET /api/magpie/install —— 安装进度
+    if (method === 'GET' && parts[1] === 'magpie' && parts[2] === 'install') {
+      const magpie = require('./magpie-adapter');
+      const bin = this._magpieBinary();
+      const prog = magpie.installProgress();
+      return {
+        installed: !!bin,
+        binary: bin,
+        progress: prog,
+        target: this.deps.store && this.deps.store.dataDir
+          ? path.join(this.deps.store.dataDir, 'magpie') : null,
+      };
+    }
+
     // GET /api/magpie/presets —— magpie 支持的完整 provider 目录（含未安装的）
     if (method === 'GET' && parts[1] === 'magpie' && parts[2] === 'presets') {
       const magpie = require('./magpie-adapter');
@@ -410,9 +514,9 @@ class ApiServer {
       const [action] = rest;
 
       if (method === 'POST') {
-        if (action === 'start') return manager.start(id);
+        if (action === 'start') return manager.start(id, { force: !!(body && body.force) });
         if (action === 'stop') return manager.stop(id);
-        if (action === 'restart') return manager.restart(id);
+        if (action === 'restart') return manager.restart(id, { force: !!(body && body.force) });
         if (action === 'enable') return manager.enable(id);
         if (action === 'disable') return manager.disable(id);
         if (action === 'open-panel') {
@@ -547,10 +651,13 @@ class ApiServer {
         type: p.type,
         mode: p.mode,
         workDir: p.workDir,
-        run: p.run,
+        // run.env 里可能有 MAGPIE_WEB_KEY 这类会话密钥：只回传键名，
+        // 值一律不回显（前端也不需要它们来启停平台）。
+        run: p.run ? { ...p.run, env: Object.fromEntries(Object.keys(p.run.env || {}).map((k) => [k, ''])) } : p.run,
         port: p.port,
         health: p.health,
-        adminPanel: p.adminPanel,
+        // adminPanel 可能带 ?k=<密钥>，去掉查询串再给前端
+        adminPanel: typeof p.adminPanel === 'string' ? p.adminPanel.split('?')[0] : p.adminPanel,
         updater: p.updater ? { ...p.updater, githubToken: undefined } : null,
         restart: p.restart,
         requires: p.requires,

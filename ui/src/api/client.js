@@ -2,7 +2,10 @@
 // 基址 http://127.0.0.1:17800（壳子主进程内嵌，仅 127.0.0.1）
 import { mockApi, mockLogStream } from './mock'
 
-const MODE = (import.meta.env.VITE_API_MODE || 'mock').toLowerCase()
+// 生产构建（npm run build）默认连真实壳；开发服务器默认 mock。
+// 之前构建产物落到 mock，打包后打开就是假数据，和桌面版应有的行为相反。
+const MODE = (import.meta.env.VITE_API_MODE
+  || (import.meta.env.PROD ? 'live' : 'mock')).toLowerCase()
 const BASE = (import.meta.env.VITE_API_BASE || 'http://127.0.0.1:17800').replace(/\/$/, '')
 const TIMEOUT_MS = 8000
 
@@ -19,7 +22,13 @@ async function request(path, { method = 'GET', body, timeout = TIMEOUT_MS } = {}
   try {
     const res = await fetch(BASE + path, {
       method,
-      headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+      // X-Wanneng-Client：壳用 file:// 回退加载 UI 时 Origin 是 null，
+// 与「任意网页的 sandbox iframe」无法区分。带这个自定义头证明是本台 UI
+// （跨站写请求无法设置它，会先触发预检并被拒绝）。
+      headers: {
+        'X-Wanneng-Client': 'wanneng2api',
+        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      },
       body: body !== undefined ? JSON.stringify(body) : undefined,
       signal: ctrl.signal
     })
@@ -99,12 +108,24 @@ export const api = {
     return d && typeof d === 'object' ? adaptPlatform(d) : d
   },
 
-  platformAction: (id, action) => request(`/api/platforms/${encodeURIComponent(id)}/${action}`, { method: 'POST' }),
+  platformAction: (id, action, opts) => request(
+    `/api/platforms/${encodeURIComponent(id)}/${action}`,
+    { method: 'POST', body: opts || undefined, timeout: 180000 },
+  ),
   getLogs: (id, tail = 200) => request(`/api/platforms/${encodeURIComponent(id)}/logs?tail=${tail}`),
 
   checkUpdate: (id) => request(`/api/platforms/${encodeURIComponent(id)}/update/check`, { method: 'POST' }),
   applyUpdate: (id, checkInfo) => request(`/api/platforms/${encodeURIComponent(id)}/update/apply`, { method: 'POST', body: checkInfo ? { checkInfo } : undefined }),
   openPanel: (id, query) => request(`/api/platforms/${encodeURIComponent(id)}/open-panel`, { method: 'POST', body: query ? { query } : undefined }),
+
+  // 自研网关原生管理：统一视图 / 日志 / 受限动作。
+  // 凭据（CodeArts admin_key、Lingxi/Loomy api_key）全部留在壳后台，
+  // 这里拿到的只有脱敏后的账号与统计。
+  gatewayPanel: (id) => request(`/api/platforms/${encodeURIComponent(id)}/panel`, { timeout: 30000 }),
+  gatewayLogs: (id, lines = 200) => request(`/api/platforms/${encodeURIComponent(id)}/panel/logs?lines=${lines}`, { timeout: 30000 }),
+  gatewayPanelAction: (id, action, body = {}) => request(`/api/platforms/${encodeURIComponent(id)}/panel`, {
+    method: 'POST', body: { ...body, action }, timeout: 120000,
+  }),
 
   updatesSummary: async () => {
     const d = await request('/api/updates/summary')
@@ -143,10 +164,26 @@ export const api = {
   magpieVersion: () => request('/api/magpie/version'),
   // 直接执行 magpie update（下载并替换内核）
   magpieUpdate: () => request('/api/magpie/update', { method: 'POST', timeout: 30000 }),
+  // 未安装时一键下载 magpie
+  magpieInstall: () => request('/api/magpie/install', { method: 'POST', timeout: 30000 }),
+  magpieInstallStatus: () => request('/api/magpie/install'),
   // magpie 支持的完整 provider 目录（含未安装）
   magpiePresets: (refresh) => request(`/api/magpie/presets${refresh ? '?refresh=1' : ''}`, { timeout: 30000 }),
   // 社区插件市场（Trae / Qoder / WorkBuddy / Loomy / CodeArts …）
   magpiePlugins: (refresh) => request(`/api/magpie/plugins${refresh ? '?refresh=1' : ''}`, { timeout: 30000 }),
+  // 同模型跨平台路由组：读取共享组与调整成员顺序
+  routingGroups: () => request('/api/magpie/routing-groups', { timeout: 30000 }),
+  reorderRoutingGroup: (id, members) => request('/api/magpie/routing-groups', {
+    method: 'POST', body: { id, members }, timeout: 40000,
+  }),
+  // Hub 绑定：用勾选的平台新建一个顺序路由组
+  bindRoutingGroup: ({ id, name, providers }) => request('/api/magpie/routing-groups', {
+    method: 'POST', body: { action: 'bind', id, name, providers }, timeout: 60000,
+  }),
+  magpiePluginPanel: (pkg, provider) => request(`/api/magpie/plugin-panel?${new URLSearchParams({ package: pkg, provider })}`, { timeout: 40000 }),
+  magpiePluginAction: (pkg, provider, action, body = {}) => request('/api/magpie/plugin-panel', {
+    method: 'POST', body: { ...body, package: pkg, provider, action }, timeout: 60000,
+  }),
   magpieAddPlugin: (pkg) => request('/api/magpie/plugins/add', { method: 'POST', body: { package: pkg }, timeout: 300000 }),
   magpieRemovePlugin: (pkg) => request('/api/magpie/plugins/remove', { method: 'POST', body: { package: pkg }, timeout: 60000 }),
   // 插件登录（OAuth 设备码）：探方式 → 启动 → 轮询状态

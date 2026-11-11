@@ -20,7 +20,7 @@ const os = require('os');
 const http = require('http');
 const net = require('net');
 
-const { ConfigStore } = require('../src/config');
+const { ConfigStore, defaultPlatforms } = require('../src/config');
 const { PlatformManager } = require('../src/platform-manager');
 const { checkPortFree } = require('../src/platform-manager');
 
@@ -66,7 +66,213 @@ function makeConfig(dir, platforms) {
   };
 }
 
+function testImportedCodeArtsCommand() {
+  const cfg = defaultPlatforms().platforms.find((p) => p.id === 'codearts');
+  // 结构性断言：不能硬编码盘符，换机器/CI 也要成立
+  ok('CodeArts 默认工作目录以 bin 结尾', /[/\\]bin$/.test(cfg.workDir), `cwd=${cfg.workDir}`);
+  ok('CodeArts 默认使用 bin 内的可执行文件', cfg.run.binary === 'codearts2api-panel.exe');
+
+  // 老用户升级迁移：错误旧值被修正，自定义值不被覆盖
+  const { ConfigStore } = require('../src/config');
+  const migDir = fs.mkdtempSync(path.join(os.tmpdir(), 'w2a-migrate-'));
+  try {
+    fs.writeFileSync(path.join(migDir, 'platforms.json'), JSON.stringify({ version: 1, platforms: [
+      { id: 'workbuddy', name: 'WB', workDir: 'D:/软件/workbuddy2api', run: { binary: 'server.exe', args: [] }, port: 7863 },
+      { id: 'codearts', name: 'CA', workDir: 'D:/app/codearts2api-panel', run: { binary: 'bin/codearts2api-panel.exe', args: [] }, port: 7866 },
+    ] }));
+    fs.writeFileSync(path.join(migDir, 'manager.json'), '{}');
+    const migrated = new ConfigStore(migDir);
+    ok('老配置升级：WorkBuddy 改为 wb2api.exe', migrated.getPlatform('workbuddy').run.binary === 'wb2api.exe');
+    ok('老配置升级：CodeArts 改到 bin 并显式 --config',
+      /[/\\]bin$/.test(migrated.getPlatform('codearts').workDir)
+      && (migrated.getPlatform('codearts').run.args || []).includes('--config'));
+  } finally {
+    fs.rmSync(migDir, { recursive: true, force: true });
+  }
+
+  const keepDir = fs.mkdtempSync(path.join(os.tmpdir(), 'w2a-migrate-keep-'));
+  try {
+    fs.writeFileSync(path.join(keepDir, 'platforms.json'), JSON.stringify({ version: 1, platforms: [
+      { id: 'workbuddy', name: 'WB', workDir: 'E:/custom/wb', run: { binary: 'my-build.exe', args: [] }, port: 7863 },
+    ] }));
+    fs.writeFileSync(path.join(keepDir, 'manager.json'), '{}');
+    const kept = new ConfigStore(keepDir);
+    ok('老配置升级：用户自定义 binary 不被覆盖', kept.getPlatform('workbuddy').run.binary === 'my-build.exe');
+  } finally {
+    fs.rmSync(keepDir, { recursive: true, force: true });
+  }
+
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'w2a-codearts-config-'));
+  try {
+    fs.writeFileSync(path.join(fixture, 'codearts2api-panel.exe'), '');
+    const rt = { cfg: { ...cfg, workDir: fixture } };
+    const context = { store: { platformWorkDir: (p) => path.resolve(p.workDir) } };
+    const cmd = PlatformManager.prototype._resolveCommand.call(context, rt);
+    ok('CodeArts 命令定位到所选数据目录', cmd.cwd === fixture
+      && cmd.command === path.join(fixture, 'codearts2api-panel.exe'));
+    ok('CodeArts 显式指定所选目录的 config.json', cmd.args.length === 2 && cmd.args[0] === '--config'
+      && path.resolve(cmd.cwd, cmd.args[1]) === path.join(fixture, 'config.json'));
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
+/** 更新源与版本解析：纯函数，不联网 */
+function testUpdaterVersionParsing() {
+  const { versionFromAsset, isNewerVersion } = require('../src/updater');
+  // 旧正则会把平台后缀一起吃掉，界面上出现 "1.2.19-windows-amd64.zip" 这种假版本号
+  ok('zip 资产名只取三段版本号',
+    versionFromAsset('wb2api-v1.2.19-windows-amd64.zip') === '1.2.19',
+    `got ${versionFromAsset('wb2api-v1.2.19-windows-amd64.zip')}`);
+  ok('exe 资产名同样只取三段',
+    versionFromAsset('workbuddy2api-v1.2.10-windows-amd64.exe') === '1.2.10',
+    `got ${versionFromAsset('workbuddy2api-v1.2.10-windows-amd64.exe')}`);
+  // CodeArts 用四段版本号 vYY.MM.DD.N，只取三段会把补丁版判成同版本
+  ok('codearts 版本号保留四段',
+    versionFromAsset('codearts2api-panel_v26.11.05.1_windows_amd64.zip') === '26.11.05.1',
+    `got ${versionFromAsset('codearts2api-panel_v26.11.05.1_windows_amd64.zip')}`);
+  ok('wb2api 前缀里的 v2 不被误认成版本',
+    versionFromAsset('wb2api-v1.2.19-windows-amd64.zip') === '1.2.19',
+    `got ${versionFromAsset('wb2api-v1.2.19-windows-amd64.zip')}`);
+  ok('无版本号的资产返回 null', versionFromAsset('SHA256SUMS') === null);
+  ok('1.2.19 比 1.2.10 新', isNewerVersion('1.2.19', '1.2.10') === true);
+  ok('同版本不算更新', isNewerVersion('1.2.19', '1.2.19') === false);
+  // 四段补丁版必须能推进，否则 pin 在 v26.11.05.x 的网关永远收不到新构建
+  ok('26.11.05.2 比 26.11.05.1 新', isNewerVersion('26.11.05.2', '26.11.05.1') === true);
+  ok('26.11.05.1 不比 26.11.05.2 新', isNewerVersion('26.11.05.1', '26.11.05.2') === false);
+  ok('缺位按 0 处理：1.2 与 1.2.0 相等', isNewerVersion('1.2', '1.2.0') === false);
+}
+
+/**
+ * replace-dir 必须真的解包 zip。
+ *
+ * 回归：下载路径是 "<资产名>.part"，旧代码用 /\.zip$/ 判断 → 永远为假，
+ * 整个 zip 被当成「单 exe」拷进工作目录，sub2api/WorkBuddy/CodeArts
+ * 每次更新都必然失败。这里用真 zip 走一遍 _replaceDir。
+ */
+async function testReplaceDirUnzipsZip() {
+  const { PlatformUpdater } = require('../src/updater');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'w2a-zip-'));
+  try {
+    const workDir = path.join(root, 'work');
+    const updDir = path.join(root, 'upd');
+    const backupDir = path.join(root, 'backup');
+    fs.mkdirSync(workDir, { recursive: true });
+    fs.mkdirSync(updDir, { recursive: true });
+    fs.mkdirSync(backupDir, { recursive: true });
+    // 旧数据文件必须被 preserveGlobs 保住
+    fs.writeFileSync(path.join(workDir, 'config.yaml'), 'KEEP-ME');
+
+    // 造一个带一层根目录的 zip：<root>/sub2api.exe + <root>/README.md
+    const stage = path.join(root, 'stage', 'pkg');
+    fs.mkdirSync(stage, { recursive: true });
+    fs.writeFileSync(path.join(stage, 'sub2api.exe'), 'NEW-BINARY');
+    fs.writeFileSync(path.join(stage, 'README.md'), 'docs');
+    // 用 .NET ZipFile 打 zip（tar -a 在 Windows 上认不出 zip 格式，
+    // Compress-Archive 又会按扩展名拒绝写 .part）。打成 .zip 再改名，
+    // 正好复刻「下载得到 .zip.part」的真实形态。
+    const zipTmp = path.join(updDir, 'pkg_windows_amd64.zip');
+    const zipPath = zipTmp + '.part';
+    await new Promise((resolve, reject) => {
+      require('child_process').execFile('powershell.exe', ['-NoProfile', '-Command',
+        `Add-Type -AssemblyName System.IO.Compression.FileSystem; ` +
+        `[System.IO.Compression.ZipFile]::CreateFromDirectory('${stage}', '${zipTmp}')`],
+        { windowsHide: true, timeout: 60000 }, (e) => (e ? reject(e) : resolve()));
+    });
+    fs.renameSync(zipTmp, zipPath);
+
+    const store = {
+      platformWorkDir: () => workDir,
+      getPlatform: () => ({ id: 'sub2api', updater: { preserveGlobs: ['config.yaml'] } }),
+    };
+    const upd = new PlatformUpdater({ manager: {}, store, dataDir: root, logger: { info(){}, warn(){}, error(){} } });
+    await upd._replaceDir(store.getPlatform(), zipPath, updDir, backupDir);
+
+    ok('replace-dir 解包 .part 的 zip：二进制落地',
+      fs.existsSync(path.join(workDir, 'sub2api.exe'))
+      && fs.readFileSync(path.join(workDir, 'sub2api.exe'), 'utf8') === 'NEW-BINARY');
+    ok('replace-dir 剥掉 zip 的单层根目录', !fs.existsSync(path.join(workDir, 'pkg')));
+    ok('replace-dir 保留被保护的数据文件',
+      fs.readFileSync(path.join(workDir, 'config.yaml'), 'utf8') === 'KEEP-ME');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * 禁用平台的更新必须算成功。
+ *
+ * 回归：apply 的第 5 步会 manager.start(id) 做健康验证，
+ * 而 start() 对 enabled=false 直接抛「平台已禁用，请先 enable」，
+ * 于是「安装成功」被 catch 成失败 → 回滚 → 界面永远显示更新失败
+ * （sub2api 的实际症状）。这里用一个最小假实现跑通 apply。
+ */
+async function testDisabledPlatformUpdateSucceeds() {
+  const { PlatformUpdater } = require('../src/updater');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'w2a-disabled-'));
+  try {
+    const workDir = path.join(root, 'work');
+    const updDir = path.join(root, 'upd');
+    fs.mkdirSync(workDir, { recursive: true });
+    fs.mkdirSync(updDir, { recursive: true });
+    fs.writeFileSync(path.join(workDir, 'app.exe'), 'OLD');
+
+    const p = {
+      id: 'mockdisabled', name: 'MD', enabled: false, workDir,
+      run: { binary: 'app.exe' },
+      updater: { repo: 'x/y', strategy: 'replace-binary', preserveGlobs: [] },
+    };
+    const store = {
+      platformWorkDir: () => workDir,
+      getPlatform: () => p,
+      updatePlatform: () => {},
+      manager: { update: {} },
+    };
+    const rt = {
+      cfg: p, status: 'stopped', proc: null, version: undefined,
+      setStatus(s) { this.status = s; },
+      appendLog() {},
+    };
+    const manager = {
+      // 与真实平台管理器一致：禁用平台一律拒绝启动
+      start: async () => { throw new Error('平台已禁用，请先 enable'); },
+      stop: async () => {},
+      getRuntime: () => rt,
+      emit: () => {},
+    };
+    const upd = new PlatformUpdater({ manager, store, dataDir: root, logger: { info(){}, warn(){}, error(){} } });
+    // 绕过网络：直接给 checkInfo，并伪造下载
+    upd._download = async (_url, dest) => { fs.writeFileSync(dest, 'NEW'); return dest; };
+    upd._replaceBinary = async () => ({ binaryPath: path.join(workDir, 'app.exe') });
+    upd.manager = manager;
+
+    const r = await upd.apply('mockdisabled', {
+      checked: true, hasUpdate: true, assetUrl: 'https://example.invalid/app.exe',
+      latest: '9.9.9', current: '1.0.0',
+    });
+    ok('禁用平台的更新返回成功', r.ok === true, JSON.stringify(r));
+    ok('禁用平台更新标记 disabled=true', r.disabled === true);
+    ok('禁用平台更新后状态为 stopped（不谎报 healthy）', rt.status === 'stopped', `got ${rt.status}`);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
 async function main() {
+  console.log('[replace-dir zip 解包回归：不启动进程]');
+  await testReplaceDirUnzipsZip();
+  console.log('[禁用平台更新回归：不启动进程]');
+  await testDisabledPlatformUpdateSucceeds();
+  console.log('[CodeArts 导入配置回归：不启动进程]');
+  testImportedCodeArtsCommand();
+  console.log('[更新源版本解析回归：不联网]');
+  testUpdaterVersionParsing();
+  if (process.argv.includes('--config-only')) {
+    console.log(`RESULT: ${PASS.length} passed, ${FAIL.length} failed`);
+    process.exitCode = FAIL.length ? 1 : 0;
+    return;
+  }
+
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'w2a-test-'));
   const mocksDir = path.join(__dirname, 'mocks');
   console.log(`dataDir = ${dataDir}\n`);
@@ -190,6 +396,37 @@ async function main() {
     try { occupier.closeAllConnections?.(); } catch (_e) { /* 老 Node 无此 API */ }
     occupier.close(() => { clearTimeout(t); resolve(); });
   });
+
+  // ── 5b. force 不得杀掉本平台自己的实例（真实事故回归）──
+  console.log('\n[5b] force 与收养的边界');
+  {
+    // 端口上跑的是本平台的实例（用 mock 服务冒充：adoptHints 命中即可）
+    // 独立端口，避免与上面第 5 节的占用者互相污染
+    const forcePort = 17897;
+    const ownCfg = {
+      id: 'forceadopt', name: 'Force Adopt', type: 'node', enabled: true, mode: 'managed',
+      workDir: mocksDir,
+      run: { binary: 'node', args: ['mock-healthy.js'], env: { MOCK_PORT: String(forcePort) } },
+      port: forcePort,
+      // 不设 adoptHints：任何 HTTP 响应即视为本平台实例
+      health: { url: `http://127.0.0.1:${forcePort}/healthz`, intervalSec: 1, timeoutSec: 1, failThreshold: 1, okThreshold: 1 },
+      restart: { baseBackoffSec: 0.2, maxBackoffSec: 1, maxRetries: 0 },
+    };
+    store.platforms.platforms.push(ownCfg);
+    const rt = new (require('../src/platform-manager').PlatformManager)({
+      store, dataDir, shellRoot: path.resolve(__dirname, '..'), logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    // 给这个端口装一个能回 HTTP 的假服务
+    const http2 = require('http');
+    const fake = http2.createServer((reqq, ress) => { ress.writeHead(200); ress.end('ok'); });
+    await new Promise((r) => fake.listen(forcePort, '127.0.0.1', r));
+    try { await rt.start('forceadopt', { force: true }); } catch (_e) { /* 可能收养失败 */ }
+    const snap = rt.statusOf('forceadopt');
+    ok('force 遇到本平台实例时收养而非杀进程', snap.adopted === true, `adopted=${snap.adopted} status=${snap.status}`);
+    rt.destroy();
+    await new Promise((r) => { try { fake.closeAllConnections?.(); } catch (_e) {} fake.close(() => r()); });
+    store.platforms.platforms = store.platforms.platforms.filter((x) => x.id !== 'forceadopt');
+  }
 
   // ── 6. enable/disable ──
   console.log('\n[6] enable/disable');

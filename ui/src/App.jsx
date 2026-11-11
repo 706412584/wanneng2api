@@ -3,6 +3,7 @@ import { NavLink, Route, Routes, useLocation } from 'react-router-dom'
 import { apiMode, apiBase, pingManager } from './api/client'
 import { useTheme } from './hooks/useTheme'
 import { ToastProvider } from './components/Toast'
+import { BusyProvider, ConfirmProvider } from './components/Busy'
 import Overview from './pages/Overview'
 import Platforms from './pages/Platforms'
 import Updates from './pages/Updates'
@@ -53,6 +54,9 @@ export default function App() {
 
   return (
     <ToastProvider>
+      <ConfirmProvider>
+      <BusyProvider>
+      <TitleBar />
       <div className="app-shell">
         <aside className="sidebar">
           <div className="brand">
@@ -115,6 +119,54 @@ export default function App() {
           </main>
         </div>
       </div>
+      </BusyProvider>
+      </ConfirmProvider>
     </ToastProvider>
+  )
+}
+
+/**
+ * 自绘标题栏。
+ * Electron 主窗口是 frame:false（Windows 下 titleBarStyle:hidden 会把系统按钮
+ * 一起拿掉），所以最小化/最大化/关闭要自己画。
+ * 浏览器里（非桌面）整个条隐藏，不影响 Web 版使用。
+ */
+function TitleBar() {
+  const shell = typeof window !== 'undefined' ? window.wannengShell : null
+  const [maxed, setMaxed] = useState(false)
+
+  useEffect(() => {
+    if (!shell) return
+    document.documentElement.classList.add('has-titlebar')
+    shell.isMaximized().then(setMaxed).catch(() => {})
+    const off = shell.onMaximizeChange(setMaxed)
+    return () => {
+      document.documentElement.classList.remove('has-titlebar')
+      if (off) off()
+    }
+  }, [shell])
+
+  if (!shell) return null
+
+  return (
+    <div className="titlebar">
+      {/* 左侧留白 + 可拖动区：brand 已显示在侧栏，这里只放应用名 */}
+      <div className="titlebar-drag">
+        <span className="titlebar-title">Wanneng2API</span>
+      </div>
+      <div className="titlebar-actions">
+        <button className="tb-btn" title="最小化" onClick={() => shell.minimize()}>
+          <svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 5h10" stroke="currentColor" strokeWidth="1" /></svg>
+        </button>
+        <button className="tb-btn" title={maxed ? '还原' : '最大化'} onClick={() => shell.toggleMaximize()}>
+          {maxed
+            ? <svg width="10" height="10" viewBox="0 0 10 10"><rect x="0.5" y="2.5" width="6" height="6" fill="none" stroke="currentColor" /><path d="M2.5 2.5V0.5h7v7h-2" fill="none" stroke="currentColor" /></svg>
+            : <svg width="10" height="10" viewBox="0 0 10 10"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor" /></svg>}
+        </button>
+        <button className="tb-btn tb-close" title="关闭" onClick={() => shell.close()}>
+          <svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 0l10 10M10 0L0 10" stroke="currentColor" strokeWidth="1" /></svg>
+        </button>
+      </div>
+    </div>
   )
 }

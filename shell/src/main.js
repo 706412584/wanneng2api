@@ -7,7 +7,7 @@
  * Electron 相关（窗口/托盘/自启）只在本文件引用，其余模块均为纯 Node。
  */
 
-const { app, BrowserWindow, dialog, shell, Menu } = require('electron');
+const { app, BrowserWindow, dialog, shell, Menu, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
@@ -28,6 +28,8 @@ let splashWindow = null;
 let tray = null;
 let quitting = false;
 let closeAction = 'tray';
+// 壳内无痕登录窗（限制并发，关闭即销毁内存会话）
+const loginWindows = new Set();
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -102,6 +104,91 @@ function loadUiFromManager(port, fileFallback) {
   attempt();
 }
 
+/** 自绘标题栏用的窗口控制 IPC（frame:false 下系统按钮不存在） */
+function setupWindowControls() {
+  ipcMain.handle('window:minimize', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.minimize();
+  });
+  ipcMain.handle('window:maximize', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMaximized()) mainWindow.unmaximize();
+    else mainWindow.maximize();
+  });
+  ipcMain.handle('window:close', () => {
+    // 走 close()，让 closeAction=tray 的隐藏逻辑照常生效
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
+  });
+  ipcMain.handle('window:is-maximized', () =>
+    !!(mainWindow && !mainWindow.isDestroyed() && mainWindow.isMaximized()));
+  // 只接受来自本应用页面（http://127.0.0.1:17800 或 file:// 回退页）的调用：
+// 外部页面若能拿到 bridge，就不能借它开窗/打开系统浏览器。
+  ipcMain.handle('login:open', (e, { url, mode } = {}) => {
+    const from = e?.senderFrame?.url || '';
+    const okSource = /^http:\/\/127\.0\.0\.1:(17800|5173)\//.test(from) || /^file:\/\//.test(from);
+    if (!okSource) return { ok: false, error: '来源不允许' };
+    return openLoginPage(url, mode);
+  });
+}
+
+/**
+ * 登录页的两种打开方式：
+ *   system    → 系统默认浏览器（与旧行为一致）
+ *   incognito → 壳内独立窗口，使用一次性 session 分区：
+ *               partition 不带 persist: 前缀 = 内存会话，不写 cookie/缓存到磁盘，
+ *               窗口关闭后该会话即销毁。授权页仍在同一应用内，回调可直接回传。
+ *
+ * 只接受 http(s)，拒绝 file: / javascript: 等协议，避免被前端传入的串利用。
+ */
+function openLoginPage(url, mode) {
+  let target;
+  try { target = new URL(String(url || '')); } catch { return { ok: false, error: '授权链接无效' }; }
+  if (!['https:', 'http:'].includes(target.protocol)) return { ok: false, error: '只允许 http(s) 授权链接' };
+  if (mode !== 'incognito') {
+    shell.openExternal(target.href);
+    return { ok: true, mode: 'system' };
+  }
+  // 限制并发登录窗：避免被反复调用开无限窗口
+  if (loginWindows.size >= 3) return { ok: false, error: '已有多个登录窗口，请先关闭' };
+  try {
+    const { session } = require('electron');
+    const part = 'login-incognito-' + Date.now();
+    const win = new BrowserWindow({
+      width: 520,
+      height: 760,
+      title: '登录（无痕）',
+      autoHideMenuBar: true,
+      backgroundColor: '#ffffff',
+      webPreferences: {
+        // 无 persist: 前缀 → 内存会话，落盘为 0
+        partition: part,
+        nodeIntegration: false,
+        contextIsolation: true,
+        // 授权页不需要任何 preload 能力
+        sandbox: true,
+      },
+    });
+    win.setMenuBarVisibility(false);
+    loginWindows.add(win);
+    win.webContents.setWindowOpenHandler(({ url: next }) => {
+      if (/^https?:/i.test(next)) shell.openExternal(next);
+      return { action: 'deny' };
+    });
+    // 只允许 http(s) 导航：file:/javascript: 等一律取消
+    win.webContents.on('will-navigate', (ev, next) => {
+      if (!/^https?:/i.test(String(next || ''))) ev.preventDefault();
+    });
+    // 关闭窗口即销毁该内存会话，确保没有残留 cookie
+    win.on('closed', () => {
+      loginWindows.delete(win);
+      try { session.fromPartition(part).clearStorageData(); } catch { /* 已销毁 */ }
+    });
+    win.loadURL(target.href).catch(() => {});
+    return { ok: true, mode: 'incognito' };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
 function createMainWindow() {
   const ui = uiIndexHtml();
   mainWindow = new BrowserWindow({
@@ -112,12 +199,16 @@ function createMainWindow() {
     title: 'Wanneng2API',
     show: false,
     backgroundColor: '#111723',
-    // 去掉 Electron 自带的菜单栏（File/Edit/View…）与标题栏文字，
-    // 让界面像原生应用。保留系统的最小化/最大化/关闭按钮
-    // （frame:true + titleBarStyle:'hidden' 在 Windows 下即为此效果）。
+    // Windows 下 titleBarStyle:'hidden' 会把最小化/最大化/关闭一起拿掉，
+    // 所以改用 frame:false + 前端自绘按钮（参考 any-auto-register）：
+    // preload 暴露 window:minimize|maximize|close，UI 顶部画一条可拖拽的标题栏。
+    frame: false,
     autoHideMenuBar: true,
-    titleBarStyle: 'hidden',
-    webPreferences: { contextIsolation: true, nodeIntegration: false },
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      preload: path.join(__dirname, 'preload.js'),
+    },
   });
   // 彻底移除菜单（autoHideMenuBar 只是隐藏，按 Alt 还会冒出来）
   Menu.setApplicationMenu(null);
@@ -144,6 +235,14 @@ function createMainWindow() {
     }
   });
   mainWindow.on('closed', () => { mainWindow = null; });
+  // 最大化状态变化 → 通知前端切换按钮图标
+  const pushMaxState = () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('window:maximized', mainWindow.isMaximized());
+    }
+  };
+  mainWindow.on('maximize', pushMaxState);
+  mainWindow.on('unmaximize', pushMaxState);
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/i.test(url)) shell.openExternal(url);
     return { action: 'deny' };
@@ -300,6 +399,7 @@ app.whenReady().then(async () => {
 
   // 3. Splash → 按需 spawn autoStartPlatforms → 等健康 → 主窗口 → 托盘
   createSplash();
+  setupWindowControls();   // frame:false 的自绘标题栏需要这些 IPC
   createMainWindow(); // 先建好（ready-to-show 后才显示）
   // 自启不阻塞启动流程：start() 内部会等平台健康（最长 120s），
   // 若有平台起不来，整个界面会一起卡在 Splash 上。让它在后台跑，
