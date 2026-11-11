@@ -22,9 +22,16 @@ const HEALTH_VERIFY_SEC = 60;
 // 而更新中心会为每个平台各查一次；缓存后反复点击不再烧额度。
 const RELEASE_CACHE_MS = 30 * 60 * 1000;
 
+/**
+ * 版本号切成数字段（任意段数）。
+ *
+ * 不能固定三段：CodeArts 用 vYY.MM.DD.N（如 26.11.05.1 → 26.11.05.2），
+ * 只比前三位会把补丁版判成同一版本，永远推不到新构建。
+ * CodeArts 自己的 tag 就是这个形状，见其 docs/releases/。
+ */
 function semverParts(v) {
-  const m = String(v || '0.0.0').trim().replace(/^v/i, '').match(/(\d+)\.(\d+)\.(\d+)/);
-  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+  const m = String(v || '').trim().replace(/^v/i, '').match(/\d+(?:\.\d+)*/);
+  return m ? m[0].split('.').map(Number) : null;
 }
 
 function isNewerVersion(latest, current) {
@@ -32,15 +39,27 @@ function isNewerVersion(latest, current) {
   const b = semverParts(current);
   if (!a) return false;
   if (!b) return true; // 当前版本未知 → 有 release 就提示
-  for (let i = 0; i < 3; i++) {
-    if (a[i] !== b[i]) return a[i] > b[i];
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    // 缺位按 0 处理：1.2 与 1.2.0 相等，1.2 与 1.2.1 后者更新
+    const x = a[i] ?? 0;
+    const y = b[i] ?? 0;
+    if (x !== y) return x > y;
   }
   return false;
 }
 
-/** 从 asset 名里提取版本号（如 workbuddy2api-v1.2.10-windows-amd64.exe → 1.2.10） */
+/**
+ * 从 asset 名里提取版本号（如 wb2api-v1.2.19-windows-amd64.zip → 1.2.19）。
+ *
+ * 只取「点分数字段」：旧正则的 `(?:[-.][0-9A-Za-z]+)*` 会把平台后缀一起吃掉，
+ * 得到 "1.2.19-windows-amd64.zip" 这种假版本号并直接显示到界面上。
+ * 段数不固定（CodeArts 是四段），截到遇到非数字为止。
+ */
 function versionFromAsset(name) {
-  const m = String(name).match(/v?(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)/);
+  // 必须有前缀边界：`v?` 直接跟在字符流里会把 wb2api 的 "v2" 认成版本，
+// 于是 wb2api-v1.2.19 会解析成 "2"。用 (^|[^0-9A-Za-z]) 限制起点。
+  const m = String(name).match(/(?:^|[^0-9A-Za-z])v?(\d+(?:\.\d+)*)/);
   return m ? m[1] : null;
 }
 
@@ -73,7 +92,21 @@ class PlatformUpdater {
     if (!u.repo) {
       return { id, checked: false, reason: '未配置 updater.repo（本地平台无远程源）', current: this.currentVersion(p) };
     }
-    const latest = await this._fetchLatestRelease(u.repo, this.store.manager.update && this.store.manager.update.githubToken);
+    let latest;
+    try {
+      latest = await this._fetchLatestRelease(u.repo, this.store.manager.update && this.store.manager.update.githubToken);
+    } catch (e) {
+      // 「仓库还没发过 Release」是仓库侧的正常状态，不是检查失败：
+      // 让它走 checked:false 的同一路径，避免管理 API 把它变成 400
+      // （浏览器控制台会因此报一排红色错误，用户会误以为网络出了问题）。
+      if (/仓库无 release/.test(e.message)) {
+        return {
+          id, checked: false, noRelease: true, current: this.currentVersion(p),
+          reason: `仓库 ${u.repo} 暂无 Release`,
+        };
+      }
+      throw e;
+    }
     const assets = (latest.assets || []).map((a) => a.name);
     let asset = null;
     if (u.assetPattern) {
@@ -85,6 +118,10 @@ class PlatformUpdater {
     const latestVersion = (asset && versionFromAsset(asset.name)) || String(latest.tag_name || '').replace(/^v/i, '');
     const current = this.currentVersion(p);
     const hasUpdate = !!asset && isNewerVersion(latestVersion, current);
+    // 有 Release 但没有任何资产匹配 assetPattern（例如仓库只发 APK，
+    // 而这里要 windows zip）：这不是「已是最新」，用户点下去也装不了。
+    // 必须单独标记，否则界面会显示绿色的「最新」，把「装不了」说成「不用装」。
+    const noAsset = !asset;
     return {
       id,
       checked: true,
@@ -92,6 +129,8 @@ class PlatformUpdater {
       latest: latestVersion || latest.tag_name,
       tagName: latest.tag_name,
       hasUpdate,
+      noAsset,
+      assetPattern: u.assetPattern || '',
       assetUrl: asset ? asset.browser_download_url : null,
       assetName: asset ? asset.name : null,
       assetSize: asset ? asset.size : null,
@@ -230,15 +269,28 @@ class PlatformUpdater {
       fs.writeFileSync(marker, JSON.stringify(manifest));
 
       // 5. start + 60s 健康验证
-      rt.appendLog('manager', `[update] 安装完成，重启验证（≤${HEALTH_VERIFY_SEC}s）`);
-      try {
-        await this.manager.start(id);
-      } catch (e) {
-        throw new Error(`更新后启动失败: ${e.message}`);
-      }
-      const healthy = await this._waitHealthy(rt, HEALTH_VERIFY_SEC);
-      if (!healthy) {
-        throw new Error(`更新后 ${HEALTH_VERIFY_SEC}s 健康验证未通过`);
+      // 5. 重启 + 健康验证。
+      // 已禁用的平台不能在更新后启动（start() 会拒绝 enabled=false），
+      // 但那不是更新失败：文件已经装好了，只是用户没打算让它跑。
+      // 过去这里会把「启动被拒」当成失败 → 回滚 → 界面永远显示更新失败，
+      // 用户看到的就是「sub2api 更新永远失败」。
+      const disabled = rt.cfg && rt.cfg.enabled === false;
+      if (disabled) {
+        rt.appendLog('manager', `[update] 已安装 ${info.latest}，但平台处于禁用状态，跳过启动验证`);
+        // 必须把状态从 updating 挪走：否则界面会永远停在「更新中」，
+        // 而且 start/stop 都会被「平台更新中，禁止…」挡住。
+        rt.setStatus('stopped');
+      } else {
+        rt.appendLog('manager', `[update] 安装完成，重启验证（≤${HEALTH_VERIFY_SEC}s）`);
+        try {
+          await this.manager.start(id);
+        } catch (e) {
+          throw new Error(`更新后启动失败: ${e.message}`);
+        }
+        const healthy = await this._waitHealthy(rt, HEALTH_VERIFY_SEC);
+        if (!healthy) {
+          throw new Error(`更新后 ${HEALTH_VERIFY_SEC}s 健康验证未通过`);
+        }
       }
 
       // 6. 成功：登记版本，清理旧备份
@@ -246,9 +298,13 @@ class PlatformUpdater {
       if (rt.version !== undefined) rt.version = info.latest;
       this._pruneBackups(id, Number(this.store.manager.update && this.store.manager.update.keepBackups) || 3);
       try { fs.unlinkSync(marker); } catch (_e) { /* ignore */ }
-      rt.setStatus('healthy');
-      rt.appendLog('manager', `[update] 更新成功 → ${info.latest}`);
-      return { id, ok: true, version: info.latest, rolledBack: false };
+      // 禁用平台保持 stopped：不能谎报 healthy，否则下一次点「启动」会因状态自相矛盾而困惑
+      if (!disabled) rt.setStatus('healthy');
+      rt.appendLog('manager', `[update] 更新成功 → ${info.latest}${disabled ? '（平台仍为禁用，启用后生效）' : ''}`);
+      return {
+        id, ok: true, version: info.latest, rolledBack: false, disabled,
+        message: disabled ? `已更新到 ${info.latest}；平台处于禁用状态，启用后生效` : undefined,
+      };
     } catch (e) {
       // 7. 失败 → 回滚
       let rolledBack = false;
@@ -259,7 +315,13 @@ class PlatformUpdater {
         if (manifest && manifest.backupDir && fs.existsSync(manifest.backupDir)) {
           if (rt.proc) { await this.manager.stop(id).catch(() => {}); }
           this._restore(manifest);
-          await this.manager.start(id);
+          // 同样不能对禁用平台调 start()：那会抛「平台已禁用」，
+          // 让一次成功回滚被误报成「回滚失败，请人工检查 backups」。
+          if (rt.cfg && rt.cfg.enabled === false) {
+            rt.setStatus('stopped');
+          } else {
+            await this.manager.start(id);
+          }
           rolledBack = true;
         }
       } catch (re) {
@@ -331,11 +393,16 @@ class PlatformUpdater {
     const extractDir = path.join(updDir, 'extracted');
     fs.mkdirSync(extractDir, { recursive: true });
 
-    if (/\.zip$/i.test(dlPath)) {
+    // 下载路径是 "<资产名>.part"（防半包），所以不能拿它和 /\.zip$/ 比：
+  // 那个判断永远为假，zip 会被当成「单 exe」整包拷进工作目录，
+  // 于是 sub2api/WorkBuddy/CodeArts 这类 replace-dir 平台每次更新都必然失败。
+  // 判据要用「原始资产名」——即去掉末尾 .part 后的名字。
+  const assetName = path.basename(dlPath).replace(/\.part$/i, '');
+  if (/\.zip$/i.test(assetName)) {
       await this._unzip(dlPath, extractDir);
     } else {
       // 单 exe 的 replace-dir：直接当目录内容
-      fs.copyFileSync(dlPath, path.join(extractDir, path.basename(dlPath)));
+      fs.copyFileSync(dlPath, path.join(extractDir, assetName));
     }
     // zip 常有一层根目录，剥掉
     const src = this._stripSingleRoot(extractDir);
@@ -358,12 +425,22 @@ class PlatformUpdater {
 
   _unzip(zipPath, destDir) {
     return new Promise((resolve, reject) => {
-      // Windows 自带 tar 支持 zip；PowerShell Expand-Archive 兜底
-      execFile('tar.exe', ['-xf', zipPath, '-C', destDir],
+      // Windows 自带的 tar 是 libarchive：能解 zip，但两处坑必须同时处理：
+      //  1) 绝对路径 'C:\...' 会被当成「远端主机 C」→ --force-local；
+      //  2) 只看扩展名 + 魔数，遇到 .part 后缀的 zip 会判定「不是 tar」，
+      //     所以解压前先按真实内容把文件还原成 .zip。
+      // PowerShell Expand-Archive 作兜底（它同样要求 .zip 后缀）。
+      const dir = path.dirname(zipPath);
+      const base = path.basename(zipPath).replace(/\.part$/i, '');
+      const zipDepot = path.join(dir, base.endsWith('.zip') ? base : base + '.zip');
+      try {
+        if (zipDepot !== zipPath && !fs.existsSync(zipDepot)) fs.copyFileSync(zipPath, zipDepot);
+      } catch (_e) { /* 让下面的解压报出真实原因 */ }
+      execFile('tar.exe', ['--force-local', '-xf', zipDepot, '-C', destDir],
         { windowsHide: true, timeout: 120000 }, (err, _so, se) => {
           if (!err) return resolve();
           execFile('powershell.exe', ['-NoProfile', '-Command',
-            `Expand-Archive -LiteralPath '${zipPath}' -DestinationPath '${destDir}' -Force`],
+            `Expand-Archive -LiteralPath '${zipDepot}' -DestinationPath '${destDir}' -Force`],
             { windowsHide: true, timeout: 180000 }, (err2, _so2, se2) => {
               if (err2) return reject(new Error(`解压失败: ${se || se2 || err2.message}`));
               resolve();
@@ -478,11 +555,19 @@ class PlatformUpdater {
         status: rt ? rt.status : 'unknown',
         current: this.currentVersion(p),
         hasUpdater: !!(p.updater && p.updater.repo),
+        // 仓库地址给前端拼「查看发布页」链接（没有更新源时为空）
+        repo: (p.updater && p.updater.repo) || '',
       };
       if (!base.hasUpdater || this.busy.has(p.id)) { out.push(base); continue; }
       try {
         const c = await this.check(p.id);
-        out.push({ ...base, latest: c.latest, hasUpdate: c.hasUpdate, assetName: c.assetName });
+        out.push({
+          ...base, latest: c.latest, hasUpdate: c.hasUpdate, assetName: c.assetName,
+          // 仓库还没发 Release（check 已归一到 checked:false，不再抛异常）
+          ...(c.noRelease ? { noRelease: true, checkError: c.reason } : {}),
+          // 有 Release 但资产不匹配：界面要显示「无匹配资产」而不是「最新」
+          ...(c.noAsset ? { noAsset: true, assetPattern: c.assetPattern, allAssets: c.allAssets } : {}),
+        });
       } catch (e) {
         out.push({ ...base, checkError: e.message });
       }
