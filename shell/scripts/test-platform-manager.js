@@ -70,7 +70,10 @@ function testImportedCodeArtsCommand() {
   const cfg = defaultPlatforms().platforms.find((p) => p.id === 'codearts');
   // 结构性断言：不能硬编码盘符，换机器/CI 也要成立
   ok('CodeArts 默认工作目录以 bin 结尾', /[/\\]bin$/.test(cfg.workDir), `cwd=${cfg.workDir}`);
-  ok('CodeArts 默认使用 bin 内的可执行文件', cfg.run.binary === 'codearts2api-panel.exe');
+  // 默认名按平台推导：Windows 带 .exe，POSIX 不带
+  const exeSuffix = process.platform === 'win32' ? '.exe' : '';
+  ok('CodeArts 默认使用 bin 内的可执行文件', cfg.run.binary === `codearts2api-panel${exeSuffix}`,
+    `got ${cfg.run.binary}`);
 
   // 老用户升级迁移：错误旧值被修正，自定义值不被覆盖
   const { ConfigStore } = require('../src/config');
@@ -103,13 +106,14 @@ function testImportedCodeArtsCommand() {
   }
 
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'w2a-codearts-config-'));
+  const exeName = `codearts2api-panel${exeSuffix}`;
   try {
-    fs.writeFileSync(path.join(fixture, 'codearts2api-panel.exe'), '');
+    fs.writeFileSync(path.join(fixture, exeName), '');
     const rt = { cfg: { ...cfg, workDir: fixture } };
     const context = { store: { platformWorkDir: (p) => path.resolve(p.workDir) } };
     const cmd = PlatformManager.prototype._resolveCommand.call(context, rt);
     ok('CodeArts 命令定位到所选数据目录', cmd.cwd === fixture
-      && cmd.command === path.join(fixture, 'codearts2api-panel.exe'));
+      && cmd.command === path.join(fixture, exeName), `got ${cmd.command}`);
     ok('CodeArts 显式指定所选目录的 config.json', cmd.args.length === 2 && cmd.args[0] === '--config'
       && path.resolve(cmd.cwd, cmd.args[1]) === path.join(fixture, 'config.json'));
   } finally {
