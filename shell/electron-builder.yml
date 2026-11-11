@@ -40,3 +40,12 @@ nsis:
 # 便携版：解压即用，适合不想安装的场景
 portable:
   artifactName: ${productName}-${version}-portable.${ext}
+
+# 壳自更新（main.js setupSelfUpdater → electron-updater）依赖这里的 publish：
+# 打包时它会写出 app-update.yml 与 latest.yml，前者告诉运行时去哪儿查新版本，
+# 后者是版本清单。没有它 autoUpdater.checkForUpdates() 拿不到更新源，
+# 桌面版的「发现新版本」永远不会触发。
+publish:
+  provider: github
+  owner: 706412584
+  repo: wanneng2api
