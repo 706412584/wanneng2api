@@ -308,9 +308,11 @@ function testCrossPlatformShape() {
     ok('Windows 盘符路径在 POSIX 上保持原样',
       process.platform === 'win32' ? path.isAbsolute(winPath) : winPath === 'D:/软件/workbuddy2api',
       `got ${winPath}`);
+    // expandPath 会把反斜杠统一成正斜杠（这是既有行为，跨平台路径都用 '/'），
+    // 所以 UNC 断言要比对规范化后的形式；关键是它没有被拼到数据目录后面。
     const uncPath = st.platformWorkDir({ workDir: '\\\\server\\share\\x' });
     ok('UNC 路径不被拼成相对路径',
-      process.platform === 'win32' || uncPath === '\\\\server\\share\\x', `got ${uncPath}`);
+      process.platform === 'win32' || uncPath === '//server/share/x', `got ${uncPath}`);
     const relPath = st.platformWorkDir({ workDir: '../hub' });
     ok('真正的相对路径仍相对数据目录解析',
       path.resolve(relPath) === path.resolve(migDir2, '../hub'), `got ${relPath}`);
