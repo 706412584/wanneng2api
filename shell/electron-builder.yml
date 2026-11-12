@@ -64,13 +64,25 @@ deb:
   # deb 元数据必填：homepage 在 package.json，maintainer 必须带邮箱，
   # 否则 fpm 直接拒绝打包（CI 首跑就是卡在 homepage）。
   maintainer: wanneng2api <706412584@users.noreply.github.com>
-  # 运行时需要能拉起网关进程并探测端口
+  # 依赖清单按 Electron 33 的实际 ldd 结果补齐，不只是「常见清单」：
+  # 在 Ubuntu 24.04 上实测 wanneng2api-shell 缺 libnss3.so / libasound.so.2 等，
+  # 所以 libnss3 与 libasound2 是硬依赖，缺了根本起不来。
+  #   libnss3   → libnss3.so / libnssutil3 / libsmime3
+  #   libnspr4  → libnspr4.so（libnss3 会带，但显式列出更稳）
+  #   libasound2→ libasound.so.2（声音子系统，Electron 启动即加载）
+  #
+  # 注意 Ubuntu 24.04 起 libasound2 被 64 位时间转换重命名为 libasound2t64，
+  # 直接写 libasound2 在 24.04 上 Candidate: (none)，apt 会整包拒绝安装。
+  # 用 `A | B` 让 dpkg 二选一，同时兼容 22.04 与 24.04。
   depends:
     - libgtk-3-0
     - libnotify4
     - libnss3
+    - libnspr4
+    - 'libasound2t64 | libasound2'
     - libxss1
     - libxtst6
+    - libgbm1
     - xdg-utils
     - libatspi2.0-0
 
