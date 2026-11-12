@@ -58,6 +58,35 @@ function corsHeaders(origin) {
   };
 }
 
+/**
+ * 把代理范围里属于 magpie 的两项（订阅流量 / 插件流量）写进它的设置。
+ *
+ * 用 magpie 自己的 CLI 而不是它的 Web API：CLI 是官方稳定接口，`settings set`
+ * 带取值校验，且不需要处理控制台会话 cookie。magpie 不在（未安装/未运行）时
+ * 直接跳过——代理设置对壳其余部分依然有效，不该因此报错。
+ */
+function syncMagpieProxy(store) {
+  const proxy = require('./proxy');
+  const want = proxy.magpieEnv();          // { proxy, pluginProxy }
+  const bin = findMagpieBinary(store && store.dataDir);
+  if (!bin) return { skipped: '未找到 magpie 可执行文件' };
+
+  const { execFile } = require('child_process');
+  const applied = {};
+  const pending = Object.entries(want).map(([key, value]) => new Promise((resolve) => {
+    // 只写「与当前值不同」的项，避免每次保存设置都无谓地重启 magpie 的配置
+    execFile(bin, ['settings', 'get', key], { windowsHide: true, timeout: 10000 }, (err, stdout) => {
+      const current = String(stdout || '').trim().replace(/^"|"$/g, '');
+      if (!err && current === value) { applied[key] = 'unchanged'; return resolve(); }
+      execFile(bin, ['settings', 'set', key, value], { windowsHide: true, timeout: 20000 }, (e2) => {
+        applied[key] = e2 ? `失败: ${e2.message}` : 'ok';
+        resolve();
+      });
+    });
+  }));
+  return Promise.all(pending).then(() => applied);
+}
+
 function json(res, code, obj, origin) {
   const body = JSON.stringify(obj);
   res.writeHead(code, {
@@ -619,20 +648,47 @@ class ApiServer {
       if (method === 'GET') return store.manager;
       if (method === 'PUT') {
         const cur = store.manager;
-        // 浅合并一级，避免整对象覆盖丢失默认键
+        // 合并一级子对象，避免整对象覆盖丢失默认键；proxy.scopes 是二级对象，
+        // 单独再合一次——否则前端只发部分范围时，其余项的当前值会被整体丢掉。
         const merged = { ...cur };
         for (const k of Object.keys(body)) {
           if (typeof body[k] === 'object' && body[k] !== null && !Array.isArray(body[k])
             && typeof cur[k] === 'object' && cur[k] !== null) {
             merged[k] = { ...cur[k], ...body[k] };
+            if (k === 'proxy' && typeof body.proxy.scopes === 'object' && body.proxy.scopes !== null) {
+              merged.proxy.scopes = { ...(cur.proxy && cur.proxy.scopes), ...body.proxy.scopes };
+            }
           } else {
             merged[k] = body[k];
           }
         }
         store.manager = merged;
         store.saveManager();
-        return store.manager;
+        // 代理范围含 magpie 自己的两项（订阅/插件流量）：保存后同步过去，
+        // 由 magpie 执行。同步失败不影响壳设置已保存，只回报一句提示。
+        const warnings = [];
+        try {
+          await syncMagpieProxy(store);
+        } catch (e) {
+          warnings.push(`magpie 代理设置同步失败：${e.message}`);
+        }
+        // 壳自更新不吃我们的 http agent，需要重新告诉 electron-updater
+        if (this.deps.onSettingsSaved) {
+          try { this.deps.onSettingsSaved(); } catch (e) { warnings.push(`应用代理设置失败：${e.message}`); }
+        }
+        return warnings.length ? { ...store.manager, warnings } : store.manager;
       }
+    }
+
+
+    // POST /api/proxy/verify —— 用给定地址实发一次请求验证代理是否可用。
+    // 目标固定为 GitHub API（壳最需要代理的地方），不接受调用方指定，
+    // 免得把它当成任意 URL 的探针。
+    if (method === 'POST' && parts[1] === 'proxy' && parts[2] === 'verify') {
+      const proxy = require('./proxy');
+      const url = body && typeof body.url === 'string' ? body.url.trim() : '';
+      if (!url) throw new Error('请先填写代理地址');
+      return proxy.verify(url);
     }
 
     // GET /api/updates/summary

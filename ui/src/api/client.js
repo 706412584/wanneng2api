@@ -136,6 +136,9 @@ export const api = {
     method: 'POST', body: { ...body, action }, timeout: 120000,
   }),
 
+  // 代理连通性验证：拿填写的地址真的发一次请求（后端固定探 GitHub API）
+  verifyProxy: (url) => request('/api/proxy/verify', { method: 'POST', body: { url }, timeout: 30000 }),
+
   updatesSummary: async () => {
     const d = await request('/api/updates/summary')
     const items = Array.isArray(d?.items)

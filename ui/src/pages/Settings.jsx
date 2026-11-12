@@ -19,6 +19,16 @@ const EMPTY_SETTINGS = {
   sub2api: { pgPort: 5433, redisPort: 6380 }
 }
 
+/** 代理范围：前四项由壳执行（挂 agent），后两项写入 magpie 自己的设置 */
+const PROXY_SCOPES = [
+  { id: 'selfUpdate', label: '壳自更新' },
+  { id: 'platformUpdate', label: '平台更新（检查 + 下载）' },
+  { id: 'pluginRegistry', label: '插件市场' },
+  { id: 'magpieKernel', label: 'magpie 内核更新' },
+  { id: 'magpieSubscription', label: '订阅流量（magpie proxy）' },
+  { id: 'magpiePlugin', label: '插件流量（magpie pluginProxy）' }
+]
+
 export default function Settings() {
   const fetchSettings = useCallback(() => api.getSettings(), [])
   const { data, error, loading, refresh } = usePolling(fetchSettings, 0)
@@ -26,6 +36,8 @@ export default function Settings() {
   const [form, setForm] = useState(null)
   const [saving, setSaving] = useState(false)
   const [shellChecking, setShellChecking] = useState(false)
+  const [proxyTesting, setProxyTesting] = useState(false)
+  const [proxyResult, setProxyResult] = useState(null)
 
   useEffect(() => {
     if (data) setForm(normalize(data))
@@ -48,11 +60,37 @@ export default function Settings() {
     })
   }
 
+  // 代理范围勾选：scopes 是二级对象，用 set 直接改会整体覆盖成「只有这一个键」，
+  // 所以单独合并，并保证未勾的键保留 false（后端也会补默认）。
+  const setProxyScope = (id, on) => {
+    setForm((f) => ({
+      ...f,
+      proxy: { ...f.proxy, scopes: { ...f.proxy.scopes, [id]: on } }
+    }))
+  }
+
+  const testProxy = async () => {
+    setProxyTesting(true)
+    setProxyResult(null)
+    try {
+      const r = await api.verifyProxy(form.proxy.url)
+      setProxyResult(r)
+      if (r.ok) toast('代理可用')
+    } catch (e) {
+      setProxyResult({ ok: false, verdict: e.message })
+      toast(`验证失败：${e.message}`, 'err')
+    } finally {
+      setProxyTesting(false)
+    }
+  }
+
   const save = async () => {
     setSaving(true)
     try {
-      await api.putSettings(form)
-      toast('设置已保存（manager.json）')
+      const res = await api.putSettings(form)
+      // 后端在同步 magpie 代理失败时会在响应里带 warnings：不能假装完全成功
+      if (res?.warnings?.length) toast(`设置已保存，但${res.warnings.join('；')}`, 'err')
+      else toast('设置已保存（manager.json）')
       refresh()
     } catch (e) {
       toast(`保存失败：${e.message}`, 'err')
@@ -86,6 +124,7 @@ export default function Settings() {
   const g = form.general
   const u = form.update
   const s = form.sub2api
+  const p = form.proxy
   const dirty = JSON.stringify(form) !== JSON.stringify(normalize(data))
 
   return (
@@ -186,6 +225,69 @@ export default function Settings() {
         </div>
       </div>
 
+      <div className="card section">
+        <div className="section-head">
+          <h2>代理</h2>
+          <span className="desc">壳出网与 magpie 流量走哪个代理</span>
+        </div>
+        <div className="form-grid">
+          <label className="check-row">
+            <input type="checkbox" checked={!!p.enabled} onChange={(e) => set('proxy', 'enabled', e.target.checked)} />
+            启用代理
+          </label>
+          <div className="field">
+            <label>代理地址</label>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <input
+                className="input"
+                style={{ flex: 1 }}
+                placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+                value={p.url || ''}
+                disabled={!p.enabled}
+                onChange={(e) => set('proxy', 'url', e.target.value)}
+              />
+              <button className="btn" disabled={proxyTesting || !p.url} onClick={testProxy}>
+                {proxyTesting ? '验证中…' : '验证代理'}
+              </button>
+            </div>
+            {proxyResult && (
+              // 配色按 usable（代理隧道是否通）而不是 ok：能收到 403 说明代理是好的，
+              // 不该标红吓人
+              <div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.8, color: proxyResult.usable ? 'var(--green)' : 'var(--orange)' }}>
+                {proxyResult.usable ? '✓ ' : '⚠ '}{proxyResult.verdict}
+                {proxyResult.summary && (
+                  <div style={{ color: 'var(--text-3)' }}>
+                    走代理：{proxyResult.summary.viaProxy}{'　'}直连：{proxyResult.summary.direct}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="field">
+            <label>代理范围 <span className="desc">勾选哪些流量走上面的代理</span></label>
+            <div className="checkbox-group" style={{ paddingTop: 6 }}>
+              {PROXY_SCOPES.map((s) => (
+                <label className="check-row" key={s.id}>
+                  <input
+                    type="checkbox"
+                    checked={!!p.scopes?.[s.id]}
+                    disabled={!p.enabled}
+                    onChange={(e) => setProxyScope(s.id, e.target.checked)}
+                  />
+                  {s.label}
+                </label>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: 1.9 }}>
+          Node 默认不读系统代理，所以壳的更新/下载必须在这里显式开启。<br />
+          「订阅流量 / 插件流量」写入 magpie 自己的 proxy / pluginProxy；<b>取消勾选会明确设为不走代理</b>——
+          magpie 的空值含义是「跟随系统代理」，而系统代理可能对你的目标不通。<br />
+          四个自研网关的流量不受此设置影响（它们各自的代理由自己的配置决定）。
+        </div>
+      </div>
+
       <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
         <button className="btn primary" disabled={saving || !dirty} onClick={save}>
           {saving ? '保存中…' : dirty ? '保存设置' : '无改动'}
@@ -218,8 +320,10 @@ export default function Settings() {
   )
 }
 
-/** 归一化：保证表单所需的字段存在 */
+/** 归一化：保证表单所需的字段存在（dirty 比对也用它，键必须稳定） */
 function normalize(raw) {
+  const scopes = {}
+  for (const s of PROXY_SCOPES) scopes[s.id] = !!raw.proxy?.scopes?.[s.id]
   return {
     general: {
       closeAction: raw.general?.closeAction ?? 'tray',
@@ -230,6 +334,11 @@ function normalize(raw) {
     update: {
       checkOnLaunch: !!raw.update?.checkOnLaunch,
       githubToken: raw.update?.githubToken ?? ''
+    },
+    proxy: {
+      enabled: !!raw.proxy?.enabled,
+      url: raw.proxy?.url ?? '',
+      scopes
     },
     sub2api: {
       pgPort: raw.sub2api?.pgPort ?? 5433,

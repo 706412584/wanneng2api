@@ -38,6 +38,22 @@ function defaultManagerConfig() {
       githubToken: '',
       keepBackups: 3,
     },
+    // 代理：一律由用户显式开启，不做自动探测。Node 的 http/https 默认不读
+    // 代理环境变量；而「该不该走代理」只有用户知道（本机既有能达 GitHub 的
+    // 代理，也有只对国内通的），自动套上反而可能把本来通的流量带偏。
+    // scopes 决定哪些流量走代理，逐项可关。
+    proxy: {
+      enabled: false,
+      url: '',
+      scopes: {
+        selfUpdate: false,          // 壳自更新（electron-updater）
+        platformUpdate: false,      // 平台更新（GitHub 检查 + 资产下载）
+        pluginRegistry: false,      // magpie 插件市场目录
+        magpieKernel: false,        // magpie 内核检测与下载
+        magpieSubscription: false,  // 写入 magpie proxy：订阅流量
+        magpiePlugin: false,        // 写入 magpie pluginProxy：插件流量
+      },
+    },
     sub2api: {
       pgPort: 5433,
       redisPort: 6380,

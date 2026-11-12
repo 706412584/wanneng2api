@@ -15,6 +15,7 @@ const https = require('https');
 const http = require('http');
 const { execFile } = require('child_process');
 const { simpleGlobMatch } = require('./platform-manager');
+const proxy = require('./proxy');
 
 const HEALTH_VERIFY_SEC = 60;
 
@@ -172,14 +173,15 @@ class PlatformUpdater {
     }
     const url = `https://api.github.com/repos/${repo}/releases/latest`;
     return new Promise((resolve, reject) => {
-      const req = https.get(url, {
+      // 走代理与否由「平台更新」这一勾选项决定（GitHub API 直连国内常超时）
+      const req = https.get(url, proxy.withAgent('platformUpdate', {
         headers: {
           'User-Agent': 'wanneng2api-shell',
           Accept: 'application/vnd.github+json',
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
         timeout: 15000,
-      }, (res) => {
+      }), (res) => {
         if (res.statusCode === 404) { res.resume(); return reject(new Error(`仓库无 release: ${repo}`)); }
         if (res.statusCode === 403) {
           // x-ratelimit-reset 是 Unix 秒
@@ -617,10 +619,10 @@ class PlatformUpdater {
     if (hop > 5) throw new Error('下载重定向次数过多');
     return new Promise((resolve, reject) => {
       const mod = url.startsWith('https:') ? https : http;
-      const req = mod.get(url, {
+      const req = mod.get(url, proxy.withAgent('platformUpdate', {
         headers: { 'User-Agent': 'wanneng2api-shell' },
         timeout: 300000,
-      }, (res) => {
+      }), (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           res.resume();
           this._download(res.headers.location, destPart, hop + 1).then(resolve, reject);

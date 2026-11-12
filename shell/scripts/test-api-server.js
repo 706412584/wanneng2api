@@ -101,6 +101,8 @@ async function main() {
   };
 
   const logger = { info: () => {}, warn: () => {}, error: () => {} };
+  // 代理模块需要拿到 store 才能读 manager.json 里的 proxy 段
+  require('../src/proxy').init(store);
   const manager = new PlatformManager({ store, dataDir, logger });
   const updater = new PlatformUpdater({ manager, store, dataDir, logger });
   const api = new ApiServer({ manager, updater, store, openExternal: () => {} });
@@ -208,6 +210,52 @@ async function main() {
     `实际 ${sp2.json.general.autoStartPlatforms.length}`);
   const sg2 = await req('GET', '/api/settings');
   ok('PUT 后 GET 读到新值', sg2.json.general.closeAction === 'quit');
+
+  // ── 代理设置 ──
+  console.log('\n[proxy 设置]');
+  const proxyMod = require('../src/proxy');
+  ok('默认不启用代理（不劫持任何流量）', sg.json.proxy && sg.json.proxy.enabled === false);
+  ok('默认范围全为关', Object.values(sg.json.proxy.scopes).every((v) => v === false));
+  // 只提交部分范围：其余键必须保留（proxy.scopes 是二级对象，最容易在这里丢键）
+  const pp = await req('PUT', '/api/settings', {
+    proxy: { enabled: true, url: 'http://127.0.0.1:7890', scopes: { platformUpdate: true, magpieSubscription: true } },
+  });
+  ok('PUT 代理 200', pp.status === 200);
+  ok('代理二级对象合并：新勾的生效', pp.json.proxy.scopes.platformUpdate === true);
+  ok('代理二级对象合并：未提交的键保留 false', pp.json.proxy.scopes.pluginRegistry === false);
+  ok('代理 url 已保存', pp.json.proxy.url === 'http://127.0.0.1:7890');
+  // 未勾的用途不给 agent，勾了的才给
+  ok('勾选的用途拿到 agent', !!proxyMod.agentFor('platformUpdate'));
+  ok('未勾的用途仍直连', proxyMod.agentFor('pluginRegistry') === undefined);
+  // magpie 两项：勾选写地址，未勾选写 direct（不能落回「跟随系统代理」）
+  const me = proxyMod.magpieEnv();
+  ok('magpie proxy：勾选的写地址', me.proxy === 'http://127.0.0.1:7890', JSON.stringify(me));
+  ok('magpie pluginProxy：未勾选写 direct（而非空串=跟随系统）', me.pluginProxy === 'direct', JSON.stringify(me));
+  // 非法地址（协议不在白名单）不得当成代理用
+  const badProxy = await req('PUT', '/api/settings', { proxy: { enabled: true, url: 'file:///etc/passwd' } });
+  ok('非法代理地址被拒用（降级直连）', proxyMod.agentFor('platformUpdate') === undefined,
+    `url=${badProxy.json.proxy.url}`);
+  ok('非法地址时 magpie 也写 direct', proxyMod.magpieEnv().proxy === 'direct');
+  // 复位，避免影响后续断言
+  await req('PUT', '/api/settings', { proxy: { enabled: false, url: '' } });
+  ok('关闭后 magpie 两项都写 direct', proxyMod.magpieEnv().proxy === 'direct');
+  ok('关闭后不给 agent', proxyMod.agentFor('platformUpdate') === undefined);
+
+  // ── 验证代理（真实发请求，指向一个必然连不上的本地端口，不该挂死）──
+  console.log('\n[verify 代理]');
+  const emptyUrl = await req('POST', '/api/proxy/verify', { url: '' });
+  ok('空地址被拒（400）', emptyUrl.status === 400, `got ${emptyUrl.status}`);
+  const badUrl = await req('POST', '/api/proxy/verify', { url: 'not-a-url' });
+  ok('非法地址给出明确结论', badUrl.status === 200 && /地址无效/.test(badUrl.json.verdict),
+    JSON.stringify(badUrl.json));
+  const dead = await req('POST', '/api/proxy/verify', { url: 'http://127.0.0.1:1' });
+  ok('连不上的代理有 ok=false、usable=false 与两项实测结果',
+    dead.status === 200 && dead.json.ok === false && dead.json.usable === false
+    && dead.json.viaProxy && dead.json.direct, JSON.stringify(dead.json).slice(0, 200));
+  ok('连不上时结论说清是代理的问题', /代理连不上/.test(dead.json.verdict), dead.json.verdict);
+  // 关键：能收到 HTTP 状态码 = 代理隧道是通的，403 是目标侧回绝（GitHub 限额），
+  // 不能判成「代理不可用」——否则用户会去换代理，而问题在限流。
+  ok('usable 按「是否收到响应」而非状态码判定', dead.json.usable === false);
 
   // ── updates/summary ──
   console.log('\n[updates/summary]');

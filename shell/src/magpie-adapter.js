@@ -14,6 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execFile } = require('child_process');
+const proxy = require('./proxy');
 
 const MAGPIE_RELEASES_REPO = 'yetone/magpie-releases';
 
@@ -264,7 +265,7 @@ function latestRelease() {
       },
       timeout: 8000,
     };
-    const req = require('https').get(opts, (res) => {
+    const req = require('https').get(proxy.withAgent('magpieKernel', opts), (res) => {
       let data = '';
       res.on('data', (c) => (data += c));
       res.on('end', () => {
@@ -314,7 +315,8 @@ let registryCache = null;
 function fetchJson(url, { timeoutMs = 15000 } = {}) {
   return new Promise((resolve) => {
     const mod = url.startsWith('https:') ? require('https') : require('http');
-    const req = mod.get(url, { headers: { 'User-Agent': 'wanneng2api-manager' }, timeout: timeoutMs }, (res) => {
+    const req = mod.get(url, proxy.withAgent('pluginRegistry',
+      { headers: { 'User-Agent': 'wanneng2api-manager' }, timeout: timeoutMs }), (res) => {
       let data = '';
       res.on('data', (c) => (data += c));
       res.on('end', () => {
@@ -884,7 +886,8 @@ function installMagpie(dataDir, { timeoutMs = 300000, onProgress } = {}) {
       const file = fs.createWriteStream(part);
       const follow = (u, depth = 0) => {
         if (depth > 5) { finish(false, '下载重定向次数过多'); return; }
-        const dl = require('https').get(u, { headers: { 'User-Agent': 'wanneng2api-shell' }, timeout: timeoutMs }, (res) => {
+        const dl = require('https').get(u, proxy.withAgent('magpieKernel',
+          { headers: { 'User-Agent': 'wanneng2api-shell' }, timeout: timeoutMs }), (res) => {
           if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
             res.resume();
             return follow(res.headers.location, depth + 1);

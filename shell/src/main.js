@@ -17,6 +17,7 @@ const { PlatformManager } = require('./platform-manager');
 const { PlatformUpdater } = require('./updater');
 const { ApiServer } = require('./api-server');
 const { createTray, rebuildTrayMenu, destroyTray } = require('./tray');
+const proxy = require('./proxy');
 
 // ── 全局状态 ──
 let store = null;
@@ -342,6 +343,9 @@ function setupSelfUpdater() {
     const { autoUpdater } = require('electron-updater');
     autoUpdater.autoDownload = false;
     autoUpdater.autoInstallOnAppQuit = true;
+    // 壳自更新的代理：electron-updater 走自己的下载器，不认我们给 http/https
+    // 装的 agent，必须显式告诉它。勾选「壳自更新」且地址合法才设。
+    applyProxyToUpdater();
     autoUpdater.on('update-available', (info) => {
       dialog.showMessageBox(mainWindow, {
         type: 'info', title: '发现新版本',
@@ -363,11 +367,29 @@ function setupSelfUpdater() {
   }
 }
 
+/**
+ * 把代理解析结果写入壳自更新。禁用或地址不合法时清空，避免关掉代理后
+ * electron-updater 还沿用旧代理。设置保存后会再次调用。
+ */
+function applyProxyToUpdater() {
+  try {
+    const { autoUpdater } = require('electron-updater');
+    const p = proxy.config();
+    const usable = p.enabled && p.scopes.selfUpdate && proxy.validProxyUrl(p.url);
+    // electron-updater 的 setProxy 收 null 表示不用代理
+    autoUpdater.setProxy(usable ? p.url : null);
+  } catch (e) {
+    shellLog('warn', `[self-update] 设置代理失败: ${e.message}`);
+  }
+}
+
 // ── 启动流程 ──
 app.whenReady().then(async () => {
   // 1. 读配置（数据目录 %AppData%/wanneng2api）
   const dataDir = path.join(app.getPath('appData'), 'wanneng2api');
   store = new ConfigStore(dataDir);
+  proxy.init(store);
+  proxy.setLogger((m) => shellLog('info', m));
   closeAction = (store.manager.general && store.manager.general.closeAction) || 'tray';
 
   managerLogWriter = new (require('./logs').RotatingFileWriter)(
@@ -381,7 +403,12 @@ app.whenReady().then(async () => {
   // 2. PlatformManager + Updater + Manager API
   manager = new PlatformManager({ store, dataDir, shellRoot: path.resolve(__dirname, '..'), logger });
   updater = new PlatformUpdater({ manager, store, dataDir, logger });
-  api = new ApiServer({ manager, updater, store, openExternal: (u) => shell.openExternal(u) });
+  api = new ApiServer({
+    manager, updater, store,
+    openExternal: (u) => shell.openExternal(u),
+    // 设置保存后（代理可能变了）：壳自更新要重新下发代理
+    onSettingsSaved: () => applyProxyToUpdater(),
+  });
   // 同一个端口托管 UI：主窗口走 http://127.0.0.1:17800/ 而不是 file://
   // （见 loadUiFromManager 的说明），所以这里必须把静态目录挂上。
   const uiInfo = uiIndexHtml();
