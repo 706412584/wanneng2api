@@ -150,6 +150,11 @@ function PluginPlatformCard({ p, busy, onRemove, onChanged }) {
               : <span className="badge gray">未登录</span>}
           </div>
           <div className="meta mono">{p.package.replace('@magpie-community/', '')}</div>
+          {p.installPath && (
+            <div className="meta mono ellipsis" title={`本机安装路径：${p.installPath}`}>
+              {p.installPath}
+            </div>
+          )}
         </div>
       </div>
 
@@ -366,7 +371,9 @@ function PluginMarket({ onInstalled, onRemoved }) {
                     ? <span className="badge green">已安装</span>
                     : <span className="badge gray">{KIND_ZH[p.kind] || p.kind}</span>}
                 </div>
-                <div className="catalog-id mono">magpie 社区</div>
+                <div className="catalog-id mono" title={p.installPath || ''}>
+                  {p.installed ? (p.installPath || '已安装') : 'magpie 社区'}
+                </div>
                 <div className="catalog-desc">{(p.summary && (p.summary.zh || p.summary.en)) || ''}</div>
                 <div className="catalog-foot">
                   <span className="mono" style={{ fontSize: 10.5, color: 'var(--text-3)' }}>

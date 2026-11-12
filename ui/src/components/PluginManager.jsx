@@ -293,6 +293,29 @@ export default function PluginManager({ plugin, onClose, onChanged }) {
     finally { setCheckinBusy('') }
   }
 
+  // 一键签到：逐个账号依次签（内核只有按账号的端点）。结果按后端回报的
+  // 成功/失败数如实提示——部分账号签不了（如 Qoder 需要官方客户端身份）
+  // 不能一句「已完成」盖过去。
+  const checkinAll = async () => {
+    if (working || checkinBusy) return
+    setCheckinBusy('*')
+    try {
+      const current = ++generation.current
+      const result = await request('checkin-all')
+      if (generation.current !== current) return
+      setData(result)
+      setError(null)
+      const info = result.checkinAll
+      if (info?.failed) {
+        toast(`已签到 ${info.succeeded}/${info.count}，${info.failed} 个失败${info.failures?.[0]?.message ? `：${info.failures[0].message}` : ''}`, 'err')
+      } else {
+        toast(info?.count ? `已签到全部 ${info.count} 个账号` : '没有可签到的账号', info?.count ? 'ok' : 'err')
+      }
+      onChanged?.()
+    } catch (e) { setError(e); toast(e.message, 'err') }
+    finally { setCheckinBusy('') }
+  }
+
   const saveModels = async () => {
     const result = await act('正在保存模型选择…', 'models-save', { models: selected })
     if (result) { setModelDraft(null); toast('模型选择已保存') }
@@ -475,6 +498,14 @@ export default function PluginManager({ plugin, onClose, onChanged }) {
                   </article>
                 })}
               </div>
+              {!!data.checkin.accounts.length && (
+                <div className="plugin-manager-save">
+                  <span className="sub">一键签到会依次签该服务的全部账号；个别账号可能因上游限制签不了，结果会如实说明。</span>
+                  <button className="btn primary" disabled={!!checkinBusy || working} onClick={checkinAll}>
+                    {checkinBusy === '*' ? '签到中…' : '一键签到'}
+                  </button>
+                </div>
+              )}
               <p className="sub" style={{ marginTop: 14 }}>签到由内核插件执行，等同于在该服务的官方客户端签到。每日自动签到开关在内核的用量设置里。</p>
             </>}
             {tab === 'options' && <>

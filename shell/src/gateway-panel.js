@@ -46,6 +46,22 @@ function iso(v) {
   return '';
 }
 
+/**
+ * 从网关的错误响应体里取出可读的原因：各家都返回 {"error":"…"}，
+ * 少数写成 {"message":"…"} 或纯文本。取不到就返回空串。
+ */
+function _errorMessage(bodyText) {
+  const raw = text(bodyText).trim();
+  if (!raw) return '';
+  try {
+    const obj = JSON.parse(raw);
+    if (obj && typeof obj === 'object') {
+      return text(obj.error) || text(obj.message) || '';
+    }
+  } catch { /* 非 JSON：按纯文本处理 */ }
+  return raw;
+}
+
 /** 上游错误文本脱敏（与 PluginPanel._redact 同规则） */
 function redact(value) {
   return String(value || '')
@@ -156,7 +172,15 @@ class GatewayPanel {
     const r = await this._http(url, { method, headers, body });
     if (r.status === 401 || r.status === 403) throw new Error('网关管理鉴权失败，请检查其管理密钥配置');
     if (r.status === 404) throw new Error('当前网关版本不支持该管理接口');
-    if (r.status < 200 || r.status >= 300) throw new Error(`网关未能完成该操作（HTTP ${r.status}）`);
+    if (r.status < 200 || r.status >= 300) {
+      // 网关的拒绝理由（如 WorkBuddy 的 409「签到 正在执行中」）是用户唯一能
+      // 据此行动的信息，不能只留一个状态码。正文先脱敏再截断；解析不出来
+      // 或内容过长就退回纯状态码，避免把 HTML/HTML 错误页整段透给前端。
+      const reason = redact(text(_errorMessage(r.text)));
+      throw new Error(reason
+        ? `网关未能完成该操作（HTTP ${r.status}）：${reason}`
+        : `网关未能完成该操作（HTTP ${r.status}）`);
+    }
     if (!r.text || !r.text.trim()) return {};
     try { return JSON.parse(r.text); } catch { throw new Error('网关管理接口返回了不兼容的数据'); }
   }
@@ -211,6 +235,20 @@ class GatewayPanel {
     return key ? { Authorization: `Bearer ${key}` } : {};
   }
 
+  /**
+   * 该网关在本机的安装位置，供界面直接显示（用户要能一眼找到它装在哪）。
+   * workDir 展开 %APPDATA% 等占位符；入口按类型给出可执行文件或模块名。
+   */
+  _installInfo(platform) {
+    const workDir = platform.workDir ? expandPath(platform.workDir) : '';
+    const run = platform.run && typeof platform.run === 'object' ? platform.run : {};
+    const binary = text(run.binary);
+    const module = text(run.module);
+    let entry = binary;
+    if (!entry && module) entry = `python -m ${module}`;
+    return { workDir, entry, type: text(platform.type) };
+  }
+
   // ── 读取：统一视图 ──
 
   async detail(id) {
@@ -219,6 +257,7 @@ class GatewayPanel {
     const base = {
       id, name: text(platform.name) || id, port: platform.port,
       baseUrl: this._origin(platform), capabilities: caps,
+      install: this._installInfo(platform),
     };
     const load = async (fn, fallback) => { try { return await fn(); } catch (e) { return { ...fallback, error: redact(e.message) }; } };
     if (id === 'workbuddy') {
@@ -469,6 +508,13 @@ class GatewayPanel {
         pointsUsed: num(totals.points_used) ?? null,
         tokens: num(totals.tokens) ?? null,
         failures: num(totals.failures) ?? null,
+        // Loomy 面板里的「可用积分 Available」就是 totals.available（每个号跨
+        // 会话取较大值再求和）。UI 的「总积分」格读 credits，不给这一项时
+        // 那个格子只会显示「—」。逐号不再补 credits：账号行已经有「可用」，
+        // 同一个数出现两次反而费解。
+        credits: num(totals.available),
+        // 「冷却中」格：网关只给逐号的 in_cooldown 标志、没有汇总，这里自己数。
+        cooling: accounts.filter((a) => a.inCooldown).length,
       },
       now: num(r.now),
     };
@@ -715,6 +761,20 @@ const ACTIONS = {
       const row = arr(r.results)[0] || {};
       return { ok: row.ok !== false, id: uid, credits: num(row.credits), message: redact(row.message || '') };
     },
+    async 'checkin-all'(platform) {
+      // 空 uid = 内核语义的「全部账号」（admin.go pickTargets）。与逐号签到
+      // 走的是同一端点，只是不给 uid；逐个点一遍对几十个号不现实。
+      const r = await this._json(platform, '/admin/api/checkin', {
+        method: 'POST', headers: this._authHeaders(platform), body: { uid: '' },
+      });
+      const rows = arr(r.results);
+      return {
+        ok: r.ok !== false,
+        count: rows.length,
+        succeeded: rows.filter((x) => x && x.ok !== false).length,
+        message: redact(r.message || ''),
+      };
+    },
   },
 
   loomy: {
@@ -754,6 +814,41 @@ const ACTIONS = {
         ok: r.ok !== false, id: name, already: bool(r.already),
         balance: num(r.current_balance), permanent: num(r.permanent_balance),
         daily: num(r.daily_balance), code: num(r.code), message: redact(r.message || ''),
+      };
+    },
+    async 'checkin-all'(platform) {
+      // Loomy 没有全量签到端点：它的 /api/panel/points/checkin 每次只处理
+      // 一个账号（_pick_account 拿不到 name 时选「首个可用账号」，重复调用
+      // 只会反复签同一个号）。所以这里按账号逐个签，并在壳内并发，
+      // 上限 4，避免几十个号逐个串行把请求拖到超时（实测单号约 0.8s）。
+      const state = await this._json(platform, '/api/panel/state', { headers: this._authHeaders(platform) });
+      const names = arr(state.accounts)
+        .filter((a) => a && typeof a.name === 'string' && a.enabled !== false)
+        .map((a) => a.name);
+      if (!names.length) return { ok: true, count: 0, succeeded: 0, skipped: true, message: '没有已启用的账号' };
+
+      let cursor = 0;
+      const results = [];
+      const worker = async () => {
+        while (cursor < names.length) {
+          const name = names[cursor++];
+          try {
+            const r = await this._json(platform, '/api/panel/points/checkin', {
+              method: 'POST', headers: this._authHeaders(platform), body: { name },
+            });
+            results.push({ name, ok: r.ok !== false, already: bool(r.already) });
+          } catch (e) {
+            results.push({ name, ok: false, message: redact(e.message) });
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(4, names.length) }, worker));
+      const failed = results.filter((r) => !r.ok);
+      const already = results.filter((r) => r.ok && r.already).length;
+      return {
+        ok: failed.length === 0, count: names.length, succeeded: results.length - failed.length,
+        already,
+        message: failed.length ? `${failed.length} 个账号签到失败，请查看日志` : '全部账号已签到',
       };
     },
   },
@@ -806,6 +901,13 @@ const ACTIONS = {
         method: 'POST', headers: this._authHeaders(platform), body: {},
       });
       return { ok: r.ok !== false, id: uid, credits: num(r.credits), message: redact(r.message || '') };
+    },
+    async 'checkin-all'(platform) {
+      // 内核自带全量签到端点（panel.go checkinAll）：异步触发，进度看日志。
+      const r = await this._json(platform, '/panel/api/checkin_all', {
+        method: 'POST', headers: this._authHeaders(platform), body: {},
+      });
+      return { ok: r.ok !== false, started: bool(r.started) || true, message: '已触达全量签到（后台执行，进度见日志）' };
     },
   },
 };

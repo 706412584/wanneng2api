@@ -239,6 +239,12 @@ export default function GatewayManager({ platform, onClose, onChanged }) {
             <div className="plugin-manager-package mono">
               {id} · 127.0.0.1:{data?.port ?? platform.port}
             </div>
+            {(data?.install?.workDir || data?.install?.entry) && (
+              <div className="plugin-manager-package mono" title="本机安装路径">
+                {data.install.workDir || '—'}
+                {data.install.entry ? ` · ${data.install.entry}` : ''}
+              </div>
+            )}
           </div>
           <button className="btn ghost" onClick={leave} disabled={!!busy} aria-label="关闭网关管理">关闭</button>
         </header>
@@ -272,7 +278,9 @@ export default function GatewayManager({ platform, onClose, onChanged }) {
               {tab === 'schedule' && <ScheduleSection data={data} onRun={(task) => act('执行排程', 'checkin', { task })} busy={busy} />}
               {tab === 'checkin' && (
                 <CheckinSection data={data} accounts={accounts} busy={busy} isBusy={isBusy}
-                  checkinDone={checkinDone} onCheckin={accountCheckin} onRunAll={() => act('全量签到', 'checkin')} />
+                  checkinDone={checkinDone} onCheckin={accountCheckin}
+                  onRunAll={() => act('全量签到', 'checkin')}
+                  onCheckinAll={() => act('一键签到', 'checkin-all')} />
               )}
               {tab === 'credits' && <CreditsSection data={data} accounts={accounts} busy={busy} isBusy={isBusy} onExtras={accountExtras} />}
               {tab === 'points' && <PointsSection data={data} />}
@@ -416,9 +424,9 @@ function accountDetail(a) {
 /**
  * 签到分区。
  *  - WorkBuddy：签到是排程任务（一次覆盖所有 global 账号），只提供「立即执行」；
- *  - 其它三家：逐账号签到，按账号显示今日状态。
+ *  - 其它三家：逐账号签到，按账号显示今日状态，并额外提供「一键签到」。
  */
-function CheckinSection({ data, accounts, busy, isBusy, checkinDone, onCheckin, onRunAll }) {
+function CheckinSection({ data, accounts, busy, isBusy, checkinDone, onCheckin, onRunAll, onCheckinAll }) {
   const today = todayCN()
   const isTask = data.id === 'workbuddy'
   const signed = accounts.filter((a) => checkinDone(a)).length
@@ -479,6 +487,17 @@ function CheckinSection({ data, accounts, busy, isBusy, checkinDone, onCheckin, 
           )
         })}
       </div>
+      {/* 一键签到：逐号点一遍对几十个账号不现实。后端按各网关能力实现
+          （CodeArts 一次调用覆盖全部、Lingxi 触发内核全量任务、
+           Loomy 在壳内并发逐号签到）。 */}
+      {!!accounts.length && (
+        <div className="plugin-manager-save">
+          <span className="sub">一键签到会对该网关所有已启用账号执行签到，已在今日签到的账号会被跳过。</span>
+          <button className="btn primary" disabled={!!busy} onClick={onCheckinAll}>
+            {busy === 'checkin-all:' ? '签到中…' : '一键签到'}
+          </button>
+        </div>
+      )}
     </>
   )
 }

@@ -9,6 +9,10 @@ async function main() {
   const pkg = '@test/auth';
   const spec = pkg + '@latest';
   const calls = [];
+  // 桩里的签到状态初值：昨天签过、今天还没。调用 checkin-account 后翻成今天已领，
+  // 用来验证「一键签到」是按签到结果而不是按 HTTP 成功来判定成功。
+  let checkinDay = '2026-11-11';
+  let checkinOutcome = 'claimed';
   const advanced = { fallback: ['other/model'], contexts: { '*': 128000 }, proxy: 'http://secret:password@localhost:8890',
     accountProxies: { alice: 'direct' }, maxConcurrency: 3, maxAccounts: 2, routing: 'balance', affinity: 'window',
     queueLimit: 12, queueWait: 19, maxRPM: 25, priceRate: 2, bestInFamily: true,
@@ -74,7 +78,9 @@ async function main() {
     if (u.pathname === '/api/usage/quotas') return send([
       { provider: 'test', name: '测试插件', user: 'alice', checkins: true, plan: 'Free',
         checkinBy: 'plugin:test', checkinKey: 'test|alice',
-        checkin: { day: '2026-11-11', outcome: 'claimed', credit: '+10', streak: 3 },
+        // 上一次签到是昨天；调用 checkin-account 后置为今天已领（照真实流转）
+        checkin: { day: checkinDay, outcome: checkinOutcome, credit: '+10', streak: 3,
+          msg: checkinOutcome === 'ineligible' ? 'device identity runtime not found' : '' },
         windows: [
           // used 是**百分比**，amount 才是计数（内核 to100 + quotaCount 的口径）
           { name: 'Credits', used: 50, amount: 12, limit: 50, unit: 'credits', display: '12 / 50', resetsAt: '2026-12-01T00:00:00Z' },
@@ -86,7 +92,13 @@ async function main() {
     ]);
     if (u.pathname === '/api/usage/checkin-account') {
       calls.push({ path: 'checkin-account', body });
-      return send({ user: body.key, outcome: 'claimed', credit: '+10' });
+      // 模拟上游两种真实结果：真的签成 → 今天 claimed；
+      // 请求 200 但上游不给（Qoder 缺设备身份）→ 今天仍是 ineligible。
+      if (body.key === 'test|alice' && checkinOutcome !== 'ineligible') {
+        checkinDay = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+        checkinOutcome = 'claimed';
+      }
+      return send({ user: body.key, outcome: checkinOutcome, credit: '+10' });
     }
     if (u.pathname === '/api/plugins') return send({ plugins: [{ spec, version: '1.2.3' }] });
     if (u.pathname === '/api/plugin-signin/prompt') {
@@ -193,6 +205,25 @@ async function main() {
     const checked = await panel.action(pkg, 'test', 'checkin', { key: 'test|alice' });
     assert.equal(checked.checkin.accounts.length, 1);
     assert.deepEqual(calls.find((x) => x.path === 'checkin-account').body, { by: 'plugin:test', key: 'test|alice' });
+    // 一键签到：只签本插件账号（其它 provider 的账号不参与），结果如实回报
+    const beforeBulk = calls.filter((x) => x.path === 'checkin-account').length;
+    const all = await panel.action(pkg, 'test', 'checkin-all', {});
+    const bulk = calls.filter((x) => x.path === 'checkin-account').slice(beforeBulk);
+    assert.deepEqual(bulk.map((x) => x.body.key), ['test|alice']);
+    assert.deepEqual(bulk.map((x) => x.body.by), ['plugin:test']);
+    assert.equal(all.checkinAll.count, 1);
+    assert.equal(all.checkinAll.succeeded, 1);
+    assert.equal(all.checkinAll.failed, 0);
+
+    // 请求 200 但上游根本没给（Qoder 缺设备身份 → ineligible）必须算失败，
+    // 否则一键签到会撒谎说「全部成功」。
+    checkinDay = '2026-11-11';
+    checkinOutcome = 'ineligible';
+    const all2 = await panel.action(pkg, 'test', 'checkin-all', {});
+    assert.equal(all2.checkinAll.succeeded, 0, 'ineligible 不能算签到成功');
+    assert.equal(all2.checkinAll.failed, 1);
+    assert.match(all2.checkinAll.failures[0].message, /device identity runtime not found/);
+    checkinOutcome = 'claimed';
     // 路由组排序：只能重排现有成员，且必须原样回传其它字段
     const routing = new RoutingGroups({ getConfig: () => config });
     const shared = await routing.shared();

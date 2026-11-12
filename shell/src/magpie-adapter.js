@@ -94,6 +94,11 @@ function readJson(file, fallback) {
 const OUR_IDS = ['wanneng-workbuddy', 'wanneng-codearts', 'wanneng-loomy', 'wanneng-lingxi'];
 const OUR_PREFIX = 'wanneng-';
 
+/** 北京时间的「今天」，与前端/网关的签到判定同一口径 */
+function todayCN() {
+  return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
 // magpie 内置订阅 provider 的显示名
 const BUILTIN_NAMES = {
   claude: 'Claude（订阅）',
@@ -357,9 +362,47 @@ async function listPluginCatalog({ force = false } = {}) {
     registryCache = { reg, source, at: Date.now() };
   }
 
-  // 已安装插件（按 package spec 匹配，含 @latest 后缀差异）
-  const installedSpecs = (readJson(path.join(magpieConfigDir(), 'plugins.json'), { plugins: [] }).plugins || [])
-    .map((p) => String(p.spec || '').replace(/@latest$/, ''));
+  // 已安装插件（按 package spec 匹配，含 @latest 后缀差异）。
+  // spec 保持原样：本地路径型插件（如 D:\app\wanneng2api\plugins\prompt-guard）
+  // 的 spec 就是安装位置，去掉 @latest 会破坏它，只对 npm 包名做归一。
+  const installedEntries = (readJson(path.join(magpieConfigDir(), 'plugins.json'), { plugins: [] }).plugins || [])
+    .map((p) => String(p.spec || ''));
+
+  // 本地研发的插件（spec 是本机绝对路径）不在社区 registry 里，按注册表映射
+  // 会整条丢掉、界面上完全看不到。这里把它们补成目录条目，让「已安装插件」
+  // 区能显示，并且能一眼看到它装在哪。
+  // 注意：reg 来自 registryCache，不能在它上面 push（缓存复用会越堆越多），
+  // 所以先复制一份目录再补。
+  const catalog = reg.plugins.slice();
+  const inCatalog = new Set(catalog.map((p) => String(p.package || '')));
+  for (const spec of installedEntries) {
+    if (!path.isAbsolute(spec) || inCatalog.has(spec)) continue;
+    let meta = {};
+    try { meta = JSON.parse(fs.readFileSync(path.join(spec, 'package.json'), 'utf8')); } catch { /* 无 manifest */ }
+    const magpieMeta = (meta.magpie && typeof meta.magpie === 'object') ? meta.magpie : {};
+    const providers = Array.isArray(magpieMeta.providers) ? magpieMeta.providers.map(String) : [];
+    catalog.push({
+      package: spec,
+      name: String(meta.name || path.basename(spec)),
+      // 有 providers 声明才是 provider 型；没有则显式给 kind，否则会被
+      // 当成 provider 平台卡（本地中间件插件没有 provider，不能出现在平台区）。
+      kind: magpieMeta.kind || (providers.length ? 'provider' : (magpieMeta.middleware ? 'middleware' : 'plugin')),
+      providers,
+      community: false,
+      summary: { zh: String(meta.description || '本地插件（从本机目录安装）') },
+    });
+  }
+  const installedSpecs = installedEntries.map((s) => s.replace(/@latest$/, ''));
+  // npm 包实际落盘在 magpie 配置目录的 plugins/node_modules/<name>
+  const modulesDir = path.join(magpieConfigDir(), 'plugins', 'node_modules');
+  const installPathOf = (spec) => {
+    const raw = String(spec || '');
+    if (!raw) return '';
+    if (path.isAbsolute(raw)) return raw;             // 本地路径型：spec 本身即位置
+    const name = raw.replace(/@latest$/, '');
+    if (!/^(@?[\w.-]+\/)?[\w.-]+$/.test(name)) return '';
+    return path.join(modulesDir, ...name.split('/')); // @scope/pkg → scope/pkg
+  };
 
   // 已登录的插件账号：logins.json 里 agent 形如 "plugin:kiro"
   const signedInProviders = new Set(
@@ -369,11 +412,13 @@ async function listPluginCatalog({ force = false } = {}) {
       .map((a) => a.slice('plugin:'.length))
   );
 
-  const plugins = reg.plugins.map((p) => {
+  const plugins = catalog.map((p) => {
     const pkg = String(p.package || '');
     const basePkg = pkg.replace(/@latest$/, '');
     const providers = Array.isArray(p.providers) ? p.providers : [];
     const signed = providers.filter((x) => signedInProviders.has(x));
+    // 命中已安装的那条 spec（优先精确匹配，其次去掉 @latest 后匹配）
+    const matched = installedEntries.find((s) => s === pkg || s.replace(/@latest$/, '') === basePkg);
     return {
       package: pkg,
       name: p.name || pkg,
@@ -386,6 +431,8 @@ async function listPluginCatalog({ force = false } = {}) {
       installed: installedSpecs.some((s) => s === basePkg || s === pkg),
       signedIn: signed.length > 0,
       signedProviders: signed,
+      // 安装位置：仅已安装的才有意义，供界面显示「装在哪」。
+      installPath: matched ? installPathOf(matched) : '',
     };
   });
 
@@ -1412,6 +1459,47 @@ class PluginPanel {
       const account = state.accounts.find((a) => a.key === body.key);
       await this._api('usage/checkin-account', { by: account.by, key: account.key });
       return this.detail(pkg, pid);
+    } else if (action === 'checkin-all') {
+      // 一键签到：把该 provider 所有账号依次签一遍。内核按账号提供
+      // /usage/checkin-account，没有全量端点，所以在这里顺序执行
+      // （插件账号通常个位数，且同一 provider 并发签到容易触发上游风控）。
+      //
+      // 「成功」必须以签到结果为准，不能只看 HTTP 没报错：
+      // 有些账号请求成功但上游根本没给（如 Qoder 需要官方客户端的设备身份，
+      // 返回 ineligible）。只按异常判定会把它们误报成签到成功。
+      if (!row) throw new Error('请先登录该插件');
+      const before = await this._checkin(provider, row);
+      if (!before.supported) throw new Error('该插件没有提供签到功能');
+      if (!before.accounts.length) throw new Error('该插件还没有登录账号');
+      const errors = new Map();
+      for (const account of before.accounts) {
+        try {
+          await this._api('usage/checkin-account', { by: account.by, key: account.key });
+        } catch (e) {
+          errors.set(account.key, this._redact(e.message));
+        }
+      }
+      // 重新读一次状态：签成功的 outcome 会变成 claimed/done
+      const after = await this._checkin(provider, row);
+      const results = after.accounts.map((a) => ({
+        key: a.key,
+        user: a.user,
+        ok: !errors.has(a.key) && a.day === todayCN() && (a.outcome === 'claimed' || a.outcome === 'done') && !a.again,
+        outcome: a.outcome,
+        message: errors.get(a.key) || a.message,
+      }));
+      const failed = results.filter((r) => !r.ok);
+      const detail = await this.detail(pkg, pid);
+      return {
+        ...detail,
+        checkinAll: {
+          count: results.length,
+          succeeded: results.length - failed.length,
+          failed: failed.length,
+          // 失败原因带回去，前端不必再猜
+          failures: failed.slice(0, 5).map((r) => ({ user: r.user, message: r.message })),
+        },
+      };
     } else {
       throw new Error('不支持的插件管理操作');
     }

@@ -35,7 +35,16 @@ async function request(path, { method = 'GET', body, timeout = TIMEOUT_MS } = {}
     if (!res.ok) {
       let detail = ''
       try { detail = await res.text() } catch { /* ignore */ }
-      throw new Error(`HTTP ${res.status}${detail ? `: ${detail.slice(0, 200)}` : ''}`)
+      // 壳的错误体统一是 {"error":"..."}。直接抛出会把 JSON 括号和转义
+      // 一起显示在界面上（还会叠加 own 的状态码，看起来像两个不同的错误），
+      // 所以这里把可读的那条抽出来，其余情况才退回原始片段。
+      let reason = ''
+      try {
+        const parsed = JSON.parse(detail)
+        if (parsed && typeof parsed === 'object') reason = parsed.error || parsed.message || ''
+      } catch { /* 非 JSON */ }
+      const shown = String(reason || detail || '').slice(0, 300)
+      throw new Error(`HTTP ${res.status}${shown ? `: ${shown}` : ''}`)
     }
     if (res.status === 204) return null
     const text = await res.text()

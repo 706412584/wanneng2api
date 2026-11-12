@@ -27,6 +27,12 @@ function makeStub(handlers) {
       return;
     }
     if (out === 'raw:not-json') return res.end('{oops');
+    // handler 返回 { __status, __body } 时按该状态码回错，用来复现网关的 4xx 拒绝。
+    if (out && typeof out === 'object' && out.__status) {
+      res.writeHead(out.__status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(out.__body ?? {}));
+      return;
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(out ?? {}));
   });
@@ -37,6 +43,9 @@ const listen = (server) => new Promise((r) => server.listen(0, '127.0.0.1', () =
 
 async function main() {
   const { GatewayPanel } = require('../src/gateway-panel');
+
+  // WorkBuddy 的排程任务串行执行；置 true 时桩返回 409（模拟任务在跑）
+  let wbBusy = false;
 
   // ── WorkBuddy 桩 ──
   const wb = makeStub({
@@ -67,7 +76,9 @@ async function main() {
     '/__admin/accounts/test': ({ body }) => ({ ok: true, uid: body.uid, model: body.model, latencyMs: 812, status: 200 }),
     '/__admin/accounts/delete': () => ({ ok: true }),
     '/__admin/groups/set': ({ body }) => ({ ok: true, group: body.group }),
-    '/__admin/schedule/run': ({ body }) => ({ ok: true, task: body.task }),
+    '/__admin/schedule/run': ({ body }) => (wbBusy
+      ? { __status: 409, __body: { error: `${body.task} 正在执行中，等它跑完再试` } }
+      : { ok: true, task: body.task }),
   });
   const wbPort = await listen(wb.server);
 
@@ -158,6 +169,7 @@ async function main() {
     '/panel/api/accounts/x1/resume': () => ({ ok: true }),
     '/panel/api/accounts/x1/remove': () => ({ ok: true }),
     '/panel/api/accounts/x1/checkin': () => ({ ok: true, checkin_done: true, checkin_message: '' }),
+    '/panel/api/checkin_all': () => ({ ok: true, started: true }),
     '/panel/api/accounts/x1/balance': () => ({ ok: true, credits: 150 }),
   });
   const lxPort = await listen(lx.server);
@@ -202,6 +214,8 @@ async function main() {
     const c = await panel.detail('codearts');
     assert.equal(c.accounts.accounts.length, 1);
     assert.equal(c.accounts.accounts[0].note, '旧备注');
+    // 详情必须带本机安装路径，界面直接显示「装在哪」
+    assert.equal(c.install.workDir, tmp, '详情要带展开后的安装目录');
     assert.equal(c.accounts.accounts[0].credits, 614.89);
     assert.equal(c.accounts.accounts[0].creditTotal, 900);
     assert.equal(c.accounts.accounts[0].enabled, true);
@@ -218,6 +232,10 @@ async function main() {
     assert.equal(l.accounts.accounts[1].inCooldown, true);
     assert.equal(l.points.dailyQuota, 5000);
     assert.equal(l.points.recent.length, 1);
+    // 「总积分」= 网关口径的「可用积分 Available」；「冷却中」按账号标志汇总。
+    // 曾经两个格子恒为「—」：credits/cooling 这两个键适配层从没产出过。
+    assert.equal(l.accounts.totals.credits, 623741, '总积分应取 totals.available');
+    assert.equal(l.accounts.totals.cooling, 1, '冷却中应数 in_cooldown 的账号');
     const lJS = JSON.stringify(l);
     assert.equal(lJS.includes('SECRET-SESSION-VALUE'), false, 'session 不得外传');
     assert.equal(lJS.includes('abcdefghijklmnopqrstuvwxyz012345'), false, '上游错误必须脱敏');
@@ -273,6 +291,14 @@ async function main() {
     await panel.action('workbuddy', 'checkin', { id: 'u1' });
     assert.deepEqual(wb.calls.filter((c2) => c2.path === '/__admin/schedule/run').at(-1).body, { task: 'checkin' });
 
+    // 网关串行锁：签到在跑时返回 409，理由必须原样带到用户面前
+    // （曾经只透出「HTTP 409」这种无信息量文案，用户无从判断该等还是该改）
+    wbBusy = true;
+    try {
+      await assert.rejects(panel.action('workbuddy', 'checkin', { id: 'u1' }),
+        /HTTP 409.*正在执行中/, '409 的具体理由要透出，不能只剩状态码');
+    } finally { wbBusy = false; }
+
     // 分组名注入拦截
     await assert.rejects(panel.action('workbuddy', 'group-set', { id: 'u1', group: 'a/b' }), /分组名无效/);
     await panel.action('workbuddy', 'group-set', { id: 'u1', group: '可用真号' });
@@ -284,6 +310,11 @@ async function main() {
     assert.deepEqual(ca.calls.filter((c2) => c2.path === '/admin/api/accounts/enable').at(-1).body, { uid: 'c1' });
     const ck = await panel.action('codearts', 'checkin', { id: 'c1' });
     assert.equal(ck.credits, 10);
+    // 一键签到：空 uid 即内核语义的「全部账号」
+    const caAll = await panel.action('codearts', 'checkin-all', {});
+    assert.equal(caAll.ok, true);
+    assert.equal(caAll.count, 1);
+    assert.deepEqual(ca.calls.filter((c2) => c2.path === '/admin/api/checkin').at(-1).body, { uid: '' });
     await assert.rejects(panel.action('codearts', 'account-note', { id: 'c1', note: 'x'.repeat(201) }), /备注过长/);
     await panel.action('codearts', 'account-note', { id: 'c1', note: '新备注' });
     assert.deepEqual(ca.calls.filter((c2) => c2.path === '/admin/api/accounts/note').at(-1).body, { uid: 'c1', note: '新备注' });
@@ -299,6 +330,16 @@ async function main() {
     assert.deepEqual(lo.calls.filter((c2) => c2.path === '/api/panel/accounts/check').at(-1).body,
       { names: ['18586545056'] });
 
+    // 一键签到：Loomy 没有全量端点，壳内对已启用账号并发逐号签
+    const loAllBefore = lo.calls.filter((c2) => c2.path === '/api/panel/points/checkin').length;
+    const loAll = await panel.action('loomy', 'checkin-all', {});
+    const loAllCalls = lo.calls.filter((c2) => c2.path === '/api/panel/points/checkin').slice(loAllBefore);
+    // 桩里有一个账号 enabled:false，一键签到不应把它也算进去
+    assert.deepEqual(loAllCalls.map((c2) => c2.body.name), ['18586545056']);
+    assert.equal(loAll.count, 1);
+    assert.equal(loAll.succeeded, 1);
+    assert.equal(loAll.ok, true);
+
     // ── Lingxi 动作（uid 走 path，必须编码） ──
     await panel.action('lingxi', 'account-toggle', { id: 'x1', enabled: false });
     assert.equal(lx.calls.filter((c2) => c2.path === '/panel/api/accounts/x1/disable').length, 1);
@@ -306,6 +347,10 @@ async function main() {
     assert.equal(lx.calls.filter((c2) => c2.path === '/panel/api/accounts/x1/pause').length, 1);
     const lxCk = await panel.action('lingxi', 'checkin', { id: 'x1' });
     assert.equal(lxCk.done, true);
+    // 一键签到：走内核自带的全量签到端点（异步触发）
+    const lxAll = await panel.action('lingxi', 'checkin-all', {});
+    assert.equal(lxAll.ok, true);
+    assert.equal(lx.calls.filter((c2) => c2.path === '/panel/api/checkin_all').length, 1);
     // 路径注入：uid 在入口就被拒绝，请求根本不会发出
     for (const bad of ['../evil', '..', '.', 'a/b', 'a\\b']) {
       await assert.rejects(panel.action('lingxi', 'account-toggle', { id: bad, enabled: false }),
