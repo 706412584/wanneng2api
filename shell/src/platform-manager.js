@@ -395,19 +395,33 @@ class PlatformManager extends EventEmitter {
   _resolvePython(rt) {
     const run = rt.cfg.run || {};
     const py = run.pythonPath || 'bundled';
+    const isWin = process.platform === 'win32';
+    // POSIX 上的可执行文件名不带 .exe；bundled python 里也通常没有扩展名
+    const exeNames = isWin ? ['python.exe'] : ['python3', 'python'];
     const candidates = [];
     if (py === 'bundled') {
-      // 打包后 resources/python/python.exe；开发期回落系统 python
-      if (process.resourcesPath) candidates.push(path.join(process.resourcesPath, 'python', 'python.exe'));
-      candidates.push(path.join(this.shellRoot, 'resources', 'python', 'python.exe'));
+      // 打包后 resources/python/python(.exe)；开发期回落系统 python
+      for (const name of exeNames) {
+        if (process.resourcesPath) candidates.push(path.join(process.resourcesPath, 'python', name));
+        candidates.push(path.join(this.shellRoot, 'resources', 'python', name));
+      }
     } else {
       candidates.push(py);
     }
     for (const c of candidates) {
       if (fs.existsSync(c)) return c;
     }
-    this.log.warn(`[loomy] 捆绑 python 未找到，回落系统 python（${py}）`);
-    return 'python';
+    // 回落系统解释器：Ubuntu 只提供 python3，没有 python（后者是 python-is-python3
+    // 才装）。写死 'python' 会 spawn ENOENT 且 pid=undefined，把「解释器不存在」
+    // 伪装成「平台启动失败」，排查方向完全跑偏。
+    for (const name of exeNames) {
+      if (whichSync(name)) {
+        this.log.warn(`[python] 未找到捆绑解释器，回落系统 ${name}`);
+        return name;
+      }
+    }
+    this.log.warn(`[python] 未找到任何可用解释器（试过 ${exeNames.join(' / ')}），平台将启动失败`);
+    return exeNames[0];
   }
 
   _buildEnv(rt) {
@@ -758,7 +772,14 @@ class PlatformManager extends EventEmitter {
     proc.stderr.on('data', (d) => { for (const line of d.split(/\r?\n/)) if (line.trim()) rt.appendLog('err', line); });
 
     proc.on('error', (e) => {
+      // spawn 失败（如 ENOENT：解释器/二进制不存在）只走这里，不会触发 exit。
+      // 旧实现只写一行日志，状态仍停在 starting，界面表现为「一直在启动」
+      // 直到 120s 健康检查超时——用户看到的是超时，而不是「文件不存在」。
       rt.appendLog('manager', `process error: ${e.message}`);
+      rt.proc = null;
+      rt.pid = 0;
+      if (rt.healthTimer) { clearInterval(rt.healthTimer); rt.healthTimer = null; }
+      if (rt.status === 'starting') rt.setStatus('error', `进程启动失败: ${e.message}`);
     });
 
     // 4. 意外退出 → 指数退避自动重启

@@ -432,10 +432,26 @@ class ConfigStore {
     return p;
   }
 
-  /** 平台 workDir 绝对路径（展开 %APPDATA% 等） */
+  /**
+ * 平台 workDir 绝对路径（展开 %APPDATA% 等）。
+ *
+ * 跨平台迁移的坑：path.isAbsolute 只看当前平台的规则。
+ * 在 Linux 上 'D:/软件/workbuddy2api' 不是绝对路径（POSIX 只认 '/' 开头），
+ * 于是被当相对路径拼到数据目录后面，变成
+ *   /home/x/.config/wanneng2api/D:/软件/workbuddy2api
+ * 一个根本不存在的路径，平台必然启动失败。
+ *
+ * 所以先识别「另一种平台的绝对路径」：Windows 盘符或 UNC。
+ * 这类路径在 POSIX 上无法直接使用，但至少要原样保留，
+ * 让启动时报「文件不存在: D:/软件/...」——用户一眼就知道是配置指向了
+ * Windows 上的目录，而不是被拼成一个诡异的相对路径。
+ */
   platformWorkDir(p) {
     const expanded = expandPath(p.workDir);
+    if (!expanded) return this.dataDir;
     if (path.isAbsolute(expanded)) return expanded;
+    // Windows 风格绝对路径：盘符（D: / D:\ / D:/）或 UNC（\\server\share）
+    if (/^[A-Za-z]:[\\/]/.test(expanded) || /^\\\\/.test(expanded)) return expanded;
     // 相对路径相对壳子根目录（如 hub 的 ../hub/hub.exe 场景）
     return path.resolve(this.dataDir, expanded);
   }

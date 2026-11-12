@@ -294,8 +294,38 @@ function testCrossPlatformShape() {
   ok('Windows 仍保留 PowerShell 兜底', /Expand-Archive/.test(up));
   ok('Windows 仍用 taskkill /T', /taskkill\.exe/.test(pm));
 
-  const cfg = fs.readFileSync(path.join(__dirname, '..', 'src', 'config.js'), 'utf8');
-  ok('默认可执行名按平台推导', /const EXE = process\.platform === 'win32' \? '\.exe' : ''/.test(cfg));
+  const cfgSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'config.js'), 'utf8');
+  ok('默认可执行名按平台推导', /const EXE = process\.platform === 'win32' \? '\.exe' : ''/.test(cfgSrc));
+
+  // 跨平台迁移：Windows 绝对路径在 POSIX 上不能被当成相对路径拼到数据目录后
+  const { ConfigStore } = require('../src/config');
+  const migDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'w2a-workdir-'));
+  try {
+    fs.writeFileSync(path.join(migDir2, 'manager.json'), '{}');
+    fs.writeFileSync(path.join(migDir2, 'platforms.json'), JSON.stringify({ version: 1, platforms: [] }));
+    const st = new ConfigStore(migDir2);
+    const winPath = st.platformWorkDir({ workDir: 'D:/软件/workbuddy2api' });
+    ok('Windows 盘符路径在 POSIX 上保持原样',
+      process.platform === 'win32' ? path.isAbsolute(winPath) : winPath === 'D:/软件/workbuddy2api',
+      `got ${winPath}`);
+    const uncPath = st.platformWorkDir({ workDir: '\\\\server\\share\\x' });
+    ok('UNC 路径不被拼成相对路径',
+      process.platform === 'win32' || uncPath === '\\\\server\\share\\x', `got ${uncPath}`);
+    const relPath = st.platformWorkDir({ workDir: '../hub' });
+    ok('真正的相对路径仍相对数据目录解析',
+      path.resolve(relPath) === path.resolve(migDir2, '../hub'), `got ${relPath}`);
+  } finally {
+    fs.rmSync(migDir2, { recursive: true, force: true });
+  }
+
+  // Python 解析：POSIX 上没有 python.exe，且 Ubuntu 只有 python3
+  const pmSrc2 = fs.readFileSync(path.join(__dirname, '..', 'src', 'platform-manager.js'), 'utf8');
+  ok('Python 解析按平台取名（python3/python）',
+    /isWin \? \['python\.exe'\] : \['python3', 'python'\]/.test(pmSrc2));
+  ok('Python 回落前检查是否真的存在',
+    /whichSync\(name\)/.test(pmSrc2));
+  ok('spawn error 会把状态置为 error',
+    /rt\.status === 'starting'\) rt\.setStatus\('error'/.test(pmSrc2));
   const { defaultPlatforms } = require('../src/config');
   const wb = defaultPlatforms().platforms.find((p) => p.id === 'workbuddy');
   ok('Windows 下默认名带 .exe', process.platform !== 'win32' || wb.run.binary === 'wb2api.exe',
