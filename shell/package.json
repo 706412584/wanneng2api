@@ -1,6 +1,6 @@
 {
   "name": "wanneng2api-shell",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Wanneng2API desktop shell: process supervision, platform management, remote updates, tray/autostart",
   "main": "src/main.js",
   "private": true,
