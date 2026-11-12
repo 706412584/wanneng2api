@@ -366,6 +366,8 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
   color: var(--orange);
 }
 .alert-bar.red { background: color-mix(in srgb, var(--red) 8%, var(--card)); border-color: color-mix(in srgb, var(--red) 35%, transparent); color: var(--red); }
+/* 中性提示（如「下载失败但原版本未受影响」）：不该用红色吓人 */
+.alert-bar.muted { background: var(--card); border-color: var(--border); color: var(--text-2); }
 
 /* ===== 空态/加载/错误态 ===== */
 .empty {

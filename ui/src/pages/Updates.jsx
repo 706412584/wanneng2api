@@ -89,10 +89,17 @@ export default function Updates() {
     }
   }
 
-  // 更新失败告警：监控 state=error 且 lastError 含「更新」或「回滚」
+  // 更新失败告警：监控 state=error 且 lastError 含「更新」或「回滚」。
+  // 后端会把结局写进 lastError，据此区分三种情况，绝不能一律说「已自动回滚」：
+  //   已回滚      → 恢复旧版成功，平台正常
+  //   未受影响    → 下载/校验阶段就失败，机器上什么都没改（下载失败是常态）
+  //   其余        → 回滚也失败，确实要人工介入
   useEffect(() => {
     const failed = platforms.find((p) => ['error', 'unhealthy'].includes(p.state) && p.lastError && /更新|回滚/.test(p.lastError))
-    if (failed) setRollbackAlert({ id: failed.id, name: failed.name, msg: failed.lastError, at: Date.now() })
+    if (!failed) return
+    const msg = failed.lastError
+    const kind = /回滚失败/.test(msg) ? 'danger' : (/回滚/.test(msg) ? 'rolled-back' : 'harmless')
+    setRollbackAlert({ id: failed.id, name: failed.name, msg, kind, at: Date.now() })
   }, [platforms.map((p) => `${p.id}:${p.state}:${p.lastError}`).join('|')])
 
   if (sum.loading && !sum.data) return <Loading text="加载版本信息…" />
@@ -101,10 +108,13 @@ export default function Updates() {
   return (
     <>
       {rollbackAlert && (
-        <div className="alert-bar red">
-          <span>⚠</span>
+        <div className={`alert-bar ${rollbackAlert.kind === 'danger' ? 'red' : 'muted'}`}>
+          <span>{rollbackAlert.kind === 'danger' ? '⚠' : 'ℹ'}</span>
           <span style={{ flex: 1 }}>
-            <b>{rollbackAlert.name}</b>：{rollbackAlert.msg} —— 已自动回滚到旧版本，请检查更新包或稍后重试。
+            <b>{rollbackAlert.name}</b>：{rollbackAlert.msg}
+            {rollbackAlert.kind === 'rolled-back' && ' —— 已自动回滚到旧版本，平台已恢复正常。'}
+            {rollbackAlert.kind === 'harmless' && ' —— 原有版本未受影响，平台仍可正常使用。'}
+            {rollbackAlert.kind === 'danger' && ' —— 请人工检查备份目录。'}
           </span>
           <button className="btn sm" onClick={() => setRollbackAlert(null)}>知道了</button>
         </div>

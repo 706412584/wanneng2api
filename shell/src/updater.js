@@ -213,6 +213,18 @@ class PlatformUpdater {
   }
 
   // ── §7.2 / §7.3 应用 ──
+
+  /**
+   * 下发更新，**立即返回**，真正的下载/替换/重启在后台跑。
+   *
+   * 为什么必须异步：整个过程要下载几十 MB、校验、停服、备份、替换、
+   * 重启并等最长 60s 健康验证，动辄几分钟。过去这里是同步 await，
+   * 浏览器的 fetch 会在默认 8s 超时后 abort，用户看到的是
+   * 「更新下发失败：signal is aborted without reason」——而更新其实
+   * 还在后台跑着。真实进度与失败由前端轮询平台 state=updating / error
+   * 与 lastError 呈现（Updates.jsx 的回滚告警条就是这么读的）。
+   * 唯一会同步抛出的错误保留在参数校验阶段（未知平台/已在更新/无可用更新）。
+   */
   async apply(id, checkInfo) {
     const p = this.store.getPlatform(id);
     if (!p) throw new Error(`未知平台: ${id}`);
@@ -221,18 +233,57 @@ class PlatformUpdater {
     if (!rt) throw new Error(`未知平台: ${id}`);
     if (rt.status === 'updating') throw new Error('平台已在更新流程中');
 
-    const info = checkInfo || await this.check(id);
-    if (!info.checked || !info.hasUpdate || !info.assetUrl) {
-      throw new Error(`无可用更新（current=${info.current}, latest=${info.latest}）`);
-    }
+    // 占位登记要同步做：前端下发后会立刻开始高频轮询，
+    // 若在这个空档里再点一次「立即更新」，busy 还没置位就会重复下发。
+    this.busy.add(id);
+    this._backgroundApply(id, p, rt, checkInfo).catch((e) => {
+      this.log.error(`[update:${id}] 后台更新异常: ${e.message}`);
+    }).finally(() => { this.busy.delete(id); });
+    return { id, started: true, message: '已开始下载并安装，可在下方观察状态' };
+  }
 
+  /**
+   * 后台：先确定目标版本，再执行安装。
+   *
+   * 连 check 也放后台：GitHub API 单次超时 15s，本身就超过浏览器的
+   * 默认 8s fetch 超时，留在同步段会再次触发同一类 abort。
+   */
+  async _backgroundApply(id, p, rt, checkInfo) {
+    let info;
+    try {
+      info = checkInfo || await this.check(id);
+    } catch (e) {
+      rt.appendLog('manager', `[update] 检查更新失败: ${e.message}`);
+      rt.setStatus(rt.proc ? 'healthy' : 'stopped', `检查更新失败：${e.message}`);
+      this.manager.emit('update-alert', { id, message: e.message, rolledBack: false, harmless: true });
+      return;
+    }
+    if (!info.checked || !info.hasUpdate || !info.assetUrl) {
+      const msg = `无可用更新（current=${info.current}, latest=${info.latest}）`;
+      rt.appendLog('manager', `[update] ${msg}`);
+      rt.setStatus(rt.proc ? 'healthy' : 'stopped', msg);
+      this.manager.emit('update-alert', { id, message: msg, rolledBack: false, harmless: true });
+      return;
+    }
+    return this._runApply(p, rt, info);
+  }
+
+  /** 后台更新流程（原 apply 主体，不再向外抛错——失败通过状态与告警呈现） */
+  async _runApply(p, rt, info) {
+    const id = p.id;
     const strategy = (p.updater && p.updater.strategy) || 'replace-binary';
     const updDir = path.join(this.updatesDir(id), String(info.latest).replace(/[^\w.-]/g, '_'));
     fs.mkdirSync(updDir, { recursive: true });
     const marker = path.join(this.updatesDir(id), '.updating');
 
-    this.busy.add(id);
+    // 文件是否已被改动过：只有替换/安装这一步跑过，才存在「需要回滚」的
+    // 状态。下载阶段就失败（GitHub 连不上是常态）时机器上什么都没变，
+    // 旧代码却一律报「回滚失败，请人工检查 backups」——用户看到平台明明
+    // 跑得好好的却被标成错误。
+    let replaced = false;
+    let platformStopped = false;
     const setStatus = (s, err) => { rt.setStatus(s, err || ''); this.manager.emit('update-progress', { id, status: s }); };
+
     try {
       // 1. 下载（.part 防半包）
       setStatus('updating', '');
@@ -252,13 +303,18 @@ class PlatformUpdater {
       }));
 
       // 3. stop 平台
-      if (rt.proc) await this.manager.stop(id);
+      if (rt.proc) { await this.manager.stop(id); platformStopped = true; }
 
       // 4. 备份
       const backupDir = path.join(this.updatesDir(id), 'backups', String(Date.now()));
       fs.mkdirSync(backupDir, { recursive: true });
       const manifest = { id, version: info.latest, strategy, backupDir };
 
+      // 替换前就把 manifest 落盘，并把 replaced 提前置位：替换过程本身
+      // 可能写到一半失败（旧文件已被截断），这种也算「已改动」必须回滚。
+      // 只有「还没走到替换」的失败（下载/校验）才是无需回滚的。
+      fs.writeFileSync(marker, JSON.stringify(manifest));
+      replaced = true;
       let installed;
       if (strategy === 'replace-binary') {
         installed = await this._replaceBinary(p, dlPath, backupDir);
@@ -268,7 +324,6 @@ class PlatformUpdater {
       manifest.binaryPath = installed.binaryPath || '';
       fs.writeFileSync(marker, JSON.stringify(manifest));
 
-      // 5. start + 60s 健康验证
       // 5. 重启 + 健康验证。
       // 已禁用的平台不能在更新后启动（start() 会拒绝 enabled=false），
       // 但那不是更新失败：文件已经装好了，只是用户没打算让它跑。
@@ -284,6 +339,7 @@ class PlatformUpdater {
         rt.appendLog('manager', `[update] 安装完成，重启验证（≤${HEALTH_VERIFY_SEC}s）`);
         try {
           await this.manager.start(id);
+          platformStopped = false;
         } catch (e) {
           throw new Error(`更新后启动失败: ${e.message}`);
         }
@@ -306,8 +362,25 @@ class PlatformUpdater {
         message: disabled ? `已更新到 ${info.latest}；平台处于禁用状态，启用后生效` : undefined,
       };
     } catch (e) {
-      // 7. 失败 → 回滚
+      // 7. 失败：只有真的改动过文件才需要回滚
+      const upstream = /ETIMEDOUT|ENOTFOUND|ECONNREFUSED|ECONNRESET|EAI_AGAIN|socket hang up|certificate/i.test(e.message);
       let rolledBack = false;
+      if (!replaced) {
+        // 没动过文件：无需回滚。平台若被停过（不太可能，下载失败在停服之前）
+        // 就恢复运行，否则保持原状。
+        rt.appendLog('manager', `[update] 失败于安装前（未改动任何文件）: ${e.message}`);
+        try {
+          if (platformStopped) { await this.manager.start(id); platformStopped = false; }
+        } catch (_e) { /* 保持现状 */ }
+        const hint = upstream ? '（无法连接 GitHub，请检查网络或代理）' : '';
+        // 不能标 error：平台本身好好的、旧版本照常跑，标 error 会让平台卡
+        // 显示「错误」并禁用启停。状态按实际进程给，原因写进 lastError，
+        // 平台卡会把它显示成一行说明，更新中心据此给出中性提示。
+        rt.setStatus(rt.proc ? 'healthy' : 'stopped',
+          `更新下载失败${hint}：${e.message}。原有版本未受影响，仍可正常使用。`);
+        this.manager.emit('update-alert', { id, message: e.message, rolledBack: false, harmless: true });
+        return { id, ok: false, error: e.message, rolledBack: false, untouched: true };
+      }
       rt.appendLog('manager', `[update] 失败: ${e.message}，尝试回滚`);
       try {
         const raw = fs.existsSync(marker) ? fs.readFileSync(marker, 'utf8') : '';
@@ -328,11 +401,16 @@ class PlatformUpdater {
         rt.appendLog('manager', `[update] 回滚也失败: ${re.message}`);
       }
       try { fs.unlinkSync(marker); } catch (_e) { /* ignore */ }
-      rt.setStatus('error', `更新失败${rolledBack ? '已回滚' : '（回滚失败，请人工检查 backups）'}: ${e.message}`);
-      this.manager.emit('update-alert', { id, message: e.message, rolledBack });
+      if (rolledBack) {
+        // 已回滚：平台已恢复到旧版本且能跑，不该再标成 error 让人以为坏了
+        rt.setStatus('healthy', `更新失败已回滚: ${e.message}`);
+        rt.appendLog('manager', `[update] 已回滚到旧版本，平台恢复正常`);
+        this.manager.emit('update-alert', { id, message: e.message, rolledBack: true });
+      } else {
+        rt.setStatus('error', `更新失败（回滚失败，请人工检查 backups）: ${e.message}`);
+        this.manager.emit('update-alert', { id, message: e.message, rolledBack: false });
+      }
       return { id, ok: false, error: e.message, rolledBack };
-    } finally {
-      this.busy.delete(id);
     }
   }
 
@@ -533,7 +611,10 @@ class PlatformUpdater {
     return false;
   }
 
-  async _download(url, destPart) {
+  async _download(url, destPart, hop = 0) {
+    // GitHub 的资源地址会 302 到 objects.githubusercontent.com，正常一跳；
+    // 给个上限避免被错误配置的代理/异常跳转拖成无限递归。
+    if (hop > 5) throw new Error('下载重定向次数过多');
     return new Promise((resolve, reject) => {
       const mod = url.startsWith('https:') ? https : http;
       const req = mod.get(url, {
@@ -541,14 +622,20 @@ class PlatformUpdater {
         timeout: 300000,
       }, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          this._download(res.headers.location, destPart).then(resolve, reject);
+          res.resume();
+          this._download(res.headers.location, destPart, hop + 1).then(resolve, reject);
           return;
         }
         if (res.statusCode !== 200) { res.resume(); return reject(new Error(`下载失败 HTTP ${res.statusCode}`)); }
         const out = fs.createWriteStream(destPart);
+        // 响应流中途出错（连接被打断）必须落到 reject：只监听 out 的 error
+        // 不够，res 的 error 没有 handler 会变成未捕获异常，把整个壳带崩。
+        const fail = (e) => { out.destroy(); reject(e); };
+        res.on('error', fail);
+        res.on('aborted', () => fail(new Error('下载连接被中断')));
+        out.on('error', fail);
         res.pipe(out);
         out.on('finish', () => out.close(() => resolve(destPart)));
-        out.on('error', reject);
       });
       req.on('timeout', () => { req.destroy(); reject(new Error('下载超时')); });
       req.on('error', reject);

@@ -180,7 +180,10 @@ async function main() {
   const uc = await req('POST', '/api/platforms/mocka/update/check');
   ok('update/check 200 且 checked=false（无 repo）', uc.status === 200 && uc.json.checked === false);
   const ua = await req('POST', '/api/platforms/mocka/update/apply');
-  ok('update/apply 400（无更新可用）', ua.status === 400, `got ${ua.status}`);
+  // apply 现在「下发即返回」：无可用更新属于后台流程的结局，不再同步 400。
+  // 同步段只做校验（未知平台/已在更新中），保证前端不会因长任务被 abort。
+  ok('update/apply 200 且 started=true（下发即返回）', ua.status === 200 && ua.json.started === true,
+    `got ${ua.status} ${JSON.stringify(ua.json)}`);
 
   // ── open-panel ──
   console.log('\n[open-panel]');

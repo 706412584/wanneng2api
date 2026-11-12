@@ -244,8 +244,8 @@ async function testDisabledPlatformUpdateSucceeds() {
       manager: { update: {} },
     };
     const rt = {
-      cfg: p, status: 'stopped', proc: null, version: undefined,
-      setStatus(s) { this.status = s; },
+      cfg: p, status: 'stopped', proc: null, version: undefined, lastError: '',
+      setStatus(s, err = '') { this.status = s; if (err) this.lastError = err; },
       appendLog() {},
     };
     const manager = {
@@ -258,16 +258,54 @@ async function testDisabledPlatformUpdateSucceeds() {
     const upd = new PlatformUpdater({ manager, store, dataDir: root, logger: { info(){}, warn(){}, error(){} } });
     // 绕过网络：直接给 checkInfo，并伪造下载
     upd._download = async (_url, dest) => { fs.writeFileSync(dest, 'NEW'); return dest; };
-    upd._replaceBinary = async () => ({ binaryPath: path.join(workDir, 'app.exe') });
+    upd._replaceBinary = async () => {
+      fs.writeFileSync(path.join(workDir, 'app.exe'), 'NEW');   // 模拟真实替换
+      return { binaryPath: path.join(workDir, 'app.exe') };
+    };
     upd.manager = manager;
 
     const r = await upd.apply('mockdisabled', {
       checked: true, hasUpdate: true, assetUrl: 'https://example.invalid/app.exe',
       latest: '9.9.9', current: '1.0.0',
     });
-    ok('禁用平台的更新返回成功', r.ok === true, JSON.stringify(r));
-    ok('禁用平台更新标记 disabled=true', r.disabled === true);
-    ok('禁用平台更新后状态为 stopped（不谎报 healthy）', rt.status === 'stopped', `got ${rt.status}`);
+    // apply 现在是「下发即返回」：同步只做校验与占位，真实流程（含确定
+    // 目标版本）都在后台跑，所以同步返回里没有 version。
+    ok('apply 立即返回 started=true', r.started === true, JSON.stringify(r));
+    ok('apply 同步返回不含 version（目标版本由后台确定）', r.version === undefined);
+    // 等后台流程跑完（禁用平台跳过启动验证，很快）
+    for (let i = 0; i < 50 && upd.busy.has('mockdisabled'); i++) {
+      await new Promise((res) => setTimeout(res, 20));
+    }
+    ok('后台流程结束后 busy 释放', !upd.busy.has('mockdisabled'));
+    ok('禁用平台下载替换后停在 stopped（不谎报 healthy）', rt.status === 'stopped', `got ${rt.status}`);
+    ok('更新后的二进制确实被替换', fs.readFileSync(path.join(workDir, 'app.exe'), 'utf8') === 'NEW');
+
+    // ── 下载失败（GitHub 不可达）：不必回滚，更不能谎报「回滚失败」 ──
+    const rt2 = {
+      cfg: { ...p, enabled: true }, status: 'healthy', proc: { pid: 1 }, version: '1.0.0', lastError: '',
+      setStatus(s, err = '') { this.status = s; if (err) this.lastError = err; },
+      appendLog() {},
+    };
+    const manager2 = {
+      start: async () => { rt2.status = 'healthy'; },
+      stop: async () => {},
+      getRuntime: () => rt2,
+      emit: () => {},
+    };
+    const upd2 = new PlatformUpdater({ manager: manager2, store, dataDir: root, logger: { info(){}, warn(){}, error(){} } });
+    upd2._download = async () => { throw new Error('connect ETIMEDOUT 20.205.243.166:443'); };
+    const before = fs.readFileSync(path.join(workDir, 'app.exe'), 'utf8');
+    await upd2.apply('mockdisabled', {
+      checked: true, hasUpdate: true, assetUrl: 'https://example.invalid/app.exe',
+      latest: '9.9.9', current: '1.0.0',
+    });
+    for (let i = 0; i < 50 && upd2.busy.has('mockdisabled'); i++) {
+      await new Promise((res) => setTimeout(res, 20));
+    }
+    ok('下载失败后二进制未被改动', fs.readFileSync(path.join(workDir, 'app.exe'), 'utf8') === before);
+    ok('下载失败不谎报「回滚失败」', !/回滚失败/.test(rt2.lastError), rt2.lastError);
+    ok('下载失败提示是网络/代理', /网络|代理/.test(rt2.lastError), rt2.lastError);
+    ok('下载失败不把平台标成 error', rt2.status !== 'error', `got ${rt2.status}`);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
