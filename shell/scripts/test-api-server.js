@@ -111,7 +111,7 @@ async function main() {
   const selfUpdate = {
     check: async () => {
       selfUpdateCalls += 1;
-      return { supported: true, current: '0.1.8', latest: '0.1.8', hasUpdate: false,
+      return { supported: true, current: '0.1.9', latest: '0.1.9', hasUpdate: false,
         releaseUrl: 'https://github.com/706412584/wanneng2api/releases' };
     },
   };
