@@ -245,7 +245,7 @@ OpenAI 协议（`/v1/messages` 明确留给未来实现，当前 404）。由 ma
       "port": 17990,
       "health": { "url": "http://127.0.0.1:17990/health", "intervalSec": 15, "timeoutSec": 3, "failThreshold": 3, "okThreshold": 1 },
       "adminPanel": "http://127.0.0.1:17990/panel",
-      "updater": { "repo": "Patrick130306/loomy2api", "assetPattern": ".*\\.zip$", "strategy": "replace-dir" },
+      "updater": { "repo": "706412584/loomy2api", "assetPattern": ".*\\.zip$", "strategy": "replace-dir" },
       "restart": { "baseBackoffSec": 2, "maxBackoffSec": 300, "maxRetries": 0 }
     },
     {

@@ -185,7 +185,9 @@ function defaultPlatforms() {
         },
         adminPanel: 'http://127.0.0.1:17990/panel',
         updater: {
-          repo: 'Patrick130306/loomy2api',
+          // 指向本仓库自己的分支（已公开）。上游那份没有我们需要的改动，
+          // 版本号也对不上，更新会装回错的代码。
+          repo: '706412584/loomy2api',
           assetPattern: '.*\\.zip$',
           strategy: 'replace-dir',
           preserveGlobs: ['config.json', 'accounts.json', 'accounts.json.bak*', 'auths/**', 'data/**', 'logs/**'],
