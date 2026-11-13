@@ -981,10 +981,25 @@ class RoutingGroups {
   /**
    * 列出可绑定的平台：每个 provider 的 id/名称/是否启用/模型数。
    * 只给「已安装的 provider」，不做成通用 provider 编辑器。
+   *
+   * 模型列表不是白拿的：magpie 只有在**拉取过**之后才知道 provider 提供哪些模型。
+   * 我们接入的四家里，只有 lingxi 的 providers.json 里写死了 models 列表，
+   * 其余三家的 chosen 为空 → models 为空数组 → 界面显示「没有已启用的模型」，
+   * 于是「同模型优先级」里根本选不出这几个平台。
+   * 所以这里对「就绪、但一个模型都没有」的 provider 先触发一次拉取再读。
    */
   async bindable() {
-    const data = await this.panel._api('providers');
-    const rows = Array.isArray(data?.providers) ? data.providers : [];
+    let data = await this.panel._api('providers');
+    let rows = Array.isArray(data?.providers) ? data.providers : [];
+    const needsFetch = rows.filter((p) => p && typeof p.id === 'string' && !p.account?.builtin
+      && !p.off && p.ready && !(Array.isArray(p.models) && p.models.length));
+    if (needsFetch.length) {
+      // 并发拉取：这些是本机网关，一次往返很快；串行会让打开面板明显变卡
+      await Promise.all(needsFetch.map((p) =>
+        this.panel._api('provider/models', { id: p.id }).catch(() => null)));
+      data = await this.panel._api('providers');
+      rows = Array.isArray(data?.providers) ? data.providers : [];
+    }
     return rows.filter((p) => p && typeof p.id === 'string' && !p.account?.builtin)
       .map((p) => ({
         id: p.id,

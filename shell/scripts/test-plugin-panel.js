@@ -31,7 +31,12 @@ async function main() {
     // 绑定测试用的平台：一个正常、一个模型全关、一个空
     { id: 'p1', name: '平台一', key: { set: true }, models: [{ id: 'chat', on: true }], chosen: ['chat'] },
     { id: 'p2', name: '平台二', key: { set: true }, models: [{ id: 'chat', on: true }, { id: 'offmodel', on: false }] },
-    { id: 'empty', name: '空平台', key: { set: true }, models: [] }] };
+    { id: 'empty', name: '空平台', key: { set: true }, models: [] },
+    // 就绪但没拉过模型的平台：magpie 只有在 provider/models 之后才知道它有哪些
+    // 模型。真实事故：四家里只有 lingxi 的 providers.json 写死了 models，其余
+    // 三家的 chosen 为空 → 界面显示「没有已启用的模型」，同模型优先级里根本选不出。
+    { id: 'unfetched', name: '未拉取平台', key: { set: true }, ready: true, off: false,
+      models: [], chosen: [], exposed: 0 }] };
   let mode = 'ok';
   let failSave = false;
   const stub = http.createServer(async (req, res) => {
@@ -55,6 +60,17 @@ async function main() {
     if (mode === 'bad') return res.end('not-json');
     if (mode === 'timeout') return;
     if (u.pathname === '/api/providers') return send(state);
+    if (u.pathname === '/api/provider/models') {
+      calls.push({ path: 'provider-models', body });
+      // 拉取后模型才出现（照真实行为）
+      const row = (state.providers || []).find((p) => p.id === body.id);
+      if (row) {
+        row.models = [{ id: 'fetched', on: true, name: '拉到的模型' }];
+        row.chosen = ['fetched'];
+        row.exposed = 1;
+      }
+      return send({ count: row ? row.models.length : 0, provider: row || null });
+    }
     if (u.pathname === '/api/groups') {
       if (!state.groups) return send({ groups: [] });
       return send({ groups: state.groups });
@@ -246,11 +262,18 @@ async function main() {
 
     // Hub 绑定：只允许已安装 provider，成员由后台展开，不能由前端塞任意 id
     const bindable = await routing.bindable();
-    // test/other/p1/p2/empty 都是已安装 provider（test 与 other 也参与）
-    assert.equal(bindable.length, 5);
+    // test/other/p1/p2/empty/unfetched 都是已安装 provider（test 与 other 也参与）
+    assert.equal(bindable.length, 6);
     assert.ok(bindable.some((b) => b.id === 'p1'));
     assert.ok(bindable.some((b) => b.id === 'p2'));
     assert.equal(bindable.find((b) => b.id === 'p2').models.length, 1); // 只列已启用模型
+    // 就绪但没拉过模型的平台必须自动拉一次，否则界面永远显示「没有已启用的模型」，
+    // 「同模型优先级」里就选不出这些平台（真实事故：四家只显示 lingxi）。
+    assert.ok(calls.some((x) => x.path === 'provider-models' && x.body.id === 'unfetched'),
+      '未拉取模型的就绪平台应被自动拉取一次');
+    assert.deepEqual(bindable.find((b) => b.id === 'unfetched').models.map((m) => m.id), ['fetched']);
+    // 已经有关闭模型的平台不该被重复拉取（避免每次开面板都多打一轮）
+    assert.equal(calls.filter((x) => x.path === 'provider-models' && x.body.id === 'p2').length, 0);
     const bound = await routing.bind({ name: '我的入口', providers: ['p1', 'p2'] });
     assert.deepEqual(bound.members, ['p1/chat', 'p2/chat']);
     const bindBody = calls.filter((x) => x.path === 'groups-save').at(-1).body;
