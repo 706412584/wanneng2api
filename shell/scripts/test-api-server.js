@@ -256,6 +256,10 @@ async function main() {
   // 关键：能收到 HTTP 状态码 = 代理隧道是通的，403 是目标侧回绝（GitHub 限额），
   // 不能判成「代理不可用」——否则用户会去换代理，而问题在限流。
   ok('usable 按「是否收到响应」而非状态码判定', dead.json.usable === false);
+  // 直连侧要用同一个标准：有响应≠通。这里直连若返回 403 也是限流，
+  // 绝不能写成「直连正常——这台机器不需要代理」。
+  ok('直连侧不把 403 当「正常」', !/直连正常/.test(dead.json.verdict)
+    || (dead.json.direct.status < 400), dead.json.verdict);
 
   // ── updates/summary ──
   console.log('\n[updates/summary]');

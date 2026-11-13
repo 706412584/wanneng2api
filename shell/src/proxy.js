@@ -160,20 +160,30 @@ async function verify(url, { target = 'https://api.github.com/', timeoutMs = 800
   result.summary = { viaProxy: viaDesc(result.viaProxy), direct: directDesc(result.direct) };
 
   if (!reached(result.viaProxy)) {
-    result.verdict = reached(result.direct)
-      ? `代理连不上（${result.viaProxy.error}），但直连正常——这台机器不需要代理`
-      : `代理连不上（${result.viaProxy.error}），直连也不通——先检查本机网络`;
+    // 直连侧要用同一个标准：有响应 ≠ 通。否则会出现「代理连不上，但直连正常」
+    // 而直连其实是 403（限流）——把人引向「这台机器不需要代理」的错误结论。
+    const viaErr = result.viaProxy.error || '连不上';
+    const directOk = reached(result.direct) && result.direct.status < 400;
+    const directReached = reached(result.direct);
+    if (directOk) {
+      result.verdict = `代理连不上（${viaErr}），但直连可用——这台机器不需要代理`;
+    } else if (directReached) {
+      result.verdict = `代理连不上（${viaErr}）；直连能到目标但返回 HTTP ${result.direct.status}`
+        + (result.direct.status === 403 ? '（GitHub 未登录限流，不是代理问题）' : '');
+    } else {
+      result.verdict = `代理连不上（${viaErr}），直连也不通——先检查本机网络`;
+    }
   } else if (result.viaProxy.status === 403) {
     // 走到了 GitHub，只是被限额/拒绝。这是「代理可用」而不是「代理不可用」
     result.verdict = '代理可用（已连到 GitHub）；403 是 GitHub 的未登录限流（60 次/小时），在「更新」里填 GitHub Token 可提升到 5000 次';
   } else if (result.viaProxy.status >= 400) {
     result.verdict = `代理可用（已连到目标）；目标返回 HTTP ${result.viaProxy.status}`;
   } else {
-    result.verdict = reached(result.direct)
+    result.verdict = (reached(result.direct) && result.direct.status < 400)
       ? '代理可用（直连也通，可比延迟取舍）'
-      : '代理可用（直连不通，走代理解决了问题）';
+      : '代理可用（直连到不了目标，走代理解决了问题）';
   }
-  // ok 仍表示「代理完全可用且目标正常应答」，供脚本一键判断；usable 表示「代理本身通」
+  // ok = 代理通且目标正常应答（<400）；usable = 代理隧道本身通（供配色/主结论）
   return { ok: result.usable && result.viaProxy.status < 400, ...result };
 }
 
