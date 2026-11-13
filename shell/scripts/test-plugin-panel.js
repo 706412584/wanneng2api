@@ -276,6 +276,16 @@ async function main() {
     assert.equal(calls.filter((x) => x.path === 'provider-models' && x.body.id === 'p2').length, 0);
     const bound = await routing.bind({ name: '我的入口', providers: ['p1', 'p2'] });
     assert.deepEqual(bound.members, ['p1/chat', 'p2/chat']);
+    // 中文名必须能建：内核按 name 派生 id 且要求小写字母/数字/点/横线，
+    // 纯中文派生出的空 id 会被 400 拒绝（用户只是起了个中文名而已）。
+    // 所以绑定必须显式给出合法 id。
+    const zhBody = calls.filter((x) => x.path === 'groups-save').at(-1).body;
+    assert.equal(zhBody.name, '我的入口');
+    assert.match(zhBody.id || '', /^[a-z0-9.\-]+$/, `中文名必须派生出合法 id，实际 ${JSON.stringify(zhBody.id)}`);
+    // 同一个中文名每次得到同一个 id（重建=替换，不会无限堆积）
+    const again = await routing.bind({ name: '我的入口', providers: ['p1'] });
+    assert.equal(calls.filter((x) => x.path === 'groups-save').at(-1).body.id, zhBody.id);
+    assert.equal(again.id, zhBody.id);
     const bindBody = calls.filter((x) => x.path === 'groups-save').at(-1).body;
     assert.equal(bindBody.routing, 'order');
     assert.equal(bindBody.name, '我的入口');

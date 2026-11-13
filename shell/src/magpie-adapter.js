@@ -93,6 +93,29 @@ function readJson(file, fallback) {
  * 但语义上属于"我们自己接入的"，UI 标记为「插件」。
  */
 const OUR_IDS = ['wanneng-workbuddy', 'wanneng-codearts', 'wanneng-loomy', 'wanneng-lingxi'];
+
+/**
+ * 从分组名派生一个内核接受的 id。
+ *
+ * 内核规则：小写字母、数字、点、横线（实测报错原文
+ * 「a group's id must be lowercase letters, digits, dots and dashes」）。
+ * 中文名派生不出 id（会得到空串并 400），所以 ASCII 部分能转就转，
+ * 转不出来就用「名字的稳定短哈希」兜底——保证同一个中文名每次都得到
+ * 同一个 id，重建时是替换而不是不断堆积。
+ */
+function deriveGroupId(name, members) {
+  const ascii = String(name || '').toLowerCase()
+    .replace(/[^a-z0-9.-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .replace(/-{2,}/g, '-')
+    .slice(0, 40);
+  if (ascii && /[a-z0-9]/.test(ascii)) return ascii;
+  // 全中文（或其它非 ASCII）：按**名字**做稳定哈希（不含成员——名字才是标识，
+  // 混入成员会让「同名重建」变成另一个 id，从而不断堆积新分组）。
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  return `group-${h.toString(36)}`;
+}
 const OUR_PREFIX = 'wanneng-';
 
 /** 北京时间的「今天」，与前端/网关的签到判定同一口径 */
@@ -1063,7 +1086,12 @@ class RoutingGroups {
       };
     }
     const body = {
-      id: hasId ? id : undefined,
+      // 内核按 name 派生 id，且要求 id 只能用小写字母/数字/点/横线。
+      // 纯中文名派生出**空** id，直接 400「a group's id must be lowercase
+      // letters, digits, dots and dashes, not ""」——用户只是起了个中文名。
+      // 所以这里始终显式给出 id：有旧 id 就沿用，否则从中文名生成一个
+      // slug（中文保留成拼音式不可行，退化为按序命名），保证中文名可用。
+      id: hasId ? id : deriveGroupId(name.trim(), members),
       from: hasId ? id : undefined,
       name: name.trim(), members, placed: members,
       // 绑定入口的目标就是“按勾选顺序”，新建与更新都设为 order
@@ -1072,8 +1100,8 @@ class RoutingGroups {
     };
     const result = await this.panel._api('groups/save', body);
     const groups = Array.isArray(result) ? result : Array.isArray(result?.groups) ? result.groups : [];
-    const saved = groups.find((g) => g && g.name === body.name) || groups.find((g) => g && g.id === id);
-    return { name: body.name, members, id: saved?.id || id || '' };
+    const saved = groups.find((g) => g && g.id === body.id) || groups.find((g) => g && g.name === body.name);
+    return { name: body.name, members, id: saved?.id || body.id || '' };
   }
 
   async reorder(id, members) {
@@ -1204,14 +1232,35 @@ class PluginPanel {
       this.session = null;
       throw new Error('magpie 控制台会话已失效，请重试');
     }
-    // 不自动重试写操作；错误正文可能含 OAuth token，因此不直接转发。
-    if (r.status < 200 || r.status >= 300) throw new Error(`内核未能完成该操作（HTTP ${r.status}）`);
+    // 不自动重试写操作。错误正文经脱敏后把原因带出去：内核的拒绝理由
+    // （如「a group's id must be lowercase letters…」）是用户唯一能据此
+    // 行动的信息，只留一个状态码等于让人去猜。脱敏规则见 _redact。
+    if (r.status < 200 || r.status >= 300) {
+      const reason = this._redact(this._errorText(r.text));
+      throw new Error(reason
+        ? `内核未能完成该操作（HTTP ${r.status}）：${reason}`
+        : `内核未能完成该操作（HTTP ${r.status}）`);
+    }
     let data;
     // 204 / 空 body 是合法的“已完成，无返回”，不是不兼容数据
     if (!r.text || !r.text.trim()) return {};
     try { data = JSON.parse(r.text); } catch { throw new Error('内核管理接口返回了不兼容的数据'); }
-    if (data?.error) throw new Error('内核拒绝该操作，请检查登录状态或配置');
+    if (data?.error) {
+      const reason = this._redact(String(data.error));
+      throw new Error(reason ? `内核拒绝该操作：${reason}` : '内核拒绝该操作，请检查登录状态或配置');
+    }
     return data;
+  }
+
+  /** 从内核的错误响应体里取出可读原因（{error} 或 {message}，否则原样文本） */
+  _errorText(bodyText) {
+    const raw = String(bodyText || '').trim();
+    if (!raw) return '';
+    try {
+      const o = JSON.parse(raw);
+      if (o && typeof o === 'object') return String(o.error || o.message || '');
+    } catch { /* 非 JSON：按文本处理 */ }
+    return raw;
   }
 
   async _context(pkg, pid) {
