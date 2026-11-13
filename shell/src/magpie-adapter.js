@@ -953,6 +953,30 @@ function installMagpie(dataDir, { timeoutMs = 300000, onProgress } = {}) {
   });
 }
 
+/**
+ * 从 magpie 的模型名里抽倍率：Loomy 这类把倍率直接写进名字，
+ * 形如 "GLM 5.3 Flash(x0.8)" / "MiMo V2.5（x3.3）"。
+ * 取**最后一个**括号片段（前面的括号常是「(限时免费)」这类说明）。
+ * 没有则返回 null——与 0（免费）必须区分。
+ */
+function ratioFromName(name) {
+  const s = typeof name === 'string' ? name : '';
+  if (!s) return null;
+  const all = [...s.matchAll(/[（(]\s*[～~]?\s*x\s*([0-9]*\.?[0-9]+)\s*[）)]/gi)];
+  if (!all.length) return null;
+  const n = Number(all[all.length - 1][1]);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * 去掉模型名末尾的倍率括号，用作表格里的展示名：
+ * "Spark-X2.6 正式版(限时免费)(x0.0)" → "Spark-X2.6 正式版(限时免费)"
+ */
+function stripRatioSuffix(name) {
+  const s = typeof name === 'string' ? name : '';
+  return s.replace(/[（(]\s*[～~]?\s*x\s*[0-9]*\.?[0-9]+\s*[）)]\s*$/i, '').trim() || s;
+}
+
 function semverGt(a, b) {
   if (!a || !b) return false;
   const pa = a.split('.').map(Number);
@@ -971,8 +995,15 @@ function semverGt(a, b) {
  * 所以保存必须原样带回它已有的其它字段，不能只发 members。
  */
 class RoutingGroups {
-  constructor({ getConfig, timeoutMs = 15000 }) {
+  /**
+   * @param {object} opts
+   * @param {Function} opts.getConfig      () => magpie-web 平台配置
+   * @param {Function} [opts.getPanel]      () => GatewayPanel 实例（读四家原生倍率）
+   * @param {number}   [opts.timeoutMs]
+   */
+  constructor({ getConfig, getPanel, timeoutMs = 15000 }) {
     this.panel = new PluginPanel({ getConfig, timeoutMs });
+    this.getPanel = getPanel || null;
   }
 
   async list() {
@@ -1032,6 +1063,166 @@ class RoutingGroups {
         models: (Array.isArray(p.models) ? p.models : []).filter((m) => m && m.on && typeof m.id === 'string')
           .map((m) => ({ id: m.id, name: typeof m.name === 'string' ? m.name : m.id })),
       }));
+  }
+
+  /**
+   * 模型目录：把「同模型优先级」组的成员按**模型**聚合成一行，
+   * 每行带上提供它的平台及各平台倍率。这是「模型列表」与「模型优先级」
+   * 两个 tab 共用的唯一数据源（同一份数据，两种视图）。
+   *
+   * 倍率来源分两层，前者优先：
+   *   1. 四家自研网关的原生接口（gateway-panel），字段结构化、最可信；
+   *   2. magpie 模型 `name` 里的 `(x0.8)` 括号（Loomy 这类把倍率写进名字的），
+   *      以及其它社区插件——它们没有原生接口，只能靠这条兜底。
+   * 两层都取不到就是 null（显示「—」），不能伪造成 0（0 表示免费）。
+   */
+  async catalog() {
+    const warnings = [];
+
+    // magpie 侧拿不到（未安装/未配置/没启动）时**不能整个接口失败**：
+    // 「模型列表」页会因此变成满屏错误，而四家网关的倍率其实仍可读。
+    // 降级为「只有原生倍率、没有跨平台路由组」，并如实给出原因。
+    let groups = [];
+    let bindable = [];
+    try {
+      [groups, bindable] = await Promise.all([this.shared(), this.bindable()]);
+    } catch (e) {
+      warnings.push(`跨平台路由组读取失败：${e.message}`);
+    }
+
+    const nativeIds = ['workbuddy', 'codearts', 'loomy', 'lingxi'];
+    const isNative = (provider) => nativeIds.includes(provider.replace(/^wanneng-/, ''));
+
+    // 1) 原生倍率：只对四家自研网关尝试，单家失败不影响整体（降级到 name 括号）
+    // key 必须大小写不敏感：Lingxi 原生接口给的是 "GLM-5.3-Flash"，
+    // 而 magpie 里同一个模型记作 "glm-5.3-flash"——精确匹配会让它显示「倍率未提供」。
+    const ratioKey = (provider, model) => `${provider}\u0000${String(model).toLowerCase()}`;
+    const ratios = new Map();   // "provider\u0000model(小写)" → { ratio, text, note, badge }
+    // 原生模型清单本身也是条目来源：magpie 没启动时，四家的模型与倍率
+    // 仍然应该看得到，而不是整页空白。
+    const nativeModels = [];    // { provider, id, name, off }
+    const panel = this.getPanel ? this.getPanel() : null;
+    if (panel) {
+      await Promise.all(nativeIds.map(async (pid) => {
+        try {
+          const r = await panel.models(pid);
+          for (const m of Array.isArray(r.models) ? r.models : []) {
+            nativeModels.push({ provider: `wanneng-${pid}`, id: m.id, name: m.name || m.id });
+            if (m.ratio === null) continue;
+            ratios.set(ratioKey(`wanneng-${pid}`, m.id), {
+              ratio: m.ratio,
+              text: m.ratioText || `${m.ratio}x`,
+              note: [m.tag, m.notice].filter(Boolean).join(' · '),
+              badge: m.badge || null,
+            });
+          }
+        } catch (e) {
+          warnings.push(`${pid} 倍率读取失败：${e.message}`);
+        }
+      }));
+    }
+
+    // 2) 平台 × 模型清单：以 bindable（已启用模型）为主，组内成员兜底补上
+    //    社区插件（trae-cn / zcode / cline…）不提供原生接口，只有 magpie 的名字。
+    const entries = [];
+    const seen = new Set();
+    const push = (provider, modelId, displayName, off) => {
+      // 去重 key 必须大小写不敏感：同一模型在原生接口与 magpie 里
+      // 可能是 "GLM-5.3-Flash" / "glm-5.3-flash"（Lingxi 实测如此），
+      // 精确比较会让它在一个平台下出现两行。
+      const k = `${provider}\u0000${modelId.toLowerCase()}`;
+      if (seen.has(k)) return;
+      seen.add(k);
+      entries.push({ provider, modelId, displayName, off });
+    };
+    // 原生清单只在 magpie 不可用时充当条目来源：magpie 在的时候它的清单才是
+    // 「真正可路由的模型」，而原生接口里还含 magpie 没收录的 id
+    //（如 lingxi 的 deepseek-v4-pro-0813），两套合在一起会出现同平台重复行。
+    // 原生清单始终用于提供倍率（上一步已收集）。
+    const useNativeEntries = bindable.length === 0;
+    if (useNativeEntries) {
+      for (const m of nativeModels) push(m.provider, m.id, m.name, false);
+    }
+    for (const p of bindable) {
+      for (const m of p.models) push(p.id, m.id, m.name || m.id, p.off);
+    }
+    for (const g of groups) {
+      for (let i = 0; i < g.members.length; i++) {
+        // 成员 id 形如 "provider/model" 或 "provider/sub/model"：
+        // provider 是第一段，模型是其余部分（cline 这类会带子路由）
+        const slash = g.members[i].indexOf('/');
+        if (slash <= 0) continue;
+        const provider = g.members[i].slice(0, slash);
+        const modelId = g.members[i].slice(slash + 1);
+        const info = g.memberInfo.find((m) => m.id === g.members[i]) || {};
+        // 成员信息里的 name 是**平台**显示名，不是模型名，只能退回 id。
+        // 展示时去掉子路由前缀（cline 的 "cline-pass/glm-5.3-flash" → "glm-5.3-flash"），
+        // 否则表格里会多出一层让人费解的斜杠路径。
+        const short = modelId.includes('/') ? modelId.slice(modelId.lastIndexOf('/') + 1) : modelId;
+        push(provider, modelId, short, !!info.providerOff);
+      }
+    }
+
+    // 平台显示名：路由组成员信息里有友好名（ZCode / Trae CN / Cline）
+    const label = new Map();
+    for (const p of bindable) label.set(p.id, p.name);
+    for (const g of groups) for (const m of g.memberInfo) if (m.name) label.set(m.provider, m.name);
+
+    // 3) 按模型聚合。key 用归一化名（大小写、空格、标点差异不该拆成两行）
+    const byModel = new Map();
+    for (const e of entries) {
+      const native = ratios.get(ratioKey(e.provider, e.modelId));
+      const bare = stripRatioSuffix(e.displayName);
+      const ratio = native ? native.ratio : ratioFromName(e.displayName);
+      const ratioText = native ? native.text : (ratio !== null ? `${ratio}x` : '');
+
+      // 分组主键用**展示名**归一化：同一个模型在各家 id 拼写不同
+      // （glm-5.3-flash / GLM-5.3-Flash / kimi-k3-1 / kimi-k3），
+      // 按 id 分组会把同一个模型拆成多行。同一平台提供的不同变体
+      // （WorkBuddy 的 hy4free / hy4std 都叫 Hy4）保留成两条成员，
+      // 由展开明细里的模型 id 区分，不静默丢弃任何倍率。
+      const norm = bare.toLowerCase().replace(/[\s\-_.()（）]+/g, '');
+      const rowKey = norm || e.modelId.toLowerCase();
+      let row = byModel.get(rowKey);
+      if (!row) {
+        row = { key: rowKey, name: bare, platforms: [] };
+        byModel.set(rowKey, row);
+      }
+      row.platforms.push({
+        provider: e.provider,
+        providerLabel: label.get(e.provider) || e.provider,
+        model: e.modelId,
+        ratio,
+        ratioText,
+        note: native ? native.note : '',
+        badge: native ? native.badge : null,
+        off: e.off,
+        native: isNative(e.provider),
+      });
+    }
+
+    const models = [...byModel.values()].map((row) => {
+      // 便宜的排前面；没倍率的排最后（null 不能当成 0，0 是免费）
+      row.platforms.sort((a, b) => {
+        if (a.ratio === null && b.ratio === null) return a.provider.localeCompare(b.provider);
+        if (a.ratio === null) return 1;
+        if (b.ratio === null) return -1;
+        return a.ratio - b.ratio;
+      });
+      const priced = row.platforms.filter((p) => p.ratio !== null);
+      const best = priced.length ? priced[0] : null;
+      return {
+        ...row,
+        platformCount: new Set(row.platforms.map((p) => p.provider)).size,
+        pricedCount: priced.length,
+        bestRatio: best ? best.ratio : null,
+        bestProvider: best ? best.providerLabel : '',
+      };
+    });
+    // 平台多的在前（跨平台可路由的最值得关注），同数量按名称
+    models.sort((a, b) => b.platformCount - a.platformCount || a.name.localeCompare(b.name));
+
+    return { groups, bindable, models, warnings };
   }
 
   /**

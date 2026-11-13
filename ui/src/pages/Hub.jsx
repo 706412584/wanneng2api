@@ -10,6 +10,8 @@ import { api } from '../api/client'
 import { usePolling } from '../hooks/usePolling'
 import { useToast } from '../components/Toast'
 import { Empty, ErrorBox, Loading, StateDot, STATE_TEXT } from '../components/Bits'
+import ModelList from '../components/ModelList'
+import RoutingGroups from '../components/RoutingGroups'
 import { fmtNum, fmtTime, fmtAgo } from '../utils/format'
 
 const PERIODS = [
@@ -19,7 +21,15 @@ const PERIODS = [
   ['all', '全部'],
 ]
 
+/** 三个视图：概览（用量）/ 模型列表（按模型看倍率）/ 模型优先级（按平台排顺序） */
+const TABS = [
+  ['overview', '概览'],
+  ['models', '模型列表'],
+  ['priority', '模型优先级'],
+]
+
 export default function Hub() {
+  const [tab, setTab] = useState('overview')
   const [period, setPeriod] = useState('7d')
 
   const fetchInfo = useCallback(() => api.magpieGateway('overview'), [])
@@ -35,7 +45,6 @@ export default function Hub() {
   const reqs = usePolling(fetchReqs, 10000)
 
   const toast = useToast()
-  const [showKey, setShowKey] = useState(false)
 
   const copy = async (text, label) => {
     try {
@@ -64,6 +73,36 @@ export default function Hub() {
   const u = usage.data || {}
   const maxCalls = Math.max(1, ...(u.series || []).map((s) => s.calls || 0))
 
+  return (
+    <>
+      {/* ── 视图切换 ── */}
+      <nav className="page-tabs" role="tablist" aria-label="Hub 视图">
+        {TABS.map(([id, label]) => (
+          <button
+            key={id}
+            role="tab"
+            aria-selected={tab === id}
+            className={tab === id ? 'active' : ''}
+            onClick={() => setTab(id)}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
+
+      {tab === 'models' && <ModelList />}
+      {tab === 'priority' && <RoutingGroups embedded />}
+      {tab === 'overview' && <Overview
+        hub={hub} info={info} quotas={quotas} usage={usage} reqs={reqs}
+        period={period} setPeriod={setPeriod} copy={copy}
+        baseUrl={baseUrl} gatewayState={gatewayState} u={u} maxCalls={maxCalls}
+      />}
+    </>
+  )
+}
+
+/** 概览视图：统一入口、用量指标、趋势、额度、MCP、请求明细、协议能力 */
+function Overview({ hub, info, quotas, usage, reqs, period, setPeriod, copy, baseUrl, gatewayState, u, maxCalls }) {
   return (
     <>
       {/* ── 入口 + 概览指标 ── */}

@@ -210,6 +210,18 @@ async function main() {
   // 聚合层已交给 magpie：此端点改为刷新上游状态，恒返回 200 + ok
   ok('hub/reload 200 且返回 refreshed', hr.status === 200 && hr.json && hr.json.ok === true, `got ${hr.status}`);
 
+  // ── 模型目录（模型列表 / 模型优先级共用）──
+  // 这个环境没有 magpie-web，也没有四家网关：接口必须**降级而不是崩**，
+  // 否则用户一打开 Hub 的模型列表就是满屏报错。
+  console.log('\n[模型目录]');
+  const mc = await req('GET', '/api/magpie/model-catalog');
+  ok('model-catalog 200 且给出三块结构', mc.status === 200
+    && Array.isArray(mc.json.models) && Array.isArray(mc.json.groups) && Array.isArray(mc.json.bindable),
+    `got ${mc.status} ${JSON.stringify(mc.json).slice(0, 160)}`);
+  ok('连不上 magpie 时给出 warnings 而非 500', (mc.json.warnings || []).length > 0,
+    JSON.stringify(mc.json.warnings));
+  ok('没有数据时 models 为空数组', mc.json.models.length === 0);
+
   // ── settings ──
   console.log('\n[settings GET/PUT]');
   const sg = await req('GET', '/api/settings');

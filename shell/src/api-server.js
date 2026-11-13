@@ -116,6 +116,8 @@ class ApiServer {
     });
     this.routingGroups = deps.routingGroups || new (require('./magpie-adapter').RoutingGroups)({
       getConfig: () => deps.store.getPlatform('magpie-web'),
+      // 模型倍率只能从四家网关的原生接口读到（magpie 侧只有名字里的括号）
+      getPanel: () => this.gatewayPanel,
     });
     // 自研网关原生管理：凭据由适配器自己从各网关工作目录读取，API 层不接触密钥
     this.gatewayPanel = deps.gatewayPanel || new (require('./gateway-panel').GatewayPanel)({
@@ -298,6 +300,12 @@ class ApiServer {
         if (typeof body.action !== 'string') throw new Error('缺少管理动作');
         return this.gatewayPanel.action(id, body.action, body);
       }
+    }
+
+    // GET /api/magpie/model-catalog —— 模型列表：同模型跨平台聚合 + 各平台倍率。
+    // 「模型列表」与「模型优先级」两个 tab 共用这一份数据（两种视图）。
+    if (method === 'GET' && parts[1] === 'magpie' && parts[2] === 'model-catalog') {
+      return this.routingGroups.catalog();
     }
 
     // 路由组：同一模型被多个平台提供时的顺序（只重排、不增删成员）

@@ -74,6 +74,51 @@ function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
 }
 
+/**
+ * 把各家五花八门的倍率写法归一成数字，解析不出来给 null。
+ *
+ * 实测四家的格式：
+ *   WorkBuddy  credits:       "x0.29"     （x 在前）
+ *   CodeArts   ratio_display: "0.18x"     （x 在后）
+ *   Lingxi     credits:       "～0.12x"   （全角波浪号前缀，表示约数）
+ *   Loomy      无独立字段，倍率在模型 name 的括号里："(x0.0)" / "（x3.3）"
+ *
+ * 返回 null 表示「这家没提供倍率」，与 0 有本质区别（0 是免费），
+ * 调用方必须据此显示「—」而不是「0x」。
+ */
+function parseRatio(v) {
+  const s = text(v).trim();
+  if (!s) return null;
+  // 同时接受半角/全角括号包裹；剥离 x 前缀/后缀与约数标记
+  const m = /^[（(]?\s*[～~]?\s*x?\s*([0-9]*\.?[0-9]+)\s*[xX]?\s*[）)]?$/.exec(s);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * WorkBuddy 的 tags 里混着展示用的徽标："badge:限时免费:#FF0000"。
+ * 抽成 {text,color} 供前端直接渲染，其余标签（craft / text-to-video）忽略。
+ */
+function badgeFromTags(tags) {
+  for (const t of arr(tags)) {
+    const m = /^badge:([^:]*)(?::(#[0-9a-fA-F]{3,8}))?$/.exec(text(t));
+    if (m && m[1]) return { text: m[1], color: m[2] || '' };
+  }
+  return null;
+}
+
+/** 从模型名里抽倍率，如 "Spark-X2.6 正式版(限时免费)(x0.0)" → 0；没有则 null */
+function ratioFromName(name) {
+  const s = text(name);
+  if (!s) return null;
+  // 取**最后一个**括号片段，避免「(限时免费)」这类前缀干扰
+  const all = [...s.matchAll(/[（(]\s*[～~]?\s*x\s*([0-9]*\.?[0-9]+)\s*[）)]/gi)];
+  if (!all.length) return null;
+  const n = Number(all[all.length - 1][1]);
+  return Number.isFinite(n) ? n : null;
+}
+
 function expandPath(p) {
   const raw = String(p || '');
   const appData = process.env.APPDATA || '';
@@ -466,9 +511,95 @@ class GatewayPanel {
     const r = await this._json(platform, '/admin/api/models', { headers: this._authHeaders(platform) });
     return {
       models: arr(r.data).filter((m) => m && typeof m.id === 'string').map((m) => ({
-        id: m.id, name: text(m.name) || m.id, context: num(m.context_length),
+        id: m.id,
+        // 列表里是 model_name（人话），model_desc 是说明；早先只读 name 会得到空串
+        name: text(m.model_name) || text(m.name) || m.id,
+        context: num(m.context_length),
+        ratio: parseRatio(m.ratio_display),
+        ratioText: text(m.ratio_display),
+        tag: text(m.model_tag),
+        notice: text(m.notice),
       })),
     };
+  }
+
+  // ── 模型目录（四家统一形状，供「模型列表」页与倍率聚合使用）──
+
+  /**
+   * WorkBuddy：/v1/models 需要 Bearer，密钥在 config.json 的 api_keys（对象数组，
+   * 取第一个的 key）。字段 credits 就是倍率（"x0.29"）。没有 video 模型倍率。
+   */
+  async _wbModels(platform) {
+    const cfg = platform.workDir
+      ? readJson(path.join(expandPath(platform.workDir), 'config.json')) : null;
+    const list = arr(cfg && cfg.api_keys);
+    const first = list[0];
+    const key = typeof first === 'string' ? first : text(first && first.key);
+    const r = await this._json(platform, '/v1/models', { headers: key ? { Authorization: `Bearer ${key}` } : {} });
+    return {
+      models: arr(r.data).filter((m) => m && typeof m.id === 'string').map((m) => ({
+        id: m.id,
+        name: text(m.name) || m.id,
+        context: num(m.context_length),
+        // credits 缺席 = 这家没标倍率（如 auto / 视频模型），不是 0
+        ratio: parseRatio(m.credits),
+        ratioText: text(m.credits),
+        badge: badgeFromTags(m.tags),
+      })),
+    };
+  }
+
+  /** Loomy：/v1/models 的倍率藏在 name 的括号里，id 干净 */
+  async _loomyModels(platform) {
+    const r = await this._json(platform, '/v1/models', { headers: this._authHeaders(platform) });
+    return {
+      models: arr(r.data).filter((m) => m && typeof m.id === 'string').map((m) => ({
+        id: m.id,
+        name: text(m.name) || m.id,
+        context: num(m.context_length),
+        ratio: ratioFromName(m.name),
+        ratioText: '',
+      })),
+    };
+  }
+
+  /** Lingxi：/panel/api/models 的 credits 是结构化倍率（"～0.12x"，约数） */
+  async _lxModels(platform) {
+    const r = await this._json(platform, '/panel/api/models', { headers: this._authHeaders(platform) });
+    return {
+      models: arr(r.models).filter((m) => m && typeof m.id === 'string').map((m) => ({
+        id: m.id,
+        name: text(m.name) || m.id,
+        context: num(m.context_length),
+        ratio: parseRatio(m.credits),
+        ratioText: text(m.credits),
+        default: bool(m.is_default),
+      })),
+    };
+  }
+
+  /**
+   * 统一模型目录：只返回该平台已启用的模型（与 magpie 里 `on` 的口径对齐）。
+   * 由 API 层聚合成「模型 × 各平台倍率」。
+   */
+  async models(id) {
+    const platform = this._platform(id);
+    const read = {
+      workbuddy: this._wbModels,
+      codearts: this._caModels,
+      loomy: this._loomyModels,
+      lingxi: this._lxModels,
+    }[id];
+    const r = await read.call(this, platform);
+    // 去重：同名 id 只留第一条（上游偶有重复条目）
+    const seen = new Set();
+    const models = [];
+    for (const m of r.models) {
+      if (seen.has(m.id)) continue;
+      seen.add(m.id);
+      models.push(m);
+    }
+    return { platform: id, models };
   }
 
   // ── Loomy ──

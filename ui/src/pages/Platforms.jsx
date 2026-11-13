@@ -9,7 +9,6 @@ import { Empty, ErrorBox, Loading, StateDot, STATE_TEXT } from '../components/Bi
 import { fmtUptime } from '../utils/format'
 import PluginManager from '../components/PluginManager'
 import GatewayManager from '../components/GatewayManager'
-import RoutingGroups from '../components/RoutingGroups'
 
 const BUSY_STATES = ['starting', 'updating']
 
@@ -114,7 +113,7 @@ export default function Platforms() {
       </div>
 
       <PluginMarket onInstalled={() => setPluginRev((v) => v + 1)} onRemoved={() => setPluginRev((v) => v + 1)} />
-      <RoutingGroups />
+      {/* 「同模型优先级」已移到 Hub 页（模型优先级 tab），与模型列表共用一份数据 */}
       <Collapsible title="已配置的内置 Provider" summaryKey="已接入的厂商 / 中转 / 订阅">
         <MagpieProviders />
       </Collapsible>

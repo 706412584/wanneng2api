@@ -682,6 +682,25 @@ html.has-titlebar .plugin-manager-mask { top: 34px; }
 .routing-member-name { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; overflow-wrap: anywhere; }
 .routing-member-actions { display: flex; gap: 4px; }
 .routing-member-actions .btn { min-width: 34px; padding-left: 0; padding-right: 0; }
+
+/* ── 页面级 tab（Hub 的 概览 / 模型列表 / 模型优先级）── */
+.page-tabs { display: flex; gap: 4px; margin-bottom: 16px; padding: 4px; background: var(--bg-soft); border: 1px solid var(--border); border-radius: 10px; width: fit-content; }
+.page-tabs button { appearance: none; background: none; border: 0; color: var(--text-3); font: inherit; font-weight: 600; font-size: 13px; padding: 7px 16px; border-radius: 7px; cursor: pointer; }
+.page-tabs button:hover { color: var(--text); }
+.page-tabs button.active { background: var(--card); color: var(--primary); box-shadow: 0 1px 2px rgb(0 0 0 / 8%); }
+
+/* ── 模型列表 ── */
+.model-list tbody tr.model-row { cursor: pointer; }
+.model-list tbody tr.model-row:hover { background: var(--card-hover); }
+.model-list tbody tr.model-row.open { background: color-mix(in srgb, var(--primary) 5%, var(--card)); }
+.model-detail-row > td { padding: 0 !important; background: var(--bg); border-top: 0; }
+.model-detail { display: flex; flex-direction: column; gap: 2px; padding: 6px 0 10px; }
+.model-detail-item { display: flex; align-items: center; gap: 12px; padding: 8px 14px; font-size: 12.5px; flex-wrap: wrap; }
+.model-detail-platform { display: inline-flex; align-items: center; gap: 6px; min-width: 190px; }
+.model-detail-id { flex: 1; min-width: 140px; color: var(--text-3); font-size: 11.5px; overflow-wrap: anywhere; }
+.model-detail-ratio { min-width: 84px; text-align: right; font-variant-numeric: tabular-nums; }
+.model-detail-note { flex-basis: 100%; color: var(--text-3); font-size: 11.5px; line-height: 1.7; }
+
 .plugin-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); cursor: pointer; margin-bottom: 4px; }
 .plugin-toggle input { width: 16px; height: 16px; accent-color: var(--primary); cursor: pointer; }
 .plugin-toggle.off { color: var(--text-3); }

@@ -189,6 +189,8 @@ export const api = {
   magpiePlugins: (refresh) => request(`/api/magpie/plugins${refresh ? '?refresh=1' : ''}`, { timeout: 30000 }),
   // 同模型跨平台路由组：读取共享组与调整成员顺序
   routingGroups: () => request('/api/magpie/routing-groups', { timeout: 30000 }),
+  // 模型目录：同模型跨平台聚合 + 各平台倍率（「模型列表 / 优先级」两视图共用）
+  modelCatalog: () => request('/api/magpie/model-catalog', { timeout: 60000 }),
   reorderRoutingGroup: (id, members) => request('/api/magpie/routing-groups', {
     method: 'POST', body: { id, members }, timeout: 40000,
   }),

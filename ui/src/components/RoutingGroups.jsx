@@ -11,7 +11,11 @@ function reorderPick(list, id, checked) {
   return list.includes(id) ? list : [...list, id]
 }
 
-export default function RoutingGroups() {
+/**
+ * @param {object} [props]
+ * @param {boolean} [props.embedded] 嵌入式（放进 Hub 的 tab）：不再自带 .card 外壳
+ */
+export default function RoutingGroups({ embedded = false }) {
   const [groups, setGroups] = useState(null)
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -84,8 +88,8 @@ export default function RoutingGroups() {
   if (loading && !groups) return <Loading text="读取跨平台路由组…" />
   if (error && !groups) return <ErrorBox error={error} onRetry={load} />
 
-  return (
-    <div className="card">
+  const body = (
+    <>
       <div className="card-title" style={{ justifyContent: 'space-between' }}>
         <span>同模型优先级 <span className="sub">多个平台提供同一模型时，按此顺序尝试</span></span>
         <span style={{ display: 'flex', gap: 6 }}>
@@ -165,6 +169,7 @@ export default function RoutingGroups() {
         排在前面的平台先被尝试；失败或被限流才轮到下一个。
         修改自动合并组后，该组会变成你的自定义组，内核不会再自动增删成员。
       </div>
-    </div>
+    </>
   )
+  return embedded ? body : <div className="card">{body}</div>
 }
