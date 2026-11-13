@@ -14,6 +14,7 @@
 
 const http = require('http');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const LOCAL_HOSTS = ['127.0.0.1', 'localhost', '[::1]'];
@@ -26,10 +27,10 @@ const LOCAL_HOSTS = ['127.0.0.1', 'localhost', '[::1]'];
  * 从而把「平台是否支持」的判断绕过。null 原型没有继承，查不到就是 undefined。
  */
 const CAPS = Object.assign(Object.create(null), {
-  workbuddy: ['accounts', 'groups', 'stats', 'logs', 'schedule', 'checkin'],
-  codearts: ['accounts', 'stats', 'logs', 'credits', 'checkin'],
-  loomy: ['accounts', 'stats', 'points', 'logs', 'checkin'],
-  lingxi: ['accounts', 'stats', 'usage', 'logs', 'checkin'],
+  workbuddy: ['accounts', 'groups', 'stats', 'logs', 'schedule', 'checkin', 'lan'],
+  codearts: ['accounts', 'stats', 'logs', 'credits', 'checkin', 'lan'],
+  loomy: ['accounts', 'stats', 'points', 'logs', 'checkin', 'lan'],
+  lingxi: ['accounts', 'stats', 'usage', 'logs', 'checkin', 'lan'],
 });
 
 // ── 工具 ──
@@ -72,6 +73,67 @@ function redact(value) {
 
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+}
+
+/**
+ * 判断监听地址是否对局域网开放。
+ * ":7863"（省略 host）在 Go 里等价 0.0.0.0；"0.0.0.0"/"::"/"" 同理；
+ * 只有 127.0.0.1 / localhost / [::1] 算本机专用。
+ */
+function isLanHost(host) {
+  const h = String(host || '').trim().toLowerCase();
+  if (!h || h === '0.0.0.0' || h === '::' || h === '*' || h === '[::]') return true;
+  return !(h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1');
+}
+
+/**
+ * 拆 listen（Go 风格地址）成 host/port。
+ *   ":7866"            → { host: "",     port: 7866 }   （空 host = 绑所有接口）
+ *   "0.0.0.0:7866"     → { host: "0.0.0.0", port: 7866 }
+ *   "127.0.0.1:7866"   → { host: "127.0.0.1", port: 7866 }
+ *   "[::1]:7866"       → { host: "[::1]", port: 7866 }
+ *   "7866"             → { host: "",     port: 7866 }   （少数配置只写端口）
+ */
+function splitListen(listen, fallbackPort) {
+  const s = String(listen || '').trim();
+  const m6 = /^\[([^\]]+)\]:(\d+)$/.exec(s);
+  if (m6) return { host: `[${m6[1]}]`, port: Number(m6[2]) };
+  const idx = s.lastIndexOf(':');
+  if (idx >= 0) {
+    const host = s.slice(0, idx);
+    const p = Number(s.slice(idx + 1));
+    return { host, port: Number.isFinite(p) && p > 0 ? p : fallbackPort };
+  }
+  const onlyPort = Number(s);
+  return { host: '', port: Number.isFinite(onlyPort) && onlyPort > 0 ? onlyPort : fallbackPort };
+}
+
+/**
+ * 本机局域网 IP（第一个非回环、非链路本地的 IPv4）。取不到返回空串。
+ * 只用于在界面上拼出「其他设备用 http://<ip>:<port> 访问」的提示；
+ * 不参与任何绑定决策。
+ */
+function localLanIPv4() {
+  const nets = os.networkInterfaces();
+  for (const name of Object.keys(nets)) {
+    for (const ni of nets[name] || []) {
+      if (!ni) continue;
+      // Node <18 的 family 是字符串，>=18 是数字，两者都认
+      const isV4 = ni.family === 'IPv4' || ni.family === 4;
+      if (!isV4 || ni.internal) continue;
+      if (ni.address.startsWith('169.254.')) continue; // 链路本地
+      if (/^vEthernet|Loopback/i.test(name)) continue; // WSL/Hyper-V 虚拟网卡
+      return ni.address;
+    }
+  }
+  return '';
+}
+
+/** 写配置前备份一份（与 updater 的 import-backup 同一惯例） */
+function backupConfig(file) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const dest = `${file}.bak-lan-${stamp}`;
+  try { fs.copyFileSync(file, dest); return dest; } catch { return ''; }
 }
 
 /**
@@ -249,6 +311,108 @@ class GatewayPanel {
   _codeartsKey(platform) { return this._adminKey(platform, 'config.json', 'admin_key'); }
   _lingxiKey(platform) { return this._adminKey(platform, 'config.json', 'api_key'); }
 
+  // ── 局域网访问（监听地址）──
+  //
+  // 四家的配置格式不统一，但都只有一个「绑哪个网卡」的字段：
+  //   workbuddy / codearts / lingxi  → listen，形如 ":7863" 或 "127.0.0.1:7863"
+  //   loomy                          → host + port 两个独立字段
+  //
+  // 只说 host 部分（端口一律不动）：改端口会让 health.url、adminPanel、
+  // 平台配置里的 port 全部失配，那不是这个开关该做的事。
+  //
+  // loomy 另有 LOOMY_HOST 环境变量，优先级高于 config.json——若平台配置里
+  // 显式给了它，改文件不会生效，必须如实告诉用户，不能假装成功。
+
+  /** 该平台的配置文件路径（不存在则返回空） */
+  _configPath(platform) {
+    if (!platform.workDir) return '';
+    return path.join(expandPath(platform.workDir), 'config.json');
+  }
+
+  /**
+   * 读当前监听状态。
+   * @returns {{enabled:boolean, listen:string, host:string, port:number, note:string, overriddenBy?:string}}
+   */
+  lanStatus(platform) {
+    const file = this._configPath(platform);
+    const cfg = file ? readJson(file) : null;
+    if (!cfg) throw new Error('读取不到该网关的 config.json');
+
+    if (platform.id === 'loomy') {
+      const host = text(cfg.host) || '127.0.0.1';
+      const port = num(cfg.port) || platform.port;
+      const env = platform.run && platform.run.env;
+      const envHost = env && typeof env.LOOMY_HOST === 'string' ? env.LOOMY_HOST.trim() : '';
+      const r = {
+        enabled: isLanHost(host),
+        listen: `${host}:${port}`, host, port,
+        lanIp: localLanIPv4(),
+        note: '',
+      };
+      if (envHost) {
+        // 环境变量优先：文件里写什么都盖不过它，直接说明真实生效值
+        r.overriddenBy = 'LOOMY_HOST';
+        r.host = envHost;
+        r.enabled = isLanHost(envHost);
+        r.listen = `${envHost}:${port}`;
+        r.note = `平台配置的环境变量 LOOMY_HOST=${envHost} 会覆盖 config.json，改文件不生效`;
+      }
+      return r;
+    }
+
+    const listen = text(cfg.listen) || `:${platform.port}`;
+    const { host, port } = splitListen(listen, platform.port);
+    return {
+      enabled: isLanHost(host),
+      listen: `${host}:${port}`, host, port,
+      lanIp: localLanIPv4(),
+      note: '',
+    };
+  }
+
+  /**
+   * 切换局域网访问。enabled=true → 绑 0.0.0.0；false → 绑 127.0.0.1。
+   * 只改 host，端口原样保留；写前备份原文件。
+   * @returns {{enabled:boolean, listen:string, host:string, port:number, restartRequired:true, backup:string, note:string}}
+   */
+  setLan(platform, enabled) {
+    const file = this._configPath(platform);
+    if (!file) throw new Error('该平台没有配置工作目录');
+    const cfg = readJson(file);
+    if (!cfg || typeof cfg !== 'object') throw new Error('读取不到该网关的 config.json');
+
+    const want = enabled ? '0.0.0.0' : '127.0.0.1';
+    const status = this.lanStatus(platform);
+    if (status.overriddenBy) {
+      throw new Error(`该平台的环境变量 ${status.overriddenBy}=${status.host} 会覆盖配置文件，请先在平台配置里去掉它`);
+    }
+
+    // 端口保持不变：从现有配置推出，推不出才用平台配置的 port
+    const port = status.port || platform.port;
+
+    if (platform.id === 'loomy') {
+      cfg.host = want;
+      if (cfg.port == null) cfg.port = port;
+    } else {
+      // 保留原有写法：原本是 ":7866"（省略 host）就写回 ":7866" 形式，
+      // 只有需要绑具体地址时才带 host。这样关闭时能还原成项目默认形状。
+      cfg.listen = enabled ? `0.0.0.0:${port}` : `127.0.0.1:${port}`;
+    }
+
+    const backup = backupConfig(file);
+    fs.writeFileSync(file, JSON.stringify(cfg, null, 2));
+    return {
+      enabled: !!enabled,
+      listen: `${want}:${port}`,
+      host: want,
+      port,
+      lanIp: localLanIPv4(),
+      restartRequired: true,
+      backup,
+      note: '',
+    };
+  }
+
   /** Loomy 的 api_keys 是数组，取第一个（面板写入也用它） */
   _loomyKey(platform) {
     const env = platform.run && platform.run.env;
@@ -303,6 +467,11 @@ class GatewayPanel {
       id, name: text(platform.name) || id, port: platform.port,
       baseUrl: this._origin(platform), capabilities: caps,
       install: this._installInfo(platform),
+      // 局域网访问状态：读配置文件失败不该让整个面板打不开，降级成 { error }
+      lan: (() => {
+        try { return this.lanStatus(platform); }
+        catch (e) { return { error: redact(e.message), enabled: false, listen: '', host: '', port: platform.port, note: '' }; }
+      })(),
     };
     const load = async (fn, fallback) => { try { return await fn(); } catch (e) { return { ...fallback, error: redact(e.message) }; } };
     if (id === 'workbuddy') {
@@ -752,6 +921,12 @@ class GatewayPanel {
   async action(id, action, body = {}) {
     const platform = this._platform(id);
     if (typeof action !== 'string' || !action) throw new Error('缺少管理动作');
+    // lan-set 不走各家 HTTP 接口：它改的是网关自己的 config.json（监听地址），
+    // 四家的配置格式不同但操作相同，所以在分发层统一处理。
+    if (action === 'lan-set') {
+      if (body.enabled !== true && body.enabled !== false) throw new Error('enabled 必须是布尔值');
+      return this.setLan(platform, body.enabled);
+    }
     // 必须用 hasOwnProperty 校验：ACTIONS[id] 是普通对象，
     // ACTIONS['workbuddy']['constructor'] 命中的是 Object.prototype.constructor。
     // 直接取会把 Object 构造器当 handler 调，返回值是平台配置对象本身

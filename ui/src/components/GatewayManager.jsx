@@ -40,6 +40,7 @@ const SECTION_LABEL = {
   credits: '积分',
   points: '积分',
   usage: '用量',
+  lan: '局域网',
 }
 
 export default function GatewayManager({ platform, onClose, onChanged }) {
@@ -285,6 +286,12 @@ export default function GatewayManager({ platform, onClose, onChanged }) {
               {tab === 'credits' && <CreditsSection data={data} accounts={accounts} busy={busy} isBusy={isBusy} onExtras={accountExtras} />}
               {tab === 'points' && <PointsSection data={data} />}
               {tab === 'usage' && <UsageSection data={data} />}
+              {tab === 'lan' && (
+                <LanSection
+                  data={data} busy={busy}
+                  onChange={(enabled) => act(enabled ? '开放局域网访问' : '关闭局域网访问', 'lan-set', { enabled })}
+                />
+              )}
               {tab === 'logs' && (
                 <LogsSection lines={logs} error={logsError} loading={logsLoading} onReload={loadLogs} />
               )}
@@ -498,6 +505,83 @@ function CheckinSection({ data, accounts, busy, isBusy, checkinDone, onCheckin, 
           </button>
         </div>
       )}
+    </>
+  )
+}
+
+/**
+ * 局域网访问：改网关 config.json 里的监听地址（只改 host，端口不动）。
+ *
+ * 各家配置字段不同，但含义相同：
+ *   workbuddy / codearts / lingxi → listen（":7863" 或 "127.0.0.1:7863"）
+ *   loomy                          → host + port
+ * 后端已把差异抹平，这里只呈现「开 / 关」。
+ */
+function LanSection({ data, busy, onChange }) {
+  const lan = data.lan || {}
+  const ip = lan.lanIp || ''
+  const hasError = !!lan.error
+  const enabled = !!lan.enabled
+  const port = lan.port || data.port
+  const lanUrl = ip ? `http://${ip}:${port}` : ''
+  const busyHere = busy === 'lan-set:'
+if (hasError) {
+    return (
+      <>
+        <div className="plugin-manager-section-title"><h3>局域网访问</h3></div>
+        <div className="plugin-manager-error" role="alert">读取监听配置失败：{lan.error}</div>
+        <p className="sub" style={{ marginTop: 12 }}>
+          常见原因：该网关的 config.json 不存在或格式损坏。
+        </p>
+      </>
+    )
+  }
+
+  return (
+    <>
+      <div className="plugin-manager-section-title">
+        <h3>局域网访问</h3>
+        <span className={`badge ${enabled ? 'orange' : 'green'}`}>{enabled ? '已开放' : '仅本机'}</span>
+      </div>
+
+      <div className="card" style={{ padding: 16, marginBottom: 16 }}>
+        <label className="check-row" style={{ marginBottom: 12 }}>
+          <input
+            type="checkbox" checked={enabled} disabled={busyHere || !!lan.overriddenBy}
+            onChange={(e) => onChange(e.target.checked)}
+          />
+          允许局域网内其它设备访问
+        </label>
+
+        <div style={{ fontSize: 12.5, lineHeight: 2, color: 'var(--text-2)' }}>
+          <div>
+            当前监听：<code className="mono">{lan.listen || '—'}</code>
+            {enabled ? <span className="badge orange" style={{ marginLeft: 8 }}>所有网卡</span>
+              : <span className="badge gray" style={{ marginLeft: 8 }}>仅 127.0.0.1</span>}
+          </div>
+          {enabled && lanUrl && (
+            <div>其它设备可用：<code className="mono">{lanUrl}</code></div>
+          )}
+          {enabled && !lanUrl && (
+            <div style={{ color: 'var(--text-3)' }}>未检测到局域网 IP（可能没连 WiFi / 网线）。</div>
+          )}
+        </div>
+      </div>
+
+      {lan.overriddenBy && (
+        <div className="plugin-manager-error" role="alert" style={{ marginBottom: 12 }}>
+          该平台的环境变量 <b>{lan.overriddenBy}</b> 会覆盖 config.json，
+          在这里改了也不生效。请先在平台的「配置」里去掉该环境变量。
+        </div>
+      )}
+
+      <div style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: 1.9 }}>
+        修改的是网关自己的 config.json（只改监听地址，端口不变），
+        <b>需要重启该网关后生效</b>；修改前会自动备份一份配置。<br />
+        {!enabled
+          ? '当前仅本机可访问：只有这台机器上的程序能连。'
+          : '开放后局域网内任何人都能调用该网关的接口——若该网关没有配置访问密钥，请谨慎开启。'}
+      </div>
     </>
   )
 }
