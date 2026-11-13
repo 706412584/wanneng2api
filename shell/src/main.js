@@ -368,16 +368,24 @@ function setupSelfUpdater() {
 }
 
 /**
- * 把代理解析结果写入壳自更新。禁用或地址不合法时清空，避免关掉代理后
- * electron-updater 还沿用旧代理。设置保存后会再次调用。
+ * 把代理写给壳自更新。
+ *
+ * electron-updater 没有 setProxy（9.x 也没有），它走的是自己那条
+ * electron net session——所以要在那个 session 上设代理。session 名由它
+ * 内部固定为 'electron-updater'（electronHttpExecutor.NET_SESSION_NAME），
+ * 优先从它导出里取，取不到再退回字面量。
  */
 function applyProxyToUpdater() {
   try {
-    const { autoUpdater } = require('electron-updater');
+    const { session } = require('electron');
+    let name = 'electron-updater';
+    try { name = require('electron-updater/out/electronHttpExecutor').NET_SESSION_NAME || name; } catch { /* 用字面量 */ }
     const p = proxy.config();
     const usable = p.enabled && p.scopes.selfUpdate && proxy.validProxyUrl(p.url);
-    // electron-updater 的 setProxy 收 null 表示不用代理
-    autoUpdater.setProxy(usable ? p.url : null);
+    const ses = session.fromPartition(name, { cache: false });
+    // 关掉代理时必须显式设 direct：不设会沿用上一次的代理
+    ses.setProxy(usable ? { proxyRules: p.url } : { mode: 'direct' })
+      .catch((e) => shellLog('warn', `[self-update] 设置代理失败: ${e.message}`));
   } catch (e) {
     shellLog('warn', `[self-update] 设置代理失败: ${e.message}`);
   }

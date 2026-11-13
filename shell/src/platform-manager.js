@@ -597,11 +597,17 @@ class PlatformManager extends EventEmitter {
   }
 
   // ── 启动 ──
-  async start(id, { force = false } = {}) {
+  /**
+   * @param {object} [opts]
+   * @param {boolean} [opts.forUpdate] 更新流程内部重启（替换完文件后要把平台
+   *   拉起来）。平台原本没在运行时，更新期间状态一直是 updating，这条守卫
+   *   会把更新自己的重启挡掉——「平台更新中，禁止启动」。只给 updater 用。
+   */
+  async start(id, { force = false, forUpdate = false } = {}) {
     const rt = this.getRuntime(id);
     if (!rt) throw new Error(`未知平台: ${id}`);
     const cfg = rt.cfg;
-    if (rt.status === 'updating') throw new Error('平台更新中，禁止启动');
+    if (rt.status === 'updating' && !forUpdate) throw new Error('平台更新中，禁止启动');
     if (rt.proc && !rt.stopping) throw new Error('平台已在运行');
     if (cfg.enabled === false) throw new Error('平台已禁用，请先 enable');
 
@@ -825,10 +831,19 @@ class PlatformManager extends EventEmitter {
   }
 
   // ── 优雅停止 ──
-  async stop(id, { timeoutMs = 3000 } = {}) {
+  /**
+   * @param {object} [opts]
+   * @param {boolean} [opts.forUpdate] 更新流程内部停止。更新必须先把自己标成
+   *   updating（挡住用户的手动启停），随后又要停掉旧进程才能替换文件——
+   *   那条「更新中禁止停止」的守卫会把它自己挡住，导致下载完成后永远装不上
+   *   （实测：下载 14.8MB 成功 → 「失败于安装前: 平台更新中，禁止停止」，
+   *   于是每次检查都还是「有新版」）。这个开关只给 updater 用，外部调用
+   *   一律不给，手动停仍然被守卫挡住。
+   */
+  async stop(id, { timeoutMs = 3000, forUpdate = false } = {}) {
     const rt = this.getRuntime(id);
     if (!rt) throw new Error(`未知平台: ${id}`);
-    if (rt.status === 'updating') throw new Error('平台更新中，禁止停止');
+    if (rt.status === 'updating' && !forUpdate) throw new Error('平台更新中，禁止停止');
     // 外部托管平台不归壳管，stop 只停止探测，不碰对方进程。
     if (rt.cfg.type === 'external' || rt.cfg.managed === false) {
       rt.clearTimers();

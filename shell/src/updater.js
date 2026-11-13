@@ -304,8 +304,9 @@ class PlatformUpdater {
         id, version: info.latest, strategy, ts: Date.now(),
       }));
 
-      // 3. stop 平台
-      if (rt.proc) { await this.manager.stop(id); platformStopped = true; }
+      // 3. stop 平台。必须带 forUpdate：更新已把自己标成 updating，
+      // 默认守卫会以「平台更新中，禁止停止」拒绝，导致永远装不上。
+      if (rt.proc) { await this.manager.stop(id, { forUpdate: true }); platformStopped = true; }
 
       // 4. 备份
       const backupDir = path.join(this.updatesDir(id), 'backups', String(Date.now()));
@@ -340,7 +341,8 @@ class PlatformUpdater {
       } else {
         rt.appendLog('manager', `[update] 安装完成，重启验证（≤${HEALTH_VERIFY_SEC}s）`);
         try {
-          await this.manager.start(id);
+          // forUpdate：平台原本没在运行时状态仍是 updating，默认守卫会拒绝
+          await this.manager.start(id, { forUpdate: true });
           platformStopped = false;
         } catch (e) {
           throw new Error(`更新后启动失败: ${e.message}`);
@@ -372,7 +374,8 @@ class PlatformUpdater {
         // 就恢复运行，否则保持原状。
         rt.appendLog('manager', `[update] 失败于安装前（未改动任何文件）: ${e.message}`);
         try {
-          if (platformStopped) { await this.manager.start(id); platformStopped = false; }
+          // forUpdate：这条路径同样可能还处于 updating 状态
+          if (platformStopped) { await this.manager.start(id, { forUpdate: true }); platformStopped = false; }
         } catch (_e) { /* 保持现状 */ }
         const hint = upstream ? '（无法连接 GitHub，请检查网络或代理）' : '';
         // 不能标 error：平台本身好好的、旧版本照常跑，标 error 会让平台卡
@@ -388,14 +391,15 @@ class PlatformUpdater {
         const raw = fs.existsSync(marker) ? fs.readFileSync(marker, 'utf8') : '';
         const manifest = raw ? JSON.parse(raw) : null;
         if (manifest && manifest.backupDir && fs.existsSync(manifest.backupDir)) {
-          if (rt.proc) { await this.manager.stop(id).catch(() => {}); }
+          // 回滚同样处于 updating 状态，也要放行，否则回滚停不掉进程
+          if (rt.proc) { await this.manager.stop(id, { forUpdate: true }).catch(() => {}); }
           this._restore(manifest);
           // 同样不能对禁用平台调 start()：那会抛「平台已禁用」，
           // 让一次成功回滚被误报成「回滚失败，请人工检查 backups」。
           if (rt.cfg && rt.cfg.enabled === false) {
             rt.setStatus('stopped');
           } else {
-            await this.manager.start(id);
+            await this.manager.start(id, { forUpdate: true });
           }
           rolledBack = true;
         }

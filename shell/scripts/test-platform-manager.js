@@ -240,7 +240,8 @@ async function testDisabledPlatformUpdateSucceeds() {
     const store = {
       platformWorkDir: () => workDir,
       getPlatform: () => p,
-      updatePlatform: () => {},
+      // 真实实现会把升级后的版本登记回 platforms.json，这里照做以便断言
+      updatePlatform: (_id, patch) => { Object.assign(p, patch); Object.assign(p.updater, patch.updater || {}); },
       manager: { update: {} },
     };
     const rt = {
@@ -286,9 +287,20 @@ async function testDisabledPlatformUpdateSucceeds() {
       setStatus(s, err = '') { this.status = s; if (err) this.lastError = err; },
       appendLog() {},
     };
+    // 这两个替身照抄真实平台管理器的守卫：更新期间（status=updating）默认
+    // 拒绝 stop/start，只有 forUpdate 才放行。曾经更新自己把自己锁死——
+    // 下载完 14.8MB 后停不掉平台，报「平台更新中，禁止停止」，于是永远装不上。
     const manager2 = {
-      start: async () => { rt2.status = 'healthy'; },
-      stop: async () => {},
+      startCalls: [], stopCalls: [],
+      async start(id, opts = {}) {
+        manager2.startCalls.push(!!opts.forUpdate);
+        if (rt2.status === 'updating' && !opts.forUpdate) throw new Error('平台更新中，禁止启动');
+        rt2.status = 'healthy';
+      },
+      async stop(id, opts = {}) {
+        manager2.stopCalls.push(!!opts.forUpdate);
+        if (rt2.status === 'updating' && !opts.forUpdate) throw new Error('平台更新中，禁止停止');
+      },
       getRuntime: () => rt2,
       emit: () => {},
     };
@@ -306,6 +318,51 @@ async function testDisabledPlatformUpdateSucceeds() {
     ok('下载失败不谎报「回滚失败」', !/回滚失败/.test(rt2.lastError), rt2.lastError);
     ok('下载失败提示是网络/代理', /网络|代理/.test(rt2.lastError), rt2.lastError);
     ok('下载失败不把平台标成 error', rt2.status !== 'error', `got ${rt2.status}`);
+
+    // ── 成功路径：更新必须能停掉又拉起平台（自我锁死回归）──
+    const rt3 = {
+      cfg: { ...p, enabled: true }, status: 'healthy', proc: { pid: 1 }, version: '1.0.0', lastError: '',
+      setStatus(s, err = '') { this.status = s; if (err) this.lastError = err; },
+      appendLog() {},
+    };
+    const manager3 = {
+      startCalls: [], stopCalls: [],
+      async start(id, opts = {}) {
+        manager3.startCalls.push(!!opts.forUpdate);
+        if (rt3.status === 'updating' && !opts.forUpdate) throw new Error('平台更新中，禁止启动');
+        rt3.status = 'healthy'; rt3.proc = { pid: 2 };
+      },
+      async stop(id, opts = {}) {
+        manager3.stopCalls.push(!!opts.forUpdate);
+        if (rt3.status === 'updating' && !opts.forUpdate) throw new Error('平台更新中，禁止停止');
+        rt3.proc = null;
+      },
+      getRuntime: () => rt3,
+      emit: () => {},
+    };
+    const upd3 = new PlatformUpdater({ manager: manager3, store, dataDir: root, logger: { info(){}, warn(){}, error(){} } });
+    upd3._download = async (_url, dest) => { fs.writeFileSync(dest, 'NEW3'); return dest; };
+    upd3._replaceBinary = async () => {
+      fs.writeFileSync(path.join(workDir, 'app.exe'), 'NEW3');
+      return { binaryPath: path.join(workDir, 'app.exe') };
+    };
+    upd3._waitHealthy = async () => true;   // 不真等 60s
+    await upd3.apply('mockdisabled', {
+      checked: true, hasUpdate: true, assetUrl: 'https://example.invalid/app.exe',
+      latest: '9.9.9', current: '1.0.0',
+    });
+    for (let i = 0; i < 100 && upd3.busy.has('mockdisabled'); i++) {
+      await new Promise((res) => setTimeout(res, 20));
+    }
+    ok('更新期间确实调用了 stop', manager3.stopCalls.length > 0);
+    ok('停止平台带 forUpdate（否则被自己的守卫挡住）', manager3.stopCalls.every(Boolean), JSON.stringify(manager3.stopCalls));
+    ok('重启平台带 forUpdate', manager3.startCalls.length > 0 && manager3.startCalls.every(Boolean),
+      JSON.stringify(manager3.startCalls));
+    ok('更新成功：文件已替换', fs.readFileSync(path.join(workDir, 'app.exe'), 'utf8') === 'NEW3');
+    ok('更新成功后不给平台留 lastError', !rt3.lastError, rt3.lastError);
+    ok('更新成功后状态为 healthy', rt3.status === 'healthy', `got ${rt3.status}`);
+    ok('更新成功后登记 currentVersion（否则界面永远显示 —）', p.updater.currentVersion === '9.9.9',
+      String(p.updater.currentVersion));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
