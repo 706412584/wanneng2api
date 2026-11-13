@@ -251,9 +251,9 @@ function defaultPlatforms() {
         },
         adminPanel: 'http://127.0.0.1:6789/panel/',
         updater: {
-          // 指向本仓库自己的分支。上游 ketion/lingxi2api-panel 至今没有发过
-          // release，但一旦发了，壳会拉取上游代码并覆盖本地修复
-          //（上游错误伪装成正文、anyOf 工具 schema 导致整轮失败）。
+          // 指向本仓库自己的分支。上游至今没有发过 release，但一旦发了，
+          // 壳会拉取上游代码并覆盖本地修复（上游错误伪装成正文、
+          // anyOf 工具 schema 导致整轮失败）。
           repo: '706412584/lingxi2api-panel',
           assetPattern: '.*windows.*\\.exe$',
           strategy: 'replace-binary',
