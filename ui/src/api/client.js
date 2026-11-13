@@ -139,6 +139,10 @@ export const api = {
   // 代理连通性验证：拿填写的地址真的发一次请求（后端固定探 GitHub API）
   verifyProxy: (url) => request('/api/proxy/verify', { method: 'POST', body: { url }, timeout: 30000 }),
 
+  // 壳自身更新检查。壳不是平台，不能借 /api/platforms/:id/update/check
+  // （此前传 'hub' 占位，而自研 Hub 已移除，永远 404）。
+  checkShellUpdate: () => request('/api/shell/update/check', { method: 'POST', timeout: 60000 }),
+
   updatesSummary: async () => {
     const d = await request('/api/updates/summary')
     const items = Array.isArray(d?.items)

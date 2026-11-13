@@ -105,7 +105,17 @@ async function main() {
   require('../src/proxy').init(store);
   const manager = new PlatformManager({ store, dataDir, logger });
   const updater = new PlatformUpdater({ manager, store, dataDir, logger });
-  const api = new ApiServer({ manager, updater, store, openExternal: () => {} });
+  // 壳自更新替身：真实实现在 main.js（依赖 Electron）。这里只验证路由打通与形状，
+  // 重点是「壳不是平台」——不能再借 /api/platforms/:id/update/check。
+  let selfUpdateCalls = 0;
+  const selfUpdate = {
+    check: async () => {
+      selfUpdateCalls += 1;
+      return { supported: true, current: '0.1.7', latest: '0.1.7', hasUpdate: false,
+        releaseUrl: 'https://github.com/706412584/wanneng2api/releases' };
+    },
+  };
+  const api = new ApiServer({ manager, updater, store, openExternal: () => {}, selfUpdate });
   await api.listen('127.0.0.1:17809');
   console.log(`api up, dataDir=${dataDir}\n`);
 
@@ -260,6 +270,34 @@ async function main() {
   // 绝不能写成「直连正常——这台机器不需要代理」。
   ok('直连侧不把 403 当「正常」', !/直连正常/.test(dead.json.verdict)
     || (dead.json.direct.status < 400), dead.json.verdict);
+
+  // ── 壳自身更新 ──
+  console.log('\n[壳自更新]');
+  // 回归：前端曾传 'hub' 借平台端点，而自研 Hub 已移除 → 永远 404「未知平台: hub」
+  const hubCheck = await req('POST', '/api/platforms/hub/update/check');
+  ok('旧写法（拿 hub 占位）确实 404——这就是被修掉的 bug', hubCheck.status === 404);
+  const sc = await req('POST', '/api/shell/update/check');
+  ok('壳自更新走独立端点 200', sc.status === 200, `got ${sc.status}`);
+  ok('返回 supported/current/hasUpdate 形状', sc.json.supported === true
+    && typeof sc.json.current === 'string' && typeof sc.json.hasUpdate === 'boolean', JSON.stringify(sc.json));
+  ok('确实调用了 selfUpdate.check', selfUpdateCalls === 1, String(selfUpdateCalls));
+  // 不支持时（开发环境/macOS）必须给出原因，而不是抛 500
+  const apiNoSelf = new ApiServer({ manager, updater, store, openExternal: () => {} });
+  await apiNoSelf.listen('127.0.0.1:17808');
+  try {
+    const r = await new Promise((resolve) => {
+      const rq = http.request({ host: '127.0.0.1', port: 17808, method: 'POST', path: '/api/shell/update/check' }, (res) => {
+        let b = '';
+        res.setEncoding('utf8');
+        res.on('data', (d) => { b += d; });
+        res.on('end', () => resolve({ status: res.statusCode, json: JSON.parse(b || '{}') }));
+      });
+      rq.on('error', () => resolve({ status: 0, json: {} }));
+      rq.end();
+    });
+    ok('未注入 selfUpdate 时给出明确错误而非崩溃', r.status === 400 && /不可用/.test(r.json.error || ''),
+      `${r.status} ${JSON.stringify(r.json)}`);
+  } finally { await apiNoSelf.close().catch(() => {}); }
 
   // ── updates/summary ──
   console.log('\n[updates/summary]');

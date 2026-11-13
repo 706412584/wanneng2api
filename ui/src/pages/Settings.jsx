@@ -102,11 +102,13 @@ export default function Settings() {
   const checkShellUpdate = async () => {
     setShellChecking(true)
     try {
-      // 壳子自身更新走 electron-updater；此处通过 manager API 的更新汇总取壳子（id=shell/hub 之外的条目由壳子实现方约定）
-      // 用 updates/summary 里 id=hub 的 check 作为壳子更新探测的演示入口不合适，直接调用 manager 约定端点：
-      const r = await api.checkUpdate('hub')
-      if (r.latest && r.latest !== r.current) {
-        toast(`发现壳子新版本 v${r.latest}，请到更新中心执行`, 'ok')
+      // 壳不是平台（platforms.json 里没有它），走 electron-updater 的独立通道。
+      // 早期这里传 'hub' 占位，而自研 Hub 早已移除，于是固定 404「未知平台: hub」。
+      const r = await api.checkShellUpdate()
+      if (r.supported === false) {
+        toast(`壳子更新不可用：${r.reason || '当前平台不支持'}`)
+      } else if (r.hasUpdate) {
+        toast(`发现壳子新版本 v${r.latest}（当前 v${r.current}）`, 'ok')
       } else {
         toast(`壳子已是最新（v${r.current}）`)
       }

@@ -691,6 +691,15 @@ class ApiServer {
       return proxy.verify(url);
     }
 
+    // POST /api/shell/update/check —— 壳自身更新检查。
+    // 壳不是平台（platforms.json 里没有它），走 electron-updater，因此不能
+    // 借用 /api/platforms/:id/update/check（早先前端拿 'hub' 当占位，而自研
+    // Hub 早已移除，于是永远 404「未知平台: hub」）。
+    if (method === 'POST' && parts[1] === 'shell' && parts[2] === 'update' && parts[3] === 'check') {
+      if (!this.deps.selfUpdate) throw new Error('壳自更新在当前平台不可用');
+      return this.deps.selfUpdate.check();
+    }
+
     // GET /api/updates/summary
     if (method === 'GET' && parts[1] === 'updates' && parts[2] === 'summary') {
       return { updates: await updater.summary() };

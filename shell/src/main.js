@@ -333,12 +333,16 @@ function applyAutoStart() {
 }
 
 // ── electron-updater（壳自身更新，§7.4）──
+/** 壳自更新是否可用：仅在打包后的 Windows / Linux AppImage 上成立 */
+function selfUpdateSupported() {
+  if (app.isPackaged !== true) return false;      // 开发环境
+  if (process.platform === 'darwin') return false; // 未签名，macOS 自更新不可用
+  if (process.platform !== 'win32' && !process.env.APPIMAGE) return false;
+  return true;
+}
+
 function setupSelfUpdater() {
-  // Linux 走 AppImage 自更新；deb/rpm 装出来的包没有可替换的镜像文件，
-  // electron-updater 会直接报错，所以只对 AppImage 启用。
-  if (app.isPackaged !== true) return; // 开发环境跳过
-  if (process.platform === 'darwin') return; // 未签名，macOS 自更新不可用
-  if (process.platform !== 'win32' && !process.env.APPIMAGE) return;
+  if (!selfUpdateSupported()) return;
   try {
     const { autoUpdater } = require('electron-updater');
     autoUpdater.autoDownload = false;
@@ -365,6 +369,27 @@ function setupSelfUpdater() {
   } catch (e) {
     shellLog('warn', `electron-updater 初始化失败: ${e.message}`);
   }
+}
+
+/**
+ * 供 Manager API 调用的壳自更新检查。
+ * 壳不是平台，没有 platforms.json 条目，所以走这条独立通道。
+ */
+async function checkSelfUpdate() {
+  if (!selfUpdateSupported()) {
+    return { supported: false, reason: '壳自更新在当前平台不可用（仅 Windows 安装包与 Linux AppImage 支持）', current: app.getVersion() };
+  }
+  const { autoUpdater } = require('electron-updater');
+  const result = await autoUpdater.checkForUpdates();
+  const latest = result && result.updateInfo && result.updateInfo.version;
+  const current = app.getVersion();
+  return {
+    supported: true,
+    current,
+    latest: latest || current,
+    hasUpdate: !!(latest && latest !== current),
+    releaseUrl: `https://github.com/706412584/wanneng2api/releases`,
+  };
 }
 
 /**
@@ -416,6 +441,8 @@ app.whenReady().then(async () => {
     openExternal: (u) => shell.openExternal(u),
     // 设置保存后（代理可能变了）：壳自更新要重新下发代理
     onSettingsSaved: () => applyProxyToUpdater(),
+    // 壳不是平台，自更新检查走独立通道（前端此前拿 'hub' 占位，永远 404）
+    selfUpdate: { check: checkSelfUpdate },
   });
   // 同一个端口托管 UI：主窗口走 http://127.0.0.1:17800/ 而不是 file://
   // （见 loadUiFromManager 的说明），所以这里必须把静态目录挂上。
