@@ -21,19 +21,19 @@ function makePlatforms() {
   return [
     {
       id: 'hub', name: 'Hub 聚合层', type: 'go-binary', enabled: true, state: 'healthy',
-      pid: 24100, uptimeSec: 86400 + 3600, version: '0.3.1', port: 17810, health: 'ok', lastError: null, updateAvailable: false
+      pid: 24100, uptimeSec: 86400 + 3600, version: '0.3.1', port: 17810, health: 'ok', lastError: null, updateAvailable: false, installed: true
     },
     {
       id: 'workbuddy', name: 'WorkBuddy2API', type: 'go-binary', enabled: true, state: 'healthy',
-      pid: 22108, uptimeSec: 86400 - 1200, version: '1.8.4', port: 7863, health: 'ok', lastError: null, updateAvailable: true
+      pid: 22108, uptimeSec: 86400 - 1200, version: '1.8.4', port: 7863, health: 'ok', lastError: null, updateAvailable: true, installed: true
     },
     {
       id: 'codearts', name: 'CodeArts2API Panel', type: 'go-binary', enabled: true, state: 'degraded',
-      pid: 19456, uptimeSec: 4210, version: '2.1.0', port: 7866, health: 'fail-2', lastError: '健康探活 /v1/models 连续 2 次超时', updateAvailable: true
+      pid: 19456, uptimeSec: 4210, version: '2.1.0', port: 7866, health: 'fail-2', lastError: '健康探活 /v1/models 连续 2 次超时', updateAvailable: true, installed: true
     },
     {
       id: 'loomy', name: 'Loomy2API', type: 'python-module', enabled: true, state: 'starting',
-      pid: 31244, uptimeSec: 14, version: '0.9.7', port: 17990, health: 'pending', lastError: null, updateAvailable: false
+      pid: 31244, uptimeSec: 14, version: '0.9.7', port: 17990, health: 'pending', lastError: null, updateAvailable: false, installed: true
     },
     {
       id: 'sub2api', name: 'Sub2API（可选）', type: 'go-binary', enabled: false, state: 'stopped',
@@ -190,6 +190,14 @@ function nextVersion(v) {
 }
 
 export const mockApi = {
+  platformInstallStatus: async (id) => ({ id, status: 'not-installed' }),
+  installPlatform: async (id) => ({ id, started: false, installed: true, status: 'installed' }),
+  registerPlatformProvider: async () => ({ ok: true }),
+  shellUpdateStatus: async () => ({ supported: false, reason: '开发预览不连接桌面壳更新' }),
+  checkShellUpdate: async () => ({ supported: false, reason: '开发预览不连接桌面壳更新' }),
+  downloadShellUpdate: async () => ({ supported: false }),
+  installShellUpdate: async () => ({ supported: false }),
+
   async getOverview() {
     await latency(120)
     const running = platforms.filter((p) => ['healthy', 'degraded', 'starting'].includes(p.state)).length

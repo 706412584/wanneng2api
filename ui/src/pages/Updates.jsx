@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api/client'
 import { usePolling } from '../hooks/usePolling'
 import { useToast } from '../components/Toast'
+import { useConfirm } from '../components/Busy'
 import { Empty, ErrorBox, Loading, StateDot, STATE_TEXT } from '../components/Bits'
 import { fmtAgo } from '../utils/format'
 
@@ -214,6 +215,8 @@ export default function Updates() {
         {!items.length && <Empty icon="⟳" text="暂无版本数据，点击「一键检查全部」开始" />}
       </div>
 
+      <ShellUpdateCard />
+
       <MagpieCoreCard />
 
       {anyUpdating && (
@@ -242,6 +245,81 @@ export default function Updates() {
         </div>
       </div>
     </>
+  )
+}
+
+/** 壳更新：下载期间留在本页显示真实进度，安装必须由用户再次确认。 */
+function ShellUpdateCard() {
+  const fetchStatus = useCallback(() => api.shellUpdateStatus(), [])
+  const { data, loading, refresh } = usePolling(fetchStatus, 1500)
+  const [busy, setBusy] = useState('')
+  const toast = useToast()
+  const confirm = useConfirm()
+  const run = async (action, fn) => {
+    setBusy(action)
+    try {
+      const result = await fn()
+      if (result.supported === false) toast(result.reason || '当前环境不支持壳自更新', 'err')
+      refresh()
+      return result
+    } catch (e) {
+      toast(`壳更新失败：${e.message}`, 'err')
+      refresh()
+      return null
+    } finally { setBusy('') }
+  }
+  const state = data || {}
+  const install = async () => {
+    const ok = await confirm(`v${state.latest} 已下载完成。安装将停止当前托管的平台并重启应用，是否继续？`, {
+      title: '确认重启并安装', okText: '停止平台并重启', cancelText: '稍后', danger: true,
+    })
+    if (ok) run('install', api.installShellUpdate)
+  }
+  const active = ['checking', 'downloading'].includes(state.status) || !!busy
+  return (
+    <div className="card" style={{ marginTop: 16 }}>
+      <div className="card-title" style={{ justifyContent: 'space-between' }}>
+        <span>应用更新 <span className="sub">Wanneng2API 桌面壳</span></span>
+        {state.current && <span className="badge gray">当前 v{state.current}</span>}
+      </div>
+      {loading && !data && <Loading text="读取应用更新状态…" />}
+      {data && (
+        <>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{ flex: 1, minWidth: 220, fontSize: 12.5, color: 'var(--text-2)' }}>
+              {state.supported === false ? state.reason :
+                state.status === 'downloaded' ? `v${state.latest} 已下载完成，确认后重启安装。` :
+                  state.status === 'downloading' ? `正在下载 v${state.latest || ''}，请勿关闭应用。` :
+                    state.status === 'available' ? `发现新版本 v${state.latest}` :
+                      state.status === 'error' ? state.error :
+                        state.status === 'checking' ? '正在检查新版本…' : '检查、下载和安装分步进行，不会自动退出。'}
+            </span>
+            {!['downloaded'].includes(state.status) && (
+              <button className="btn sm" disabled={active} onClick={() => run('check', api.checkShellUpdate)}>
+                {state.status === 'checking' || busy === 'check' ? '检查中…' : '检查更新'}
+              </button>
+            )}
+            {state.supported !== false && ['available', 'error', 'idle'].includes(state.status) && state.hasUpdate !== false && (
+              <button className="btn sm primary" disabled={active} onClick={() => run('download', api.downloadShellUpdate)}>下载更新</button>
+            )}
+            {state.status === 'downloaded' && (
+              <button className="btn sm primary" disabled={!!busy} onClick={install}>
+                {busy === 'install' ? '正在停止平台并重启…' : '重启并安装'}
+              </button>
+            )}
+          </div>
+          {state.status === 'downloading' && (
+            <div style={{ marginTop: 12 }}>
+              <div className="progress"><div className="bar" style={{ width: `${state.percent || 0}%` }} /></div>
+              <div className="sub" style={{ marginTop: 6 }}>
+                {(state.percent || 0).toFixed(1)}% · {(state.received / 1048576 || 0).toFixed(1)} / {(state.total / 1048576 || 0).toFixed(1)} MB
+              </div>
+            </div>
+          )}
+          {state.status === 'error' && <div className="plat-error" style={{ marginTop: 10 }}>⚠ {state.error}</div>}
+        </>
+      )}
+    </div>
   )
 }
 

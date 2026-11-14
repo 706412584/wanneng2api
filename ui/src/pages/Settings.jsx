@@ -1,15 +1,17 @@
 // 设置页：manager.json 读写（general / update / sub2api）+ 关于区（版本/检查壳更新）
-import { useCallback, useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { api, apiMode } from '../api/client'
 import { usePolling } from '../hooks/usePolling'
 import { useToast } from '../components/Toast'
 import { Empty, ErrorBox, Loading } from '../components/Bits'
 
 const PLATFORM_CHOICES = [
-  { id: 'hub', label: 'Hub 聚合层' },
   { id: 'workbuddy', label: 'WorkBuddy2API' },
   { id: 'codearts', label: 'CodeArts2API' },
   { id: 'loomy', label: 'Loomy2API' },
+  { id: 'lingxi', label: 'Lingxi2API' },
+  { id: 'magpie-web', label: 'Magpie 控制台' },
+  { id: 'magpie', label: 'Magpie 网关（探测外部实例）' },
   { id: 'sub2api', label: 'Sub2API' }
 ]
 
@@ -102,13 +104,11 @@ export default function Settings() {
   const checkShellUpdate = async () => {
     setShellChecking(true)
     try {
-      // 壳不是平台（platforms.json 里没有它），走 electron-updater 的独立通道。
-      // 早期这里传 'hub' 占位，而自研 Hub 早已移除，于是固定 404「未知平台: hub」。
       const r = await api.checkShellUpdate()
       if (r.supported === false) {
         toast(`壳子更新不可用：${r.reason || '当前平台不支持'}`)
       } else if (r.hasUpdate) {
-        toast(`发现壳子新版本 v${r.latest}（当前 v${r.current}）`, 'ok')
+        toast(`发现壳子新版本 v${r.latest}，请前往更新中心下载`, 'ok')
       } else {
         toast(`壳子已是最新（v${r.current}）`)
       }
@@ -314,6 +314,7 @@ export default function Settings() {
             <button className="btn" disabled={shellChecking} onClick={checkShellUpdate}>
               {shellChecking ? '检查中…' : '检查壳子更新'}
             </button>
+            <Link className="btn" to="/updates">查看下载进度</Link>
             <span style={{ fontSize: 12, color: 'var(--text-3)' }}>壳子自更新走 electron-updater（GitHub Releases）</span>
           </div>
         </div>

@@ -551,6 +551,8 @@ class ApiServer {
       const [action] = rest;
 
       if (method === 'POST') {
+        if (action === 'install') return updater.install(id);
+        if (action === 'register-provider') return updater.registerProvider(id);
         if (action === 'start') return manager.start(id, { force: !!(body && body.force) });
         if (action === 'stop') return manager.stop(id);
         if (action === 'restart') return manager.restart(id, { force: !!(body && body.force) });
@@ -591,6 +593,7 @@ class ApiServer {
       }
 
       if (method === 'GET') {
+        if (action === 'install') return updater.installStatus(id);
         if (action === 'detail') return this._platformDetail(id);
         if (action === 'logs') {
           const tail = Math.min(500, Math.max(1, Number(u.searchParams.get('tail')) || 200));
@@ -704,8 +707,19 @@ class ApiServer {
     // 借用 /api/platforms/:id/update/check（早先前端拿 'hub' 当占位，而自研
     // Hub 早已移除，于是永远 404「未知平台: hub」）。
     if (method === 'POST' && parts[1] === 'shell' && parts[2] === 'update' && parts[3] === 'check') {
-      if (!this.deps.selfUpdate) throw new Error('壳自更新在当前平台不可用');
+      if (!this.deps.selfUpdate) return { supported: false, reason: '纯浏览器模式不支持壳自更新' };
       return this.deps.selfUpdate.check();
+    }
+    if (parts[1] === 'shell' && parts[2] === 'update' && parts[3] === 'status' && method === 'GET') {
+      return this.deps.selfUpdate ? this.deps.selfUpdate.status() : { supported: false, reason: '纯浏览器模式不支持壳自更新' };
+    }
+    if (parts[1] === 'shell' && parts[2] === 'update' && parts[3] === 'download' && method === 'POST') {
+      if (!this.deps.selfUpdate) return { supported: false, reason: '纯浏览器模式不支持壳自更新' };
+      return this.deps.selfUpdate.download();
+    }
+    if (parts[1] === 'shell' && parts[2] === 'update' && parts[3] === 'install' && method === 'POST') {
+      if (!this.deps.selfUpdate) throw new Error('纯浏览器模式不支持壳自更新');
+      return this.deps.selfUpdate.install();
     }
 
     // GET /api/updates/summary

@@ -89,7 +89,7 @@ function adaptPlatformList(r) {
 }
 
 // ---------- 平台 ----------
-export const api = {
+export const api = new Proxy({
   getOverview: async () => {
     const d = await request('/api/overview')
     const platforms = adaptPlatformList(d)
@@ -122,6 +122,9 @@ export const api = {
     { method: 'POST', body: opts || undefined, timeout: 180000 },
   ),
   getLogs: (id, tail = 200) => request(`/api/platforms/${encodeURIComponent(id)}/logs?tail=${tail}`),
+  installPlatform: (id) => request(`/api/platforms/${encodeURIComponent(id)}/install`, { method: 'POST', timeout: 30000 }),
+  platformInstallStatus: (id) => request(`/api/platforms/${encodeURIComponent(id)}/install`),
+  registerPlatformProvider: (id) => request(`/api/platforms/${encodeURIComponent(id)}/register-provider`, { method: 'POST', timeout: 180000 }),
 
   checkUpdate: (id) => request(`/api/platforms/${encodeURIComponent(id)}/update/check`, { method: 'POST' }),
   applyUpdate: (id, checkInfo) => request(`/api/platforms/${encodeURIComponent(id)}/update/apply`, { method: 'POST', body: checkInfo ? { checkInfo } : undefined }),
@@ -142,6 +145,9 @@ export const api = {
   // 壳自身更新检查。壳不是平台，不能借 /api/platforms/:id/update/check
   // （此前传 'hub' 占位，而自研 Hub 已移除，永远 404）。
   checkShellUpdate: () => request('/api/shell/update/check', { method: 'POST', timeout: 60000 }),
+  shellUpdateStatus: () => request('/api/shell/update/status'),
+  downloadShellUpdate: () => request('/api/shell/update/download', { method: 'POST', timeout: 30000 }),
+  installShellUpdate: () => request('/api/shell/update/install', { method: 'POST', timeout: 120000 }),
 
   updatesSummary: async () => {
     const d = await request('/api/updates/summary')
@@ -220,7 +226,12 @@ export const api = {
 
   getSettings: () => request('/api/settings'),
   putSettings: (settings) => request('/api/settings', { method: 'PUT', body: settings })
-}
+}, {
+  get(live, method) {
+    if (isMock && Object.prototype.hasOwnProperty.call(mockApi, method)) return mockApi[method]
+    return live[method]
+  },
+})
 
 /**
  * SSE 实时日志流。

@@ -89,7 +89,9 @@ function expandPath(p) {
  * 能力：strip 掉 .exe 即可，各家的基名一致。
  */
 const EXE = process.platform === 'win32' ? '.exe' : '';
-function defaultPlatforms() {
+
+function defaultPlatforms({ forInstall = false, dataDir = appDataDir() } = {}) {
+  const managedDir = (id) => forInstall ? path.join(dataDir, 'platforms', id) : null;
   return {
     version: 1,
     platforms: [
@@ -98,8 +100,8 @@ function defaultPlatforms() {
         name: 'WorkBuddy2API',
         type: 'go-binary',
         enabled: true,
-        mode: 'import',
-        workDir: 'D:/软件/workbuddy2api',
+        mode: forInstall ? 'managed' : 'import',
+        workDir: managedDir('workbuddy') || 'D:/软件/workbuddy2api',
         run: {
           // 必须是 wb2api.exe：它才是与 start.cmd 一致、含最新指纹/会话头修复的
           // 构建。server.exe 是 2026-09-27 的旧产物，缺 X-Conversation-Message-ID /
@@ -123,9 +125,11 @@ function defaultPlatforms() {
         // /__admin/ 只注册了 handler，实测返回 404。
         adminPanel: 'http://127.0.0.1:7863/',
         updater: {
-          repo: '',
-          assetPattern: 'workbuddy2api.*windows.*amd64\\.exe$',
-          strategy: 'replace-binary',
+          repo: '706412584/workbuddy2api',
+          assetPattern: process.platform === 'win32'
+            ? '^wb2api-v[0-9.]+-windows-amd64\\.zip$'
+            : `^wb2api-v[0-9.]+-linux-${process.arch === 'arm64' ? 'arm64' : 'amd64'}\\.tar\\.gz$`,
+          strategy: 'replace-dir',
           preserveGlobs: ['config.json', 'auths/**', 'data/**'],
         },
         restart: { baseBackoffSec: 2, maxBackoffSec: 300, maxRetries: 0 },
@@ -135,8 +139,8 @@ function defaultPlatforms() {
         name: 'CodeArts2API Panel',
         type: 'go-binary',
         enabled: true,
-        mode: 'import',
-        workDir: 'D:/app/codearts2api-panel/bin',
+        mode: forInstall ? 'managed' : 'import',
+        workDir: managedDir('codearts') || 'D:/app/codearts2api-panel/bin',
         run: {
           binary: `codearts2api-panel${EXE}`,
           args: ['--config', 'config.json'],
@@ -154,9 +158,11 @@ function defaultPlatforms() {
         },
         adminPanel: 'http://127.0.0.1:7866/',
         updater: {
-          repo: '',
-          assetPattern: '.*windows.*\\.exe$',
-          strategy: 'replace-binary',
+          repo: '706412584/codearts2api-panel',
+          assetPattern: process.platform === 'win32'
+            ? '^codearts2api-panel_v[0-9.]+_windows_amd64\\.zip$'
+            : `^codearts2api-panel_v[0-9.]+_linux_${process.arch === 'arm64' ? 'arm64' : 'amd64'}\\.tar\\.gz$`,
+          strategy: 'replace-dir',
           preserveGlobs: ['config.json', 'auths/**', 'data/**'],
         },
         restart: { baseBackoffSec: 2, maxBackoffSec: 300, maxRetries: 0 },
@@ -166,8 +172,8 @@ function defaultPlatforms() {
         name: 'Loomy2API',
         type: 'python-module',
         enabled: true,
-        mode: 'import',
-        workDir: 'D:/app/loomy2api',
+        mode: forInstall ? 'managed' : 'import',
+        workDir: managedDir('loomy') || 'D:/app/loomy2api',
         run: {
           pythonPath: 'bundled',       // bundled=壳子捆绑 python-embed，找不到回落系统 python
           module: 'loomy2api',
@@ -188,7 +194,7 @@ function defaultPlatforms() {
           // 指向本仓库自己的分支（已公开）。上游那份没有我们需要的改动，
           // 版本号也对不上，更新会装回错的代码。
           repo: '706412584/loomy2api',
-          assetPattern: '.*\\.zip$',
+          assetPattern: '^loomy2api-v[0-9.]+\\.zip$',
           strategy: 'replace-dir',
           preserveGlobs: ['config.json', 'accounts.json', 'accounts.json.bak*', 'auths/**', 'data/**', 'logs/**'],
         },
@@ -232,8 +238,8 @@ function defaultPlatforms() {
         name: 'Lingxi2API（WPS 灵犀）',
         type: 'go-binary',
         enabled: true,
-        mode: 'import',
-        workDir: 'D:/app/lingxi2api-panel',
+        mode: forInstall ? 'managed' : 'import',
+        workDir: managedDir('lingxi') || 'D:/app/lingxi2api-panel',
         run: {
           binary: `lingxi2api${EXE}`,
           args: [],
@@ -255,8 +261,10 @@ function defaultPlatforms() {
           // 壳会拉取上游代码并覆盖本地修复（上游错误伪装成正文、
           // anyOf 工具 schema 导致整轮失败）。
           repo: '706412584/lingxi2api-panel',
-          assetPattern: '.*windows.*\\.exe$',
-          strategy: 'replace-binary',
+          assetPattern: process.platform === 'win32'
+            ? '^lingxi2api-v[0-9.]+-windows-amd64\\.zip$'
+            : `^lingxi2api-v[0-9.]+-linux-${process.arch === 'arm64' ? 'arm64' : 'amd64'}\\.tar\\.gz$`,
+          strategy: 'replace-dir',
           preserveGlobs: ['config.json', 'auths/**', 'data/**'],
         },
         restart: { baseBackoffSec: 2, maxBackoffSec: 300, maxRetries: 0 },
@@ -332,6 +340,7 @@ class ConfigStore {
     this.manager = null;
     this.platforms = null;
     this.loadAll();
+    // 新配置使用用户数据目录；已有 platforms.json 保持原目录与账号。
   }
 
   _ensureDir() {
@@ -364,7 +373,7 @@ class ConfigStore {
       }
     }
     if (!fs.existsSync(this.platformsPath)) {
-      this.platforms = defaultPlatforms();
+      this.platforms = defaultPlatforms({ forInstall: true, dataDir: this.dataDir });
       this._writeJson(this.platformsPath, this.platforms);
     } else {
       this.platforms = this._readJson(this.platformsPath, defaultPlatforms());

@@ -96,6 +96,7 @@ function findMagpieBinary(dataDir) {
       if (c && fs.existsSync(c)) return c;
     } catch { /* 无权访问的路径跳过 */ }
   }
+  if (process.env.WANNENG_DISABLE_SYSTEM_MAGPIE === '1') return null;
   return null;
 }
 
@@ -203,6 +204,7 @@ class PlatformRuntime {
     this.okCount = 0;
     this.healthTimer = null;
     this.restartTimer = null;
+    this.missingBinary = false;
     this.stopping = false;
     this.adopted = false;   // 端口上已有本平台实例，被认领而非 spawn
     this.version = null;
@@ -251,6 +253,9 @@ class PlatformRuntime {
       type: cfg.type || '',
       enabled: !!cfg.enabled,
       mode: cfg.mode || '',
+      installed: this.mgr.isInstalled(this.id),
+      missingBinary: this.missingBinary,
+      workDir: this.mgr.store.platformWorkDir(cfg),
       status: this.status,
       pid: this.pid,
       port: cfg.port || 0,
@@ -349,6 +354,50 @@ class PlatformManager extends EventEmitter {
     return this.rts.get(id) || null;
   }
 
+  isInstalled(id) {
+    const rt = this.getRuntime(id);
+    if (!rt) return false;
+    const cfg = rt.cfg;
+    if (cfg.type === 'external' || cfg.managed === false) return true;
+    try {
+      if (['workbuddy', 'codearts', 'loomy', 'lingxi'].includes(id)) {
+        const root = this.store.platformWorkDir(cfg);
+        if (cfg.type === 'python-module') return fs.existsSync(path.join(root, cfg.run.module || id, '__main__.py'));
+        const binary = (cfg.run && cfg.run.binary) || '';
+        if (!binary) return false;
+        const direct = path.isAbsolute(binary) ? binary : path.join(root, binary);
+        if (fs.existsSync(direct)) return true;
+        // 导入目录可能保留 bin/ 等历史布局；只在目录内再找一层，不搜 PATH。
+        for (const name of fs.readdirSync(root)) {
+          const candidate = path.join(root, name, binary);
+          if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return true;
+        }
+        return false;
+      }
+      if (cfg.type === 'python-module') {
+        const root = this.store.platformWorkDir(cfg);
+        return fs.existsSync(path.join(root, cfg.run.module || id, '__main__.py'));
+      }
+      if (id === 'magpie-web') return !!findMagpieBinary(this.dataDir);
+      const cmd = this._resolveCommand(rt);
+      return fs.existsSync(cmd.command) || (!/[/\\]/.test(cmd.command) && !!whichSync(cmd.command));
+    } catch {
+      return false;
+    }
+  }
+
+  async waitForListening(id, timeoutMs = 30000) {
+    const rt = this.getRuntime(id);
+    if (!rt) return false;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (rt.proc && rt.cfg.port && await probePortOpen(rt.cfg.port)) return true;
+      if (!rt.proc || rt.stopping || this._stopping) return false;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    return false;
+  }
+
   // ── 命令解析 ──
   _resolveCommand(rt) {
     const cfg = rt.cfg;
@@ -375,6 +424,13 @@ class PlatformManager extends EventEmitter {
       // 直接用裸名会 ENOENT），否则退回 PATH 查找（测试用的 node/python 等）。
       const inWorkDir = path.join(workDir, binary);
       command = fs.existsSync(inWorkDir) ? inWorkDir : binary;
+      if (command === binary && ['workbuddy', 'codearts', 'loomy', 'lingxi'].includes(cfg.id)
+        && fs.existsSync(workDir)) {
+        for (const name of fs.readdirSync(workDir)) {
+          const candidate = path.join(workDir, name, binary);
+          if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) { command = candidate; break; }
+        }
+      }
       // magpie 是外部依赖，不随安装包分发：装机后它可能在 PATH、标准安装
       // 目录，或用户自己放在数据目录。这里统一探测一次。
       if (command === binary && /^magpie(\.exe)?$/i.test(binary)) {
@@ -603,7 +659,7 @@ class PlatformManager extends EventEmitter {
    *   拉起来）。平台原本没在运行时，更新期间状态一直是 updating，这条守卫
    *   会把更新自己的重启挡掉——「平台更新中，禁止启动」。只给 updater 用。
    */
-  async start(id, { force = false, forUpdate = false } = {}) {
+  async start(id, { force = false, forUpdate = false, waitForHealth = true } = {}) {
     const rt = this.getRuntime(id);
     if (!rt) throw new Error(`未知平台: ${id}`);
     const cfg = rt.cfg;
@@ -616,6 +672,7 @@ class PlatformManager extends EventEmitter {
     rt.lastError = '';
     rt.failCount = 0;
     rt.okCount = 0;
+    rt.missingBinary = false;
 
     // 0. 外部托管平台（如 magpie）：壳不启动它，只探测存活并反映到状态灯。
     //    它的生命周期由应用自身/系统托盘负责，壳无权启停。
@@ -732,7 +789,8 @@ class PlatformManager extends EventEmitter {
       // exists 已经把「绝对路径存在」和「裸名能在 PATH 找到」都算进去了，
       // 所以只要 !exists 就是真找不到。
       if (!exists) {
-        const msg = `可执行文件不存在: ${cmd.command}（工作目录 ${cmd.cwd}）`;
+        const msg = `可执行文件不存在: ${cmd.command}（工作目录 ${cmd.cwd}）。请先安装或导入该网关`;
+        rt.missingBinary = ['workbuddy', 'codearts', 'loomy', 'lingxi'].includes(id) && !this.isInstalled(id);
         rt.setStatus('error', msg);
         throw new Error(msg);
       }
@@ -796,8 +854,8 @@ class PlatformManager extends EventEmitter {
       rt.lastExitCode = code;
       if (rt.healthTimer) { clearInterval(rt.healthTimer); rt.healthTimer = null; }
       rt.appendLog('manager', `exit code=${code} stopping=${wasStopping}`);
-      if (wasStopping || this._stopping) {
-        rt.setStatus('stopped');
+      if (wasStopping || this._stopping || rt.missingBinary) {
+        rt.setStatus(rt.missingBinary ? 'error' : 'stopped');
         return;
       }
       // crash 分支
@@ -819,7 +877,11 @@ class PlatformManager extends EventEmitter {
       }, delay * 1000);
     });
 
-    // 5. 等待首次健康
+    // 5. 等待首次健康；首次安装只要求监听，空账号池的 503 不算安装失败。
+    if (!waitForHealth) {
+      this._scheduleHealthTimer(rt);
+      return rt.snapshot();
+    }
     const ok = await this._waitForFirstHealth(rt, this._startTimeoutSec(rt));
     if (rt.proc && ok) {
       rt.setStatus('healthy');
@@ -959,6 +1021,7 @@ class PlatformManager extends EventEmitter {
       const rt = this.getRuntime(id);
       if (!rt) return;
       if (rt.cfg.enabled === false) return;
+      if (['workbuddy', 'codearts', 'loomy', 'lingxi'].includes(id) && !this.isInstalled(id)) return;
       if (delaySec > 0) await new Promise((r) => setTimeout(r, delaySec * 1000));
       try {
         await this.start(id);

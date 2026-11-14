@@ -114,6 +114,9 @@ async function main() {
       return { supported: true, current: '0.1.9', latest: '0.1.9', hasUpdate: false,
         releaseUrl: 'https://github.com/706412584/wanneng2api/releases' };
     },
+    status: () => ({ supported: true, status: 'downloading', percent: 50, received: 5, total: 10 }),
+    download: async () => ({ supported: true, status: 'downloading' }),
+    install: async () => ({ ok: true }),
   };
   const api = new ApiServer({ manager, updater, store, openExternal: () => {}, selfUpdate });
   await api.listen('127.0.0.1:17809');
@@ -293,6 +296,12 @@ async function main() {
   ok('返回 supported/current/hasUpdate 形状', sc.json.supported === true
     && typeof sc.json.current === 'string' && typeof sc.json.hasUpdate === 'boolean', JSON.stringify(sc.json));
   ok('确实调用了 selfUpdate.check', selfUpdateCalls === 1, String(selfUpdateCalls));
+  const updateStatus = await req('GET', '/api/shell/update/status');
+  ok('更新进度可读', updateStatus.status === 200 && updateStatus.json.percent === 50);
+  const updateDownload = await req('POST', '/api/shell/update/download');
+  ok('下载只下发不退出', updateDownload.status === 200 && updateDownload.json.status === 'downloading');
+  const updateInstall = await req('POST', '/api/shell/update/install');
+  ok('确认安装走独立端点', updateInstall.status === 200 && updateInstall.json.ok === true);
   // 不支持时（开发环境/macOS）必须给出原因，而不是抛 500
   const apiNoSelf = new ApiServer({ manager, updater, store, openExternal: () => {} });
   await apiNoSelf.listen('127.0.0.1:17808');
@@ -307,7 +316,7 @@ async function main() {
       rq.on('error', () => resolve({ status: 0, json: {} }));
       rq.end();
     });
-    ok('未注入 selfUpdate 时给出明确错误而非崩溃', r.status === 400 && /不可用/.test(r.json.error || ''),
+    ok('未注入 selfUpdate 时给出明确错误而非崩溃', r.status === 200 && r.json.supported === false,
       `${r.status} ${JSON.stringify(r.json)}`);
   } finally { await apiNoSelf.close().catch(() => {}); }
 

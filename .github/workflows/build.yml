@@ -39,6 +39,8 @@ jobs:
           node shell/scripts/test-gateway-panel.js
           node shell/scripts/test-plugin-panel.js
           node shell/scripts/test-api-server.js
+          npm --prefix shell run test:install
+          npm --prefix shell run test:self-update
 
       - name: UI 构建
         run: npm --prefix ui run build

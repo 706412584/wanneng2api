@@ -67,9 +67,9 @@ function makeConfig(dir, platforms) {
 }
 
 function testImportedCodeArtsCommand() {
-  const cfg = defaultPlatforms().platforms.find((p) => p.id === 'codearts');
-  // 结构性断言：不能硬编码盘符，换机器/CI 也要成立
-  ok('CodeArts 默认工作目录以 bin 结尾', /[/\\]bin$/.test(cfg.workDir), `cwd=${cfg.workDir}`);
+  const cfg = defaultPlatforms({ forInstall: true, dataDir: os.tmpdir() }).platforms.find((p) => p.id === 'codearts');
+  // 首次安装使用根目录；用户原有的 bin 导入目录仍由 ConfigStore 保留。
+  ok('CodeArts 新安装工作目录不以 bin 结尾', !/[/\\]bin$/.test(cfg.workDir), `cwd=${cfg.workDir}`);
   // 默认名按平台推导：Windows 带 .exe，POSIX 不带
   const exeSuffix = process.platform === 'win32' ? '.exe' : '';
   ok('CodeArts 默认使用 bin 内的可执行文件', cfg.run.binary === `codearts2api-panel${exeSuffix}`,
@@ -380,13 +380,12 @@ function testCrossPlatformShape() {
   ok('POSIX 校验可执行位（X_OK）', /fs\.constants\.X_OK/.test(pm));
 
   const up = fs.readFileSync(path.join(__dirname, '..', 'src', 'updater.js'), 'utf8');
-  ok('POSIX 解压优先 unzip', /execFile\('unzip'/.test(up));
-  ok('POSIX 解压退回 tar', /execFile\('tar', \['-xf'/.test(up));
+  ok('ZIP 使用固定解析器，不依赖系统 tar', /require\('adm-zip'\)/.test(up));
+  ok('ZIP 拒绝目录穿越', /发布包路径越界/.test(up));
   ok('解压合并补回执行位', /chmodSync\(d, 0o755\)/.test(up));
   ok('replace-binary 补回执行位', /chmodSync\(target, 0o755\)/.test(up));
-  // Windows 专用路径必须保留，不能被跨平台改造误删
-  ok('Windows 仍用 --force-local 解 tar', /--force-local/.test(up));
-  ok('Windows 仍保留 PowerShell 兜底', /Expand-Archive/.test(up));
+  // Windows 不再依赖系统 tar/PowerShell 的 ZIP 兼容性。
+  ok('tar.gz 保留 tar 解压', /\.tar\\.gz/.test(up));
   ok('Windows 仍用 taskkill /T', /taskkill\.exe/.test(pm));
 
   const cfgSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'config.js'), 'utf8');

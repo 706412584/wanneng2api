@@ -23,6 +23,7 @@ const proxy = require('./proxy');
 let store = null;
 let manager = null;
 let updater = null;
+let selfUpdater = null;
 let api = null;
 let mainWindow = null;
 let splashWindow = null;
@@ -342,54 +343,38 @@ function selfUpdateSupported() {
 }
 
 function setupSelfUpdater() {
-  if (!selfUpdateSupported()) return;
   try {
     const { autoUpdater } = require('electron-updater');
-    autoUpdater.autoDownload = false;
-    autoUpdater.autoInstallOnAppQuit = true;
-    // 壳自更新的代理：electron-updater 走自己的下载器，不认我们给 http/https
-    // 装的 agent，必须显式告诉它。勾选「壳自更新」且地址合法才设。
-    applyProxyToUpdater();
-    autoUpdater.on('update-available', (info) => {
-      dialog.showMessageBox(mainWindow, {
-        type: 'info', title: '发现新版本',
-        message: `壳新版本 v${info.version} 可用，是否下载？`,
-        buttons: ['下载更新', '稍后'], defaultId: 0,
-      }).then(({ response }) => { if (response === 0) autoUpdater.downloadUpdate(); });
-    });
-    autoUpdater.on('update-downloaded', () => {
-      dialog.showMessageBox(mainWindow, {
-        type: 'info', title: '更新就绪',
-        message: '壳更新已下载，重启应用即可安装。',
-        buttons: ['立即重启', '稍后'], defaultId: 0,
-      }).then(({ response }) => { if (response === 0) autoUpdater.quitAndInstall(); });
+    const { SelfUpdater } = require('./self-updater');
+    selfUpdater = new SelfUpdater(autoUpdater, {
+      currentVersion: app.getVersion(),
+      supported: selfUpdateSupported(),
+      reason: '壳自更新在当前平台不可用（仅 Windows 安装包与 Linux AppImage 支持）',
+      beforeInstall: async () => {
+        // quitAndInstall 会跳过 Electron 的 before-quit 生命周期，先按正常退出收尾。
+        if (manager) await manager.stopAll();
+        if (api) await api.close();
+      },
     });
     autoUpdater.on('error', (err) => shellLog('warn', `[self-update] ${err.message}`));
-    setTimeout(() => autoUpdater.checkForUpdates().catch(() => {}), 10000);
+    applyProxyToUpdater();
+    if (store.manager.update && store.manager.update.checkOnLaunch) {
+      setTimeout(() => selfUpdater.check().catch(() => {}), 10000);
+    }
   } catch (e) {
     shellLog('warn', `electron-updater 初始化失败: ${e.message}`);
   }
 }
 
-/**
- * 供 Manager API 调用的壳自更新检查。
- * 壳不是平台，没有 platforms.json 条目，所以走这条独立通道。
- */
-async function checkSelfUpdate() {
-  if (!selfUpdateSupported()) {
-    return { supported: false, reason: '壳自更新在当前平台不可用（仅 Windows 安装包与 Linux AppImage 支持）', current: app.getVersion() };
-  }
-  const { autoUpdater } = require('electron-updater');
-  const result = await autoUpdater.checkForUpdates();
-  const latest = result && result.updateInfo && result.updateInfo.version;
-  const current = app.getVersion();
-  return {
-    supported: true,
-    current,
-    latest: latest || current,
-    hasUpdate: !!(latest && latest !== current),
-    releaseUrl: `https://github.com/706412584/wanneng2api/releases`,
-  };
+function selfUpdateController() {
+  if (selfUpdater) return selfUpdater;
+  const { SelfUpdater } = require('./self-updater');
+  selfUpdater = new SelfUpdater(require('electron-updater').autoUpdater, {
+    currentVersion: app.getVersion(),
+    supported: selfUpdateSupported(),
+    reason: '壳自更新在当前平台不可用（仅 Windows 安装包与 Linux AppImage 支持）',
+  });
+  return selfUpdater;
 }
 
 /**
@@ -442,7 +427,7 @@ app.whenReady().then(async () => {
     // 设置保存后（代理可能变了）：壳自更新要重新下发代理
     onSettingsSaved: () => applyProxyToUpdater(),
     // 壳不是平台，自更新检查走独立通道（前端此前拿 'hub' 占位，永远 404）
-    selfUpdate: { check: checkSelfUpdate },
+    selfUpdate: selfUpdateController(),
   });
   // 同一个端口托管 UI：主窗口走 http://127.0.0.1:17800/ 而不是 file://
   // （见 loadUiFromManager 的说明），所以这里必须把静态目录挂上。

@@ -14,7 +14,7 @@ const path = require('path');
 const https = require('https');
 const http = require('http');
 const { execFile } = require('child_process');
-const { simpleGlobMatch } = require('./platform-manager');
+const { simpleGlobMatch, findMagpieBinary } = require('./platform-manager');
 const proxy = require('./proxy');
 
 const HEALTH_VERIFY_SEC = 60;
@@ -79,6 +79,8 @@ class PlatformUpdater {
     this.log = logger || { info: () => {}, warn: () => {}, error: () => {} };
     this.busy = new Set(); // 正在 apply 的平台
     this._releaseCache = new Map(); // repo -> { at, data }
+    this.installStates = new Map();
+    this.installTasks = new Map();
   }
 
   updatesDir(id) {
@@ -86,7 +88,7 @@ class PlatformUpdater {
   }
 
   // ── §7.1 检查 ──
-  async check(id) {
+  async check(id, { forInstall = false } = {}) {
     const p = this.store.getPlatform(id);
     if (!p) throw new Error(`未知平台: ${id}`);
     const u = p.updater || {};
@@ -118,7 +120,7 @@ class PlatformUpdater {
     }
     const latestVersion = (asset && versionFromAsset(asset.name)) || String(latest.tag_name || '').replace(/^v/i, '');
     const current = this.currentVersion(p);
-    const hasUpdate = !!asset && isNewerVersion(latestVersion, current);
+    const hasUpdate = !!asset && (forInstall || isNewerVersion(latestVersion, current));
     // 有 Release 但没有任何资产匹配 assetPattern（例如仓库只发 APK，
     // 而这里要 windows zip）：这不是「已是最新」，用户点下去也装不了。
     // 必须单独标记，否则界面会显示绿色的「最新」，把「装不了」说成「不用装」。
@@ -135,7 +137,8 @@ class PlatformUpdater {
       assetUrl: asset ? asset.browser_download_url : null,
       assetName: asset ? asset.name : null,
       assetSize: asset ? asset.size : null,
-      sha256: asset ? this._assetDigest(latest, asset.name) : null,
+      sha256: asset && asset.digest && asset.digest.startsWith('sha256:')
+        ? asset.digest.slice(7).toLowerCase() : (asset ? this._assetDigest(latest, asset.name) : null),
       notes: latest.body || '',
       publishedAt: latest.published_at || null,
       allAssets: assets,
@@ -212,6 +215,162 @@ class PlatformUpdater {
       req.on('timeout', () => { req.destroy(); reject(new Error('GitHub API 超时')); });
       req.on('error', reject);
     });
+  }
+
+  installStatus(id) {
+    return this.installStates.get(id) || { id, status: this.manager.isInstalled(id) ? 'installed' : 'not-installed' };
+  }
+
+  install(id) {
+    if (!['workbuddy', 'codearts', 'loomy', 'lingxi'].includes(id)) throw new Error('该平台不支持一键安装');
+    if (this.manager.isInstalled(id) && !['error', 'installed-without-provider'].includes(this.installStatus(id).status)) {
+      return Promise.resolve({ started: false, installed: true, ...this.installStatus(id) });
+    }
+    if (this.installTasks.has(id)) return Promise.resolve({ started: false, ...this.installStatus(id) });
+    const task = this._install(id).catch((e) => {
+      this._installState(id, { status: 'error', message: e.message });
+    }).finally(() => this.installTasks.delete(id));
+    this.installTasks.set(id, task);
+    return Promise.resolve({ started: true, ...this.installStatus(id) });
+  }
+
+  _installState(id, patch) {
+    const next = { ...this.installStatus(id), ...patch, updatedAt: Date.now() };
+    this.installStates.set(id, next);
+    return next;
+  }
+
+  async _install(id) {
+    const p = this.store.getPlatform(id);
+    const workDir = this.store.platformWorkDir(p);
+    const stage = path.join(this.dataDir, 'updates', id, 'install');
+    const extractDir = path.join(stage, 'extracted');
+    if (this.manager.isInstalled(id)) {
+      this._installState(id, { status: 'starting', message: '程序已在目录中，正在恢复启动与注册…' });
+      try {
+        const rt = this.manager.getRuntime(id);
+        if (!rt.proc) await this.manager.start(id, { waitForHealth: false });
+        const listening = rt.adopted || await this.manager.waitForListening(id);
+        if (!listening) throw new Error('程序已安装，但服务未能监听端口，请查看平台日志');
+        const registration = await this.registerProvider(id);
+        this._installState(id, {
+          status: registration.ok ? 'installed' : 'installed-without-provider',
+          message: registration.ok ? '安装完成，请在管理中添加账号' : `安装完成；${registration.message}`,
+          registration,
+        });
+      } catch (e) {
+        this._installState(id, { status: 'error', message: e.message });
+      }
+      return;
+    }
+    const protectedFiles = ['config.json', 'accounts.json', 'auths', 'data', 'config.yaml'];
+    if (fs.existsSync(workDir) && protectedFiles.some((name) => fs.existsSync(path.join(workDir, name)))) {
+      this._installState(id, {
+        status: 'needs-import',
+        message: '该目录已有配置或账号数据，但未找到主程序。为保护数据，未写入任何文件；请换空目录安装，或手工恢复主程序后重试。',
+      });
+      return;
+    }
+    this._installState(id, { status: 'checking', message: '正在获取发布版本…', received: 0, total: 0 });
+    try {
+      const info = await this.check(id, { forInstall: true });
+      if (!info.checked || !info.assetUrl) throw new Error(info.reason || '当前系统没有匹配的发布包');
+      fs.mkdirSync(stage, { recursive: true });
+      const dlPath = path.join(stage, `${info.assetName}.part`);
+      this._installState(id, { status: 'downloading', message: `正在下载 ${info.assetName}`, version: info.latest });
+      await this._download(info.assetUrl, dlPath, 0, ({ received, total }) => {
+        this._installState(id, { received, total: total || info.assetSize || 0 });
+      });
+      if (info.sha256) {
+        const actual = await this._sha256File(dlPath);
+        if (actual !== info.sha256) throw new Error('发布包 SHA-256 校验失败');
+      }
+      this._installState(id, { status: 'extracting', message: '正在解压并准备默认配置…' });
+      fs.rmSync(extractDir, { recursive: true, force: true });
+      fs.mkdirSync(extractDir, { recursive: true });
+      await this._extract(dlPath, extractDir, info.assetName);
+      if (this.manager.isInstalled(id)) {
+        this._installState(id, { status: 'installed', message: '检测到已有安装，已保留原目录与配置', version: info.latest });
+        return;
+      }
+      const src = this._stripSingleRoot(extractDir);
+      fs.mkdirSync(workDir, { recursive: true });
+      this._mergeTree(src, workDir, (p.updater && p.updater.preserveGlobs) || []);
+      this._writeInitialConfig(id, workDir, p.port);
+      this.store.updatePlatform(id, { updater: { ...(p.updater || {}), currentVersion: info.latest } });
+      this._installState(id, { status: 'starting', message: '正在启动并验证本机服务…', version: info.latest });
+      const rt = this.manager.getRuntime(id);
+      await this.manager.start(id, { waitForHealth: false });
+      if (rt.adopted) {
+        this._installState(id, { status: 'installed', message: '检测到已运行的网关，已复用现有配置' });
+        return;
+      }
+      const listening = await this.manager.waitForListening(id);
+      if (!listening) throw new Error('程序已安装，但服务未能监听端口，请查看平台日志');
+      this._installState(id, { status: 'registering', message: '正在注册到 magpie…', version: info.latest });
+      const registration = await this.registerProvider(id);
+      this._installState(id, {
+        status: registration.ok ? 'installed' : 'installed-without-provider',
+        message: registration.ok ? '安装完成，请在管理中添加账号' : `安装完成；${registration.message}`,
+        version: info.latest, registration,
+      });
+    } catch (e) {
+      this._installState(id, { status: 'error', message: e.message });
+    }
+  }
+
+  _writeInitialConfig(id, workDir, port) {
+    const file = path.join(workDir, 'config.json');
+    if (fs.existsSync(file)) return;
+    if (fs.existsSync(path.join(workDir, 'accounts.json'))
+      || fs.existsSync(path.join(workDir, 'auths')) || fs.existsSync(path.join(workDir, 'data'))) {
+      throw new Error('已有账号数据但缺少配置，未生成新配置；请先备份并导入原配置');
+    }
+    const config = {
+      listen: `127.0.0.1:${port}`,
+      api_key: require('crypto').randomBytes(32).toString('hex'),
+      auth_dir: './auths',
+      state_file: './data/state.json',
+    };
+    if (id === 'codearts') config.admin_key = require('crypto').randomBytes(32).toString('hex');
+    if (id === 'loomy') {
+      config.host = '127.0.0.1';
+      config.port = port;
+      config.api_keys = [config.api_key];
+      delete config.api_key;
+      delete config.listen;
+      delete config.auth_dir;
+      delete config.state_file;
+    }
+    fs.writeFileSync(file, JSON.stringify(config, null, 2), { mode: 0o600, flag: 'wx' });
+    if (id === 'loomy') {
+      const accounts = path.join(workDir, 'accounts.json');
+      if (!fs.existsSync(accounts)) fs.writeFileSync(accounts, '{"accounts":[]}\n', { mode: 0o600, flag: 'wx' });
+    }
+  }
+
+  _gatewayConfig(workDir) {
+    try { return JSON.parse(fs.readFileSync(path.join(workDir, 'config.json'), 'utf8')); } catch { return {}; }
+  }
+
+  async registerProvider(id) {
+    const p = this.store.getPlatform(id);
+    if (!p || !['workbuddy', 'codearts', 'loomy', 'lingxi'].includes(id)) return { ok: false, message: '该平台不支持注册为自研网关' };
+    if (!this.manager.isInstalled(id)) return { ok: false, message: '网关尚未安装' };
+    const magpie = require('./magpie-adapter');
+    const bin = findMagpieBinary(this.dataDir);
+    if (!bin) return { ok: false, message: 'magpie 尚未安装，安装内核后可重试注册' };
+    const cfg = this._gatewayConfig(this.store.platformWorkDir(p));
+    const firstKey = Array.isArray(cfg.api_keys) ? cfg.api_keys[0] : '';
+    const key = cfg.api_key || (typeof firstKey === 'string' ? firstKey : firstKey && firstKey.key) || '';
+    if (!key) return { ok: false, message: '未找到网关 API 密钥，未修改 magpie 配置' };
+    const args = [`url=http://127.0.0.1:${p.port}`];
+    if (id !== 'lingxi') args.push(`anthropic=http://127.0.0.1:${p.port}`);
+    args.push('models=*');
+    const result = await magpie.addProvider(bin, { id: `wanneng-${id}`, key, args });
+    const redact = (value) => String(value || '').replace(/\b[A-Fa-f0-9]{32,}\b/g, '[已隐藏]')
+      .replace(/([?&](?:k|key|token|api_key)=)[^&\s]+/gi, '$1[已隐藏]').slice(0, 300);
+    return { ok: result.ok, message: result.ok ? '已注册到 magpie' : redact(result.stderr || result.stdout || 'magpie 注册失败，可重试').replaceAll(key, '[已隐藏]') };
   }
 
   // ── §7.2 / §7.3 应用 ──
@@ -511,49 +670,51 @@ class PlatformUpdater {
     return dir;
   }
 
-  _unzip(zipPath, destDir) {
+  _extract(archivePath, destDir, assetName) {
+    if (/\.zip$/i.test(assetName)) return this._unzip(archivePath, destDir);
+    if (!/\.tar\.gz$/i.test(assetName)) return Promise.reject(new Error('不支持的发布包格式'));
     return new Promise((resolve, reject) => {
-      // 无论哪个平台，都先把 .part 还原成 .zip：
-      // cat 只看扩展名 + 魔数，.part 后缀的 zip 会被判「不是 tar」。
-      const dir = path.dirname(zipPath);
-      const base = path.basename(zipPath).replace(/\.part$/i, '');
-      const zipDepot = path.join(dir, base.endsWith('.zip') ? base : base + '.zip');
-      try {
-        if (zipDepot !== zipPath && !fs.existsSync(zipDepot)) fs.copyFileSync(zipPath, zipDepot);
-      } catch (_e) { /* 让下面的解压报出真实原因 */ }
-
-      if (process.platform === 'win32') {
-        // Windows 自带 tar 是 libarchive：能解 zip，但绝对路径 'C:\...' 会被
-        // 当成「远端主机 C」→ 必须加 --force-local。
-        // PowerShell Expand-Archive 作兜底。
-        execFile('tar.exe', ['--force-local', '-xf', zipDepot, '-C', destDir],
-          { windowsHide: true, timeout: 120000 }, (err, _so, se) => {
-            if (!err) return resolve();
-            execFile('powershell.exe', ['-NoProfile', '-Command',
-              `Expand-Archive -LiteralPath '${zipDepot}' -DestinationPath '${destDir}' -Force`],
-              { windowsHide: true, timeout: 180000 }, (err2, _so2, se2) => {
-                if (err2) return reject(new Error(`解压失败: ${se || se2 || err2.message}`));
-                resolve();
-              });
-          });
-        return;
-      }
-
-      // POSIX：优先 unzip（存在最广），没有就退回 bsdtar/GNU tar。
-      // 两者都没有才报错，并把可执行的补救办法写进消息里。
-      execFile('unzip', ['-o', '-q', zipDepot, '-d', destDir],
-        { timeout: 180000 }, (err, _so, se) => {
-          if (!err) return resolve();
-          execFile('tar', ['-xf', zipDepot, '-C', destDir],
-            { timeout: 180000 }, (err2, _so2, se2) => {
-              if (err2) {
-                return reject(new Error(
-                  `解压失败：需要 unzip 或支持 zip 的 tar（${se || se2 || err2.message}）`));
-              }
-              resolve();
-            });
-        });
+      execFile('tar', ['-xzf', archivePath, '-C', destDir], { timeout: 180000, windowsHide: true }, (err, _stdout, stderr) => {
+        if (err) return reject(new Error(`解压失败: ${stderr || err.message}`));
+        this._makeExecutables(destDir);
+        resolve();
+      });
     });
+  }
+
+  _makeExecutables(dir) {
+    if (process.platform === 'win32') return;
+    for (const name of fs.readdirSync(dir)) {
+      const file = path.join(dir, name);
+      const stat = fs.statSync(file);
+      if (stat.isDirectory()) this._makeExecutables(file);
+      else if (!/\.(?:json|md|txt)$/i.test(name)) fs.chmodSync(file, 0o755);
+    }
+  }
+
+  _unzip(zipPath, destDir) {
+    try {
+      const AdmZip = require('adm-zip');
+      const zip = new AdmZip(zipPath);
+      for (const entry of zip.getEntries()) {
+        const name = entry.entryName;
+        if (entry.header.size > 512 * 1024 * 1024) throw new Error('发布包单个文件超过 512 MB，已停止解压');
+        if ((entry.attr >>> 16 & 0o170000) === 0o120000) throw new Error('发布包不允许包含符号链接');
+        if (!name || name.includes('\0') || path.isAbsolute(name) || /^[A-Za-z]:/.test(name)) {
+          throw new Error(`发布包含非法路径: ${name}`);
+        }
+        const target = path.resolve(destDir, name);
+        const relative = path.relative(path.resolve(destDir), target);
+        if (relative.startsWith('..') || path.isAbsolute(relative)) {
+          throw new Error(`发布包路径越界: ${name}`);
+        }
+      }
+      zip.extractAllTo(destDir, true);
+      this._makeExecutables(destDir);
+      return Promise.resolve();
+    } catch (e) {
+      return Promise.reject(new Error(`解压失败: ${e.message}`));
+    }
   }
 
   _backupExecutablePart(src, workDir, backupDir, preserve) {
@@ -617,7 +778,7 @@ class PlatformUpdater {
     return false;
   }
 
-  async _download(url, destPart, hop = 0) {
+  async _download(url, destPart, hop = 0, onProgress = null) {
     // GitHub 的资源地址会 302 到 objects.githubusercontent.com，正常一跳；
     // 给个上限避免被错误配置的代理/异常跳转拖成无限递归。
     if (hop > 5) throw new Error('下载重定向次数过多');
@@ -629,11 +790,17 @@ class PlatformUpdater {
       }), (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           res.resume();
-          this._download(res.headers.location, destPart, hop + 1).then(resolve, reject);
+          this._download(new URL(res.headers.location, url).href, destPart, hop + 1, onProgress).then(resolve, reject);
           return;
         }
         if (res.statusCode !== 200) { res.resume(); return reject(new Error(`下载失败 HTTP ${res.statusCode}`)); }
         const out = fs.createWriteStream(destPart);
+        let received = 0;
+        const total = Number(res.headers['content-length']) || 0;
+        res.on('data', (chunk) => {
+          received += chunk.length;
+          if (onProgress) onProgress({ received, total });
+        });
         // 响应流中途出错（连接被打断）必须落到 reject：只监听 out 的 error
         // 不够，res 的 error 没有 handler 会变成未捕获异常，把整个壳带崩。
         const fail = (e) => { out.destroy(); reject(e); };

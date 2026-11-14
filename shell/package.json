@@ -7,12 +7,15 @@
   "scripts": {
     "start": "electron .",
     "test:manager": "node scripts/test-platform-manager.js",
-    "check": "node --check src/main.js && node --check src/platform-manager.js && node --check src/updater.js && node --check src/api-server.js && node --check src/tray.js && node --check src/config.js && node --check src/logs.js && node --check src/proxy.js && node --check src/magpie-adapter.js && node --check src/gateway-panel.js"
+    "test:install": "node scripts/test-platform-install.js",
+    "test:self-update": "node scripts/test-self-updater.js",
+    "check": "node --check src/main.js && node --check src/platform-manager.js && node --check src/updater.js && node --check src/api-server.js && node --check src/tray.js && node --check src/config.js && node --check src/logs.js && node --check src/proxy.js && node --check src/magpie-adapter.js && node --check src/gateway-panel.js && node --check src/self-updater.js"
   },
   "author": "wanneng2api",
   "license": "MIT",
   "homepage": "https://github.com/706412584/wanneng2api",
   "dependencies": {
+    "adm-zip": "^0.6.1",
     "electron-updater": "^6.3.9",
     "http-proxy-agent": "^7.0.2",
     "https-proxy-agent": "^7.0.6",

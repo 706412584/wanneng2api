@@ -224,6 +224,7 @@ html[data-theme='dark'] .banner { background: #3a1d1d; color: #f2a19d; border-co
   background: color-mix(in srgb, var(--red) 8%, transparent);
   border-radius: 6px; padding: 6px 9px;
 }
+.install-status { display: flex; flex-direction: column; gap: 6px; padding: 4px 0; }
 
 /* ===== 状态灯 ===== */
 .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; display: inline-block; }

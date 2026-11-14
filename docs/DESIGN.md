@@ -8,6 +8,8 @@
 
 ## 0. 结论先行（关键决策记录）
 
+> 2026-11-14 实施补充：新用户首次运行使用 `<数据目录>/platforms/<id>`，四网关可从各自公开 Release 一键安装；已有 `platforms.json` 的导入目录、配置和账号不自动迁移。安装状态、下载进度、健康验证与 magpie 注册由 Manager API 提供。空账号池只要求进程监听成功，不把 `/healthz 503` 误判为安装失败。壳自更新在更新中心展示下载进度，只有用户再次点击「重启并安装」才退出。下文 §6 自研 Hub 为历史设计，当前统一入口仍是 magpie :3425。
+
 | # | 决策 | 理由 |
 |---|---|---|
 | D1 | **不给 sub2api 换 SQLite** | `backend/internal/repository/ent.go:126` 硬编码 `dialect.Postgres` + pq 驱动；SQL 迁移文件是 PG 专用语法（权威 schema）；多处仓库代码判断 `dialect.Postgres` 走特殊分支（`api_key_repo.go:567` 等）；Redis 也是硬依赖（rate_limiter、IM hub）。换 SQLite = 重写迁移体系 + 所有 PG 分支，按周计工作量且引入并发锁风险 |
@@ -356,6 +358,8 @@ GET    /api/updates/summary              全平台版本汇总（UI「更新中�
 
 ## 6. Hub 轻量聚合层详细设计（Go 单二进制，零 DB）
 
+> **历史方案，未采用。** 当前没有 `hub/` 实现；统一协议、路由、quota 由 magpie 承担。以下仅保留决策演进记录，新增功能不要按本节自研 Hub。
+
 ### 6.1 hub.json
 
 ```json
@@ -450,7 +454,7 @@ zip 下载 → 解包到暂存 → stop → 备份整个目录中**可执行部�
 
 ### 7.4 壳子自身更新
 
-`electron-updater` + GitHub Releases（完全照搬 any-auto-register main.js:262-291 的 update-available / update-downloaded 事件流），下载完成后提示重启应用。
+`electron-updater` + GitHub Releases。`shell/src/self-updater.js` 统一维护 `idle / checking / available / downloading / downloaded / error` 状态，更新中心展示真实下载百分比和字节数。检查、下载以及下载完成均不自动退出；用户点击「重启并安装」后才停止平台并调用 `quitAndInstall()`。
 
 ---
 

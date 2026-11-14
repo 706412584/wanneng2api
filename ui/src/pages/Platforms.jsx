@@ -668,11 +668,53 @@ function MagpieProviders() {
 }
 
 function PlatformCard({ p, busy, onAction, onOpenPanel, onRefresh }) {
+  const fmtBytes = (n) => `${(Number(n || 0) / 1048576).toFixed(1)} MB`
   const disabled = BUSY_STATES.includes(p.state) || !!busy
   const running = ['healthy', 'degraded', 'unhealthy', 'starting', 'updating'].includes(p.state)
   // 四家自研网关有原生管理面板；内核（external）没有，仍走「打开面板」
   const hasManager = !!p.id && ['workbuddy', 'codearts', 'loomy', 'lingxi'].includes(p.id)
   const [managerOpen, setManagerOpen] = useState(false)
+  const [install, setInstall] = useState(null)
+  const [installError, setInstallError] = useState('')
+  const toast = useToast()
+  const installBusy = install && ['checking', 'downloading', 'extracting', 'starting', 'registering'].includes(install.status)
+  const needsInstall = hasManager && ((!p.installed && !p.adopted && p.state !== 'healthy')
+    || ['error', 'installed-without-provider', 'needs-import'].includes(install?.status))
+  const showProgress = hasManager && install && install.status !== 'installed'
+
+  useEffect(() => {
+    if (!hasManager) return undefined
+    let alive = true
+    const load = async () => {
+      try {
+        const state = await api.platformInstallStatus(p.id)
+        if (alive) setInstall(state)
+      } catch { /* 列表安装状态仍可正常展示 */ }
+    }
+    load()
+    const timer = setInterval(load, installBusy ? 1000 : 5000)
+    return () => { alive = false; clearInterval(timer) }
+  }, [p.id, hasManager, installBusy])
+
+  const startInstall = async () => {
+    setInstallError('')
+    try {
+      const result = await api.installPlatform(p.id)
+      if (result.installed) onRefresh()
+      else setInstall((prev) => ({ ...prev, ...result }))
+    } catch (e) {
+      setInstallError(e.message)
+      toast(`安装失败：${e.message}`, 'err')
+    }
+  }
+
+  const retryRegistration = async () => {
+    try {
+      const result = await api.registerPlatformProvider(p.id)
+      toast(result.ok ? '已注册到 magpie' : result.message, result.ok ? 'ok' : 'err')
+      if (result.ok) setInstall((prev) => ({ ...prev, status: 'installed' }))
+    } catch (e) { toast(e.message, 'err') }
+  }
 
   return (
     <div className="card plat-card" data-kind={p.type === 'external' ? 'core' : 'own'}>
@@ -696,17 +738,40 @@ function PlatformCard({ p, busy, onAction, onOpenPanel, onRefresh }) {
       </div>
 
       <div className="plat-stats">
-        <span>状态 <b>{STATE_TEXT[p.state] || p.state}</b></span>
+        <span>状态 <b>{installBusy ? '安装中' : install?.status === 'needs-import' ? '需导入' : needsInstall && !installBusy ? '未安装' : STATE_TEXT[p.state] || p.state}</b></span>
         <span>健康 <b>{p.health === 'ok' ? '正常' : p.health === 'off' ? '—' : p.health === 'pending' ? '等待' : p.health}</b></span>
         <span>运行 <b>{running ? fmtUptime(p.uptimeSec) : '—'}</b></span>
       </div>
 
       {p.lastError && <div className="plat-error">⚠ {p.lastError}</div>}
 
+      {showProgress && (
+        <div className="install-status">
+          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 12 }}>
+            <span>{install.message || '等待安装'}</span>
+            {install.total > 0 && <span>{Math.min(100, Math.round((install.received / install.total) * 100))}%</span>}
+          </div>
+          {installBusy && (
+            <div className="progress">
+              <div className="bar" style={{ width: install.total > 0 ? `${Math.min(100, (install.received / install.total) * 100)}%` : '20%' }} />
+            </div>
+          )}
+          {install.total > 0 && <div className="sub">{fmtBytes(install.received)} / {fmtBytes(install.total)}</div>}
+          {install.status === 'installed-without-provider' && (
+            <button className="btn sm" onClick={retryRegistration}>重试注册到 magpie</button>
+          )}
+        </div>
+      )}
+      {installError && <div className="plat-error">⚠ {installError}</div>}
+
       {p.id === 'sub2api' && <DepDots p={p} />}
 
       <div className="plat-actions">
-        {running ? (
+        {needsInstall ? (
+          <button className="btn primary" disabled={installBusy} onClick={startInstall}>
+            {installBusy ? '安装中…' : install?.status === 'error' ? '重试安装' : install?.status === 'needs-import' ? '重试检测' : install?.status === 'installed-without-provider' ? '注册到 magpie' : '安装'}
+          </button>
+        ) : running ? (
           <>
             <button className="btn" disabled={disabled} onClick={() => onAction(p, 'restart', '重启')}>重启</button>
             <button className="btn danger" disabled={disabled} onClick={() => onAction(p, 'stop', '停止')}>停止</button>
