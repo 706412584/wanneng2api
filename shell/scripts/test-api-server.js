@@ -148,7 +148,36 @@ async function main() {
     start: () => { aliasCalls.push(['start']); },
     close: async () => { aliasCalls.push(['close']); },
   };
-  const api = new ApiServer({ manager, updater, store, openExternal: () => {}, selfUpdate, tunnelManager, aliasSync });
+  const gatewayKeys = [{
+    id: 'ff4234dcbcf5d93051e8c3aa', name: 'Magpie', off: false,
+    secret: 'sk-magpie-key-must-not-leak', masked: 'sk-magpie-key-…9f20ec',
+    models: ['wanneng-lingxi/*'], accounts: ['private-account'],
+    limit: { period: 'day', tokens: 100000000, cacheReads: true },
+    more: [],
+    used: { period: 'day', reset: '2026-11-17T00:00:00+08:00', calls: 709, tokens: 100147421, tokenLimit: 100000000, spent: true },
+    usedAll: [],
+  }];
+  const gatewayKeyCalls = [];
+  const pluginPanel = {
+    async _api(endpoint, body) {
+      gatewayKeyCalls.push({ endpoint, body });
+      if (endpoint === 'caller-keys') return { keys: gatewayKeys };
+      if (endpoint === 'caller-keys/limit-key') {
+        gatewayKeys[0].limit = body.limit;
+        return { keys: gatewayKeys };
+      }
+      if (endpoint === 'caller-keys/reset-limit-key') {
+        gatewayKeys[0].used = { ...gatewayKeys[0].used, tokens: 0, spent: false };
+        return { keys: gatewayKeys };
+      }
+      throw new Error(`unexpected api ${endpoint}`);
+    },
+    async detail() { return {}; },
+    async action() { return {}; },
+  };
+  const api = new ApiServer({
+    manager, updater, store, openExternal: () => {}, selfUpdate, tunnelManager, aliasSync, pluginPanel,
+  });
   await api.listen('127.0.0.1:17809');
   api.startAliasSync();
   console.log(`api up, dataDir=${dataDir}\n`);
@@ -273,6 +302,42 @@ async function main() {
   const beforeUnrelatedStatus = aliasCalls.length;
   manager.emit('status', 'mocka', 'healthy', {});
   ok('无关平台状态不触发 aliases 同步', aliasCalls.length === beforeUnrelatedStatus);
+
+  // ── Gateway Key 额度（含每 N 小时/每 N 天）──
+  console.log('\n[gateway-keys]');
+  const gk = await req('GET', '/api/magpie/gateway-keys');
+  ok('gateway-keys 200 且返回 Key', gk.status === 200 && gk.json.keys.length === 1);
+  ok('额度响应不泄露 secret/masked/accounts',
+    !gk.raw.includes('sk-magpie-key-must-not-leak') && !gk.raw.includes('…9f20ec') && !gk.raw.includes('private-account'));
+  ok('额度用量只保留安全字段', gk.json.keys[0].used.tokens === 100147421 && gk.json.keys[0].used.tokenLimit === 100000000);
+  const gkHour = await req('POST', '/api/magpie/gateway-keys/limit', {
+    keyId: 'ff4234dcbcf5d93051e8c3aa', limit: { period: 'hours', hours: 24, tokens: 1000, cost: 0 },
+  });
+  ok('每 24 小时额度可保存', gkHour.status === 200
+    && gatewayKeyCalls.some((c) => c.endpoint === 'caller-keys/limit-key'
+      && c.body.limit.period === 'hours' && c.body.limit.hours === 24));
+  const gkDay = await req('POST', '/api/magpie/gateway-keys/limit', {
+    keyId: 'ff4234dcbcf5d93051e8c3aa', limit: { period: 'days', days: 7, tokens: 5000 },
+  });
+  ok('每 7 天额度可保存', gkDay.status === 200
+    && gatewayKeyCalls.some((c) => c.endpoint === 'caller-keys/limit-key'
+      && c.body.limit.period === 'days' && c.body.limit.days === 7));
+  const gkBad = await req('POST', '/api/magpie/gateway-keys/limit', {
+    keyId: 'ff4234dcbcf5d93051e8c3aa', limit: { period: 'hours', hours: 0, tokens: 1000 },
+  });
+  ok('非法小时数被拒绝', gkBad.status === 400);
+  const gkEmpty = await req('POST', '/api/magpie/gateway-keys/limit', {
+    keyId: 'ff4234dcbcf5d93051e8c3aa', limit: { period: 'day', tokens: 0, cost: 0 },
+  });
+  ok('空额度被拒绝', gkEmpty.status === 400);
+  const gkReset = await req('POST', '/api/magpie/gateway-keys/reset-limit', { keyId: 'ff4234dcbcf5d93051e8c3aa' });
+  ok('重置用量走原生 reset-limit-key', gkReset.status === 200
+    && gatewayKeyCalls.some((c) => c.endpoint === 'caller-keys/reset-limit-key'));
+  const gkInject = await req('POST', '/api/magpie/gateway-keys/limit', {
+    keyId: 'ff4234dcbcf5d93051e8c3aa', limit: { period: 'day', tokens: 10 }, admin: 'any',
+  });
+  ok('多余权限字段被忽略且只发送白名单额度', gkInject.status === 200
+    && gatewayKeyCalls.filter((c) => c.endpoint === 'caller-keys/limit-key').at(-1).body.admin === undefined);
 
   // ── settings ──
   console.log('\n[settings GET/PUT]');

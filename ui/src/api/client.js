@@ -239,6 +239,15 @@ export const api = new Proxy({
   // 安装 / 移除 provider（走 magpie CLI）
   magpieAddProvider: (id, key, args) => request('/api/magpie/providers/add', { method: 'POST', body: { id, key, args }, timeout: 180000 }),
   magpieRemoveProvider: (id) => request('/api/magpie/providers/remove', { method: 'POST', body: { id }, timeout: 60000 }),
+  // Gateway Key 额度：原生页面只有日/周/月，这里补每 N 天/每 N 小时。
+  magpieGatewayKeys: () => request('/api/magpie/gateway-keys', { timeout: 45000 }),
+  magpieSetGatewayKeyLimit: (keyId, limit, index) => request('/api/magpie/gateway-keys/limit', {
+    method: 'POST', body: { keyId, limit, index }, timeout: 45000,
+  }),
+  magpieResetGatewayKeyLimit: (keyId, index) => request('/api/magpie/gateway-keys/reset-limit', {
+    method: 'POST', body: { keyId, index }, timeout: 45000,
+  }),
+
   // 公网模型 aliases：只允许选择 Key/provider，权限与目标由后端规划。
   magpieAliasSync: () => request('/api/magpie/alias-sync', { timeout: 45000 }),
   magpieAliasAction: (action, body = {}) => request('/api/magpie/alias-sync', {

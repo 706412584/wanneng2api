@@ -549,6 +549,18 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 }
 .collapse-head .caret.open { transform: rotate(90deg); }
 
+/* ===== Gateway Key 额度 ===== */
+.gwkey-list { display: flex; flex-direction: column; gap: 10px; }
+.gwkey-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); }
+.gwkey-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; overflow-wrap: anywhere; }
+.gwkey-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.gwkey-usage { display: flex; flex-direction: column; gap: 4px; max-width: 360px; }
+.gwkey-usage .progress { height: 6px; }
+@media (max-width: 600px) {
+  .gwkey-row { flex-direction: column; }
+  .gwkey-actions { width: 100%; }
+}
+
 /* ===== Magpie 公网模型别名 ===== */
 .alias-sync-card { margin-top: 16px; padding: 0; overflow: hidden; }
 .alias-sync-card .collapse-head .sub { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

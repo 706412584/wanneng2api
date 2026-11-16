@@ -640,7 +640,13 @@ Models 空数组可能表示“不限制”，因此不能用来撤销。仍有�
 
 验证使用 `test-magpie-alias-sync.js` 的临时目录与原生 API 桩，覆盖旧 27→真实 11、首次接管、手工项保留、组冲突、外部修改、上限、最后撤销、部分完成和写入途中撤销；`test-platform-install.js` 固定使用不存在的 magpie 路径，禁止测试误写真实 provider。灵犀 pool/全量 Go 测试覆盖并发硬冷却、旧成功不解封和 Revive 持久化。真实公网修复与灵犀部署必须另行确认。
 
-### 13.9 睡眠与唤醒恢复（2026-11-16 补充）
+### 13.9 Gateway Key 额度（2026-11-16 补充）
+
+magpie 原生 `Limit` 已支持 `period: day|week|month|days|hours|total`，`days` 为 1–3650、`hours` 为 1–8760，每把 Key 最多 5 条额度，可按模型限定统计范围。原生 Gateway 页面的“额度”对话框只暴露日/周/月，因此壳在 Hub 增加「网关密钥」页补齐每 N 天/每 N 小时入口。
+
+`GET /api/magpie/gateway-keys` 只投影安全字段：`id/name/off/readOnly/browser/expires/models/limit/more/used/usedAll`，绝不返回 `secret`、`masked` 或账号。`POST /api/magpie/gateway-keys/limit` 与 `reset-limit` 做白名单校验（Key ID 格式、周期、天数/小时范围、Token/费用非负且至少一项、模型最多 50 个、序号 0–4），再调用原生 `caller-keys/limit-key` / `reset-limit-key`；不直接改写 `caller-keys.json`。费用字段仍是 magpie 的估算美元（`cost`），不是供应商账单。
+
+### 13.10 睡眠与唤醒恢复（2026-11-16 补充）
 
 壳不启用 `powerSaveBlocker`，不阻止系统睡眠。S3/S4 期间壳、四家网关和 cloudflared 均被冻结，网络会话失效，外网隧道必然中断；进程通常不会被杀，但已有 TCP/TLS 连接基本失效。
 

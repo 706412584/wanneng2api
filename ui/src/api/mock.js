@@ -210,6 +210,21 @@ const MOCK_ROUTING_GROUPS = [
   { id: 'auto-demo', name: '自动共享组', auto: true, routing: '', members: ['workbuddy/glm', 'codearts/glm'], memberInfo: [] },
   { id: 'custom-demo', name: '自定义入口', auto: false, routing: 'order', members: ['loomy/deepseek'], memberInfo: [] },
 ]
+const MOCK_GATEWAY_KEYS = [
+  {
+    id: 'ff4234dcbcf5d93051e8c3aa', name: 'Magpie', off: true, readOnly: false, browser: false, expires: '',
+    models: ['wanneng-lingxi/*'],
+    limit: { period: 'day', tokens: 100000000, cacheReads: true },
+    more: [],
+    used: { period: 'day', start: '2026-11-16T00:00:00+08:00', reset: '2026-11-17T00:00:00+08:00', calls: 709, tokens: 100147421, tokenLimit: 100000000, tokensLeft: 0, spent: true, cacheReads: true },
+    usedAll: [],
+  },
+  {
+    id: 'b22871a44333bafd5dd042c1', name: '豆包', off: false, readOnly: false, browser: false, expires: '',
+    models: ['doubao-work/*'], limit: null, more: [], used: null, usedAll: [],
+  },
+]
+
 const MOCK_ALIAS_STATE = {
   available: true,
   selectedKeyId: 'key-public', selectedKeyName: '公网专用',
@@ -436,6 +451,37 @@ export const mockApi = {
     if (group.auto) throw new Error('自动合并的分组不能删除')
     MOCK_ROUTING_GROUPS.splice(MOCK_ROUTING_GROUPS.indexOf(group), 1)
     return { groups: clone(MOCK_ROUTING_GROUPS) }
+  },
+
+  async magpieGatewayKeys() {
+    await latency(60)
+    return { keys: clone(MOCK_GATEWAY_KEYS) }
+  },
+
+  async magpieSetGatewayKeyLimit(keyId, limit) {
+    await latency(100)
+    const target = MOCK_GATEWAY_KEYS.find((k) => k.id === keyId)
+    if (!target) throw new Error('Key 不存在')
+    if (!Number(limit?.tokens) && !Number(limit?.cost)) throw new Error('Token 上限与费用上限至少填一个')
+    target.limit = {
+      period: limit.period,
+      days: limit.period === 'days' ? Number(limit.days) : undefined,
+      hours: limit.period === 'hours' ? Number(limit.hours) : undefined,
+      tokens: Number(limit.tokens) || 0,
+      cost: Number(limit.cost) || 0,
+      cacheReads: !!limit.cacheReads,
+      models: Array.isArray(limit.models) ? limit.models : [],
+    }
+    target.used = { ...(target.used || {}), period: limit.period, tokens: 0, cost: 0, spent: false }
+    return { keys: clone(MOCK_GATEWAY_KEYS) }
+  },
+
+  async magpieResetGatewayKeyLimit(keyId) {
+    await latency(100)
+    const target = MOCK_GATEWAY_KEYS.find((k) => k.id === keyId)
+    if (!target) throw new Error('Key 不存在')
+    if (target.used) target.used = { ...target.used, tokens: 0, cost: 0, tokensLeft: target.limit?.tokens || 0, spent: false }
+    return { keys: clone(MOCK_GATEWAY_KEYS) }
   },
 
   async magpieAliasSync() {

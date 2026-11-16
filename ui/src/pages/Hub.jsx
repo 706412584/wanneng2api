@@ -12,6 +12,7 @@ import { useToast } from '../components/Toast'
 import { Empty, ErrorBox, Loading, StateDot, STATE_TEXT } from '../components/Bits'
 import ModelList from '../components/ModelList'
 import RoutingGroups from '../components/RoutingGroups'
+import GatewayKeys from '../components/GatewayKeys'
 import { fmtNum, fmtTime, fmtAgo, fmtBytes as formatBytes } from '../utils/format'
 
 const PERIODS = [
@@ -26,6 +27,7 @@ const TABS = [
   ['overview', '概览'],
   ['models', '模型列表'],
   ['priority', '模型优先级'],
+  ['keys', '网关密钥'],
 ]
 
 export default function Hub() {
@@ -92,6 +94,7 @@ export default function Hub() {
 
       {tab === 'models' && <ModelList />}
       {tab === 'priority' && <RoutingGroups embedded />}
+      {tab === 'keys' && <GatewayKeys />}
       {tab === 'overview' && <Overview
         hub={hub} info={info} quotas={quotas} usage={usage} reqs={reqs}
         period={period} setPeriod={setPeriod} copy={copy}

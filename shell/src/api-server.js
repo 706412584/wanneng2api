@@ -148,6 +148,113 @@ class ApiServer {
     this.aliasSync.start();
   }
 
+  /** Gateway Key 的安全投影：绝不返回 secret/masked/accounts 等敏感或无关字段。 */
+  _safeLimit(limit) {
+    if (!limit || typeof limit !== 'object' || Array.isArray(limit)) return null;
+    const out = { period: typeof limit.period === 'string' ? limit.period : 'day' };
+    for (const key of ['days', 'hours']) {
+      if (Number.isInteger(limit[key]) && limit[key] > 0) out[key] = limit[key];
+    }
+    for (const key of ['tokens']) {
+      if (typeof limit[key] === 'number' && Number.isFinite(limit[key]) && limit[key] >= 0) out[key] = limit[key];
+    }
+    if (typeof limit.cost === 'number' && Number.isFinite(limit.cost) && limit.cost >= 0) out.cost = limit.cost;
+    if (limit.cacheReads === true) out.cacheReads = true;
+    if (Array.isArray(limit.models)) out.models = limit.models.filter((m) => typeof m === 'string');
+    return out;
+  }
+
+  _safeUsed(used) {
+    if (!used || typeof used !== 'object' || Array.isArray(used)) return null;
+    const out = {};
+    for (const key of ['period', 'start', 'reset']) if (typeof used[key] === 'string') out[key] = used[key];
+    for (const key of ['calls', 'tokens', 'tokenLimit', 'tokensLeft', 'cost', 'costLeft']) {
+      if (typeof used[key] === 'number' && Number.isFinite(used[key])) out[key] = used[key];
+    }
+    for (const key of ['cacheReads', 'spent']) if (used[key] === true) out[key] = true;
+    return out;
+  }
+
+  async _gatewayKeys() {
+    const data = await this.pluginPanel._api('caller-keys');
+    const keys = Array.isArray(data?.keys) ? data.keys : [];
+    return {
+      keys: keys.filter((k) => k && typeof k.id === 'string').map((k) => ({
+        id: k.id,
+        name: typeof k.name === 'string' ? k.name : k.id,
+        off: !!k.off,
+        readOnly: !!k.readOnly,
+        browser: !!k.browser,
+        expires: typeof k.expires === 'string' ? k.expires : '',
+        models: Array.isArray(k.models) ? k.models.filter((m) => typeof m === 'string') : [],
+        limit: this._safeLimit(k.limit),
+        more: Array.isArray(k.more) ? k.more.map((l) => this._safeLimit(l)).filter(Boolean) : [],
+        used: this._safeUsed(k.used),
+        usedAll: Array.isArray(k.usedAll) ? k.usedAll.map((u) => this._safeUsed(u)).filter(Boolean) : [],
+      })),
+    };
+  }
+
+  _gatewayKeyId(body) {
+    const keyId = body && body.keyId;
+    if (typeof keyId !== 'string' || !/^[a-z0-9]{8,64}$/i.test(keyId)) throw new Error('Gateway Key 标识无效');
+    return keyId;
+  }
+
+  _gatewayKeyIndex(body) {
+    if (body.index == null) return undefined;
+    if (!Number.isInteger(body.index) || body.index < 0 || body.index >= 5) throw new Error('额度序号无效');
+    return body.index;
+  }
+
+  async _setGatewayKeyLimit(body) {
+    const keyId = this._gatewayKeyId(body);
+    const limit = body && body.limit;
+    if (!limit || typeof limit !== 'object' || Array.isArray(limit)) throw new Error('额度配置无效');
+    const period = limit.period;
+    if (!['day', 'week', 'month', 'days', 'hours', 'total'].includes(period)) throw new Error('不支持的额度周期');
+    const payload = { period };
+    if (period === 'days') {
+      const days = Number(limit.days);
+      if (!Number.isInteger(days) || days < 1 || days > 3650) throw new Error('天数需为 1–3650 的整数');
+      payload.days = days;
+    }
+    if (period === 'hours') {
+      const hours = Number(limit.hours);
+      if (!Number.isInteger(hours) || hours < 1 || hours > 8760) throw new Error('小时数需为 1–8760 的整数');
+      payload.hours = hours;
+    }
+    const tokens = limit.tokens === '' || limit.tokens == null ? 0 : Number(limit.tokens);
+    if (!Number.isFinite(tokens) || tokens < 0) throw new Error('Token 上限无效');
+    const cost = limit.cost === '' || limit.cost == null ? 0 : Number(limit.cost);
+    if (!Number.isFinite(cost) || cost < 0) throw new Error('费用上限无效');
+    if (!tokens && !cost) throw new Error('Token 上限与费用上限至少填一个');
+    payload.tokens = Math.floor(tokens);
+    payload.cost = cost;
+    payload.cacheReads = !!limit.cacheReads;
+    if (limit.models != null) {
+      if (!Array.isArray(limit.models) || limit.models.length > 50
+        || !limit.models.every((m) => typeof m === 'string' && m.length > 0 && m.length <= 300)) {
+        throw new Error('模型范围无效');
+      }
+      payload.models = limit.models;
+    }
+    const change = { key: keyId, limit: payload };
+    const index = this._gatewayKeyIndex(body);
+    if (index !== undefined) change.index = index;
+    await this.pluginPanel._api('caller-keys/limit-key', change);
+    return this._gatewayKeys();
+  }
+
+  async _resetGatewayKeyLimit(body) {
+    const keyId = this._gatewayKeyId(body);
+    const change = { key: keyId };
+    const index = this._gatewayKeyIndex(body);
+    if (index !== undefined) change.index = index;
+    await this.pluginPanel._api('caller-keys/reset-limit-key', change);
+    return this._gatewayKeys();
+  }
+
   _tunnels() {
     if (!this.tunnelManager) {
       const error = new Error('外网访问模块尚未初始化');
@@ -424,6 +531,14 @@ class ApiServer {
         this.aliasSync.request('routing-reorder');
         return { groups: await groups.manageable() };
       }
+    }
+
+    // Gateway Key 额度：原生页面只提供日/周/月，内核本身支持每 N 天/每 N 小时。
+    // 这里只做安全投影与白名单校验，实际写入仍走 magpie 原生 caller-keys API。
+    if (parts[1] === 'magpie' && parts[2] === 'gateway-keys') {
+      if (method === 'GET' && parts.length === 3) return this._gatewayKeys();
+      if (method === 'POST' && parts[3] === 'limit') return this._setGatewayKeyLimit(body);
+      if (method === 'POST' && parts[3] === 'reset-limit') return this._resetGatewayKeyLimit(body);
     }
 
     // GET /api/magpie/providers —— magpie 内核实管的 provider 清单。
