@@ -7,7 +7,7 @@
  * Electron 相关（窗口/托盘/自启）只在本文件引用，其余模块均为纯 Node。
  */
 
-const { app, BrowserWindow, dialog, shell, Menu, ipcMain } = require('electron');
+const { app, BrowserWindow, dialog, shell, Menu, ipcMain, powerMonitor } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
@@ -464,6 +464,22 @@ app.whenReady().then(async () => {
 
   // 状态变化时刷新托盘菜单
   manager.on('status', () => rebuildTrayMenu({ manager, store, showMainWindow, appQuit: () => app.quit(), trayRef: tray }));
+
+  // 系统睡眠/休眠唤醒：只重置健康计数并延迟探测，不主动重启进程。
+  // 睡眠期间网络会话失效，唤醒瞬间网络常未就绪；延迟可避免把「网络未就绪」
+  // 误判成「隧道/网关已死」。锁屏/解锁不是睡眠，不处理。
+  let lastResumeAt = 0;
+  powerMonitor.on('resume', () => {
+    const now = Date.now();
+    if (now - lastResumeAt < 5000) return; // 部分硬件会重复触发
+    lastResumeAt = now;
+    logger.info('系统已从睡眠/休眠恢复，重置健康检查');
+    setTimeout(() => {
+      try { manager.handleResume(); } catch (e) { logger.error(`平台唤醒恢复失败: ${e.message}`); }
+      try { tunnelManager.handleResume(); } catch (e) { logger.error(`隧道唤醒恢复失败: ${e.message}`); }
+      try { if (api && api.aliasSync) api.aliasSync.request('resume', { refresh: true }); } catch { /* 非关键 */ }
+    }, 3000);
+  });
 
   // 3. Splash → 按需 spawn autoStartPlatforms → 等健康 → 主窗口 → 托盘
   createSplash();

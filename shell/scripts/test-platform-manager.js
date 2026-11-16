@@ -510,6 +510,21 @@ async function main() {
   const httpOk = await probe('http://127.0.0.1:17891/healthz');
   ok('mock 服务真实响应 /healthz=200', httpOk === 200, `got ${httpOk}`);
 
+  // ── 1b. 系统唤醒恢复：不重启进程，只重置计数并重新探测 ──
+  console.log('\n[1b] 唤醒恢复不重启进程');
+  const resumePid = mgr.statusOf('mockhealthy').pid;
+  const resumeRt = mgr.getRuntime('mockhealthy');
+  resumeRt.failCount = 2;
+  resumeRt.okCount = 0;
+  const resumeResult = mgr.handleResume({ delayMs: 20 });
+  ok('handleResume 返回已排程数', resumeResult.scheduled >= 1, JSON.stringify(resumeResult));
+  ok('唤醒立即重置失败计数', resumeRt.failCount === 0);
+  ok('唤醒不重启进程', mgr.statusOf('mockhealthy').pid === resumePid, `pid ${resumePid} → ${mgr.statusOf('mockhealthy').pid}`);
+  await sleep(300);
+  ok('唤醒后重新探测仍 healthy 且进程不变',
+    mgr.statusOf('mockhealthy').status === 'healthy' && mgr.statusOf('mockhealthy').pid === resumePid,
+    JSON.stringify(mgr.statusOf('mockhealthy')));
+
   // ── 2. kill 进程 → 2s 内自动拉起 ──
   console.log('\n[2] kill → 自动重启（≤2s）');
   const oldPid = mgr.statusOf('mockhealthy').pid;

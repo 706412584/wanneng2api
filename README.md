@@ -69,6 +69,7 @@ Loomy 需要 Python 3.9+（未捆绑解释器时使用系统 Python）。首次�
 - **Named 配置**：按“Token → 验证 → Public Hostname”顺序操作。验证进程在 Cloudflare 注册成功后立即停止并记录 `verifiedAt/tunnelId`，未验证或 Token 已修改时不能编辑域名或启动。每个目标使用独立 Tunnel Token 和 Public Hostname；Cloudflare 控制台中的 Service URL 填页面展示的 `http://127.0.0.1:<入口端口>`，应用不会自动创建 Tunnel、DNS 或 ingress。
 - **远程管理台**：先在本机配置弹窗中设置至少 12 位管理员密码。公网请求必须经过登录、会话、CSRF、Origin/Host 与限流校验，现有 Manager API `:17800` 不直接暴露。远程日志自动使用去重轮询，避免部分 Cloudflare 链路不转发 SSE 时页面空等。
 - 卡片默认折叠且高度统一；配置和日志分别在弹窗中操作。Token 只写入、不回显，远程密码不进入 localStorage。
+- **睡眠/休眠**：壳不阻止系统睡眠。睡眠期间进程和网络会被冻结，外网隧道会中断；唤醒后壳会重置健康计数并延迟重新探测，避免把网络未就绪误判成隧道故障，但不主动重启正在运行的网关。需要持续在线时应关闭系统睡眠。
 
 数据目录：`%AppData%\wanneng2api\`（配置、日志、更新备份）。
 

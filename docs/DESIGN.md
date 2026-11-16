@@ -639,3 +639,11 @@ Models 空数组可能表示“不限制”，因此不能用来撤销。仍有�
 灵犀 `Pool.Revive` 补齐清理 `degradeUntil/consecutiveFails`，并经既有 dirty/Flush 持久化。连败降权为严格硬冷却：未到期不参与 weighted-random 全冷却兜底，旧在途 `NoteSuccess` 只清计数、不提前解除截止；到期惰性恢复，人工 Revive 可立即恢复。阈值、错误归因和权重不在本轮改动。壳适配层展示降权状态并提供显式解冻；恢复选号必须显式发送 `paused:false`。源码修复不自动替换或重启当前灵犀服务，需另行授权部署。
 
 验证使用 `test-magpie-alias-sync.js` 的临时目录与原生 API 桩，覆盖旧 27→真实 11、首次接管、手工项保留、组冲突、外部修改、上限、最后撤销、部分完成和写入途中撤销；`test-platform-install.js` 固定使用不存在的 magpie 路径，禁止测试误写真实 provider。灵犀 pool/全量 Go 测试覆盖并发硬冷却、旧成功不解封和 Revive 持久化。真实公网修复与灵犀部署必须另行确认。
+
+### 13.9 睡眠与唤醒恢复（2026-11-16 补充）
+
+壳不启用 `powerSaveBlocker`，不阻止系统睡眠。S3/S4 期间壳、四家网关和 cloudflared 均被冻结，网络会话失效，外网隧道必然中断；进程通常不会被杀，但已有 TCP/TLS 连接基本失效。
+
+`main.js` 监听 `powerMonitor` 的 `resume`（5 秒去抖，锁屏不处理），延迟 3 秒后调用 `PlatformManager.handleResume()` 与 `TunnelManager.handleResume()`：只重置健康失败计数、清掉旧健康定时器并延迟重新探测，**不主动 spawn/start**。进程已退出仍走既有 exit 重启/退避；`reconnecting` 状态保留原重连路径。这样避免唤醒瞬间网络未就绪被误判为“隧道已死”而重启，Quick 隧道也不会因此换 URL。`handleResume` 可用 `delayMs` 注入，测试用 fake 进程验证“唤醒不重启、只重置计数”。
+
+必须实机验证的部分：本机实际睡眠状态（`powercfg /a`）、唤醒后网络恢复耗时、cloudflared 同进程重连是否保留 Quick URL、四家网关上游连接是否恢复（本地 `/healthz` 可能仍 200）。睡眠/唤醒行为不承诺“服务持续运行”。

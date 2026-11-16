@@ -203,6 +203,7 @@ class PlatformRuntime {
     this.failCount = 0;
     this.okCount = 0;
     this.healthTimer = null;
+    this.resumeTimer = null;
     this.restartTimer = null;
     this.missingBinary = false;
     this.stopping = false;
@@ -572,6 +573,30 @@ class PlatformManager extends EventEmitter {
     });
   }
 
+  /**
+   * 系统唤醒后的恢复：重置健康计数并延迟重新探测。
+   * **不 start/spawn**：进程存在就复用，进程已退出交给既有的 exit 重启逻辑。
+   */
+  handleResume({ delayMs = 3000 } = {}) {
+    let scheduled = 0;
+    for (const rt of this.rts.values()) {
+      rt.failCount = 0;
+      rt.okCount = 0;
+      if (rt.healthTimer) { clearInterval(rt.healthTimer); rt.healthTimer = null; }
+      if (rt.resumeTimer) clearTimeout(rt.resumeTimer);
+      if (this._stopping || rt.stopping || ['stopped', 'error', 'updating'].includes(rt.status)) continue;
+      if (!rt.adopted && !rt.proc) continue;
+      rt.resumeTimer = setTimeout(() => {
+        rt.resumeTimer = null;
+        if (this._stopping || rt.stopping) return;
+        if (rt.adopted) this._scheduleAdoptedTimer(rt);
+        else if (rt.proc) this._scheduleHealthTimer(rt);
+      }, delayMs);
+      scheduled++;
+    }
+    return { scheduled };
+  }
+
   _scheduleHealthTimer(rt) {
     if (rt.healthTimer) clearInterval(rt.healthTimer);
     // 收养来的实例没有子进程，_healthTick 的 `!rt.proc` 早退会跳过它，
@@ -843,6 +868,7 @@ class PlatformManager extends EventEmitter {
       rt.proc = null;
       rt.pid = 0;
       if (rt.healthTimer) { clearInterval(rt.healthTimer); rt.healthTimer = null; }
+      if (rt.resumeTimer) { clearTimeout(rt.resumeTimer); rt.resumeTimer = null; }
       if (rt.status === 'starting') rt.setStatus('error', `进程启动失败: ${e.message}`);
     });
 
@@ -853,6 +879,7 @@ class PlatformManager extends EventEmitter {
       rt.pid = 0;
       rt.lastExitCode = code;
       if (rt.healthTimer) { clearInterval(rt.healthTimer); rt.healthTimer = null; }
+      if (rt.resumeTimer) { clearTimeout(rt.resumeTimer); rt.resumeTimer = null; }
       rt.appendLog('manager', `exit code=${code} stopping=${wasStopping}`);
       if (wasStopping || this._stopping || rt.missingBinary) {
         rt.setStatus(rt.missingBinary ? 'error' : 'stopped');

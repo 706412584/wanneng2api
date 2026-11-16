@@ -130,6 +130,18 @@ async function main() {
     manager.portCheck = freePortCheck;
     await assert.rejects(() => manager.verifyToken('workbuddy', NAMED_TOKEN), (e) => e.code === 'TUNNEL_ACTIVE');
 
+    // 系统唤醒恢复：不重启隧道进程，只清失败计数并延迟重新探测
+    const resumeRuntime = manager.runtimes.get('workbuddy');
+    resumeRuntime.healthFailures = 2;
+    const beforeResume = processes.length;
+    const resumeResult = manager.handleResume({ delayMs: 20 });
+    assert.ok(resumeResult.scheduled >= 1, '唤醒恢复应排程');
+    assert.strictEqual(resumeRuntime.healthFailures, 0, '唤醒应立即重置公网失败计数');
+    assert.strictEqual(processes.length, beforeResume, '唤醒不得重启隧道进程');
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.strictEqual(processes.length, beforeResume, '唤醒探测后仍不得重启进程');
+    assert.strictEqual(manager.statusOf('workbuddy').phase, 'running');
+
     const first = processes[0];
     first.crash();
     await waitFor(() => processes.length === 2 && manager.statusOf('workbuddy').phase === 'running', '崩溃后重连');

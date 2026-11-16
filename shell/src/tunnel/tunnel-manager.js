@@ -526,9 +526,42 @@ class TunnelManager {
   _clearHealth(runtime) {
     if (runtime.healthTimer) clearInterval(runtime.healthTimer);
     runtime.healthTimer = null;
+    if (runtime.resumeTimer) clearTimeout(runtime.resumeTimer);
+    runtime.resumeTimer = null;
     if (runtime.reconnectTimer) clearTimeout(runtime.reconnectTimer);
     runtime.reconnectTimer = null;
     runtime.nextRetryAt = 0;
+  }
+
+  /**
+   * 系统睡眠/休眠唤醒后的恢复：清掉睡眠前残留的失败计数，延迟重排健康检查。
+   *
+   * 睡眠期间进程被冻结、网络会话失效；唤醒瞬间网络往往还没恢复，立即探测会把
+   * 「网络未就绪」误判成「隧道已死」并重启。这里只重置计数和延迟探测，
+   * **不主动 spawn/重启**：进程真的退出走 _onProcessExit，重连中交给现有退避路径。
+   */
+  handleResume({ delayMs = 3000 } = {}) {
+    let scheduled = 0;
+    for (const [id, runtime] of this.runtimes) {
+      if (!runtime.desiredRunning || runtime.phase !== 'running') continue;
+      runtime.healthFailures = 0;
+      runtime.lastHealthAt = 0;
+      runtime.publicHealth = 'unknown';
+      runtime.localHealth = 'unknown';
+      this._clearHealth(runtime);
+      const generation = runtime.generation;
+      runtime.resumeTimer = setTimeout(() => {
+        runtime.resumeTimer = null;
+        if (!this._current(id, generation) || runtime.phase !== 'running') return;
+        void this._healthTick(id, generation).finally(() => {
+          if (this._current(id, generation) && runtime.phase === 'running' && !runtime.healthTimer) {
+            this._scheduleHealth(id, generation);
+          }
+        });
+      }, delayMs);
+      scheduled++;
+    }
+    return { scheduled };
   }
 
   async stop(id) {
