@@ -1,6 +1,6 @@
 {
   "name": "wanneng2api-shell",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "Wanneng2API desktop shell: process supervision, platform management, remote updates, tray/autostart",
   "main": "src/main.js",
   "private": true,
@@ -8,8 +8,10 @@
     "start": "electron .",
     "test:manager": "node scripts/test-platform-manager.js",
     "test:install": "node scripts/test-platform-install.js",
+    "test:alias-sync": "node scripts/test-magpie-alias-sync.js",
     "test:self-update": "node scripts/test-self-updater.js",
-    "check": "node --check src/main.js && node --check src/platform-manager.js && node --check src/updater.js && node --check src/api-server.js && node --check src/tray.js && node --check src/config.js && node --check src/logs.js && node --check src/proxy.js && node --check src/magpie-adapter.js && node --check src/gateway-panel.js && node --check src/self-updater.js"
+    "test:tunnels": "node scripts/test-tunnel-store.js && node scripts/test-cloudflared-binary.js && node scripts/test-cloudflared-process.js && node scripts/test-public-api-gateway.js && node scripts/test-remote-gateway.js && node scripts/test-tunnel-manager.js",
+    "check": "node --check src/main.js && node --check src/platform-manager.js && node --check src/updater.js && node --check src/api-server.js && node --check src/tray.js && node --check src/config.js && node --check src/logs.js && node --check src/proxy.js && node --check src/magpie-adapter.js && node --check src/magpie-alias-sync.js && node --check src/gateway-panel.js && node --check src/self-updater.js && node --check src/tunnel/targets.js && node --check src/tunnel/tunnel-store.js && node --check src/tunnel/cloudflared-binary.js && node --check src/tunnel/cloudflared-process.js && node --check src/tunnel/target-adapters.js && node --check src/tunnel/public-api-gateway.js && node --check src/tunnel/remote-auth.js && node --check src/tunnel/remote-gateway.js && node --check src/tunnel/tunnel-manager.js && node --check src/tunnel/index.js"
   },
   "author": "wanneng2api",
   "license": "MIT",
