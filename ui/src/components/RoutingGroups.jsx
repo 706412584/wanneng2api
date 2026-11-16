@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
 import { useToast } from './Toast'
+import { useConfirm } from './Busy'
 import { ErrorBox, Loading } from './Bits'
 
 /** 勾选顺序即优先级：新勾选的排在已选之后，取消则移除 */
@@ -26,22 +27,29 @@ export default function RoutingGroups({ embedded = false }) {
   const [bindName, setBindName] = useState('')
   const [picked, setPicked] = useState([])
   const toast = useToast()
+  const confirm = useConfirm()
   // 用 ref 记录“是否已经有数据”，避免 load 闭包读到首次渲染的 groups
   const loadedRef = useRef(false)
+  const loadGenerationRef = useRef(0)
 
   const load = useCallback(async () => {
+    const generation = ++loadGenerationRef.current
     try {
       const r = await api.routingGroups()
+      if (generation !== loadGenerationRef.current) return
       setGroups(r.groups || [])
       setBindable(r.bindable || [])
       setError(null)
       loadedRef.current = true
     } catch (e) {
+      if (generation !== loadGenerationRef.current) return
       setError(e)
       // 已有数据时的刷新失败不能静默：用户会以为看到的是最新状态
       if (loadedRef.current) toast(`刷新失败：${e.message}`, 'err')
     }
-    finally { setLoading(false) }
+    finally {
+      if (generation === loadGenerationRef.current) setLoading(false)
+    }
   }, [toast])
 
   useEffect(() => { load() }, [load])
@@ -83,6 +91,23 @@ export default function RoutingGroups({ embedded = false }) {
       toast(`已创建入口「${r.saved?.name || bindName.trim()}」，共 ${r.saved?.members?.length || 0} 个模型`)
     } catch (e) { toast(`创建失败：${e.message}`, 'err') }
     finally { setBusy(false) }
+  }
+
+  const removeGroup = async (group) => {
+    if (busy) return
+    const accepted = await confirm(
+      `确定删除自定义路由组「${group.name}」（${group.id}）吗？\n\n只删除路由入口，不删除 provider、账号或模型。控制台手建的自定义组也可以删除。`,
+      { title: '删除自定义路由组', okText: '删除', danger: true },
+    )
+    if (!accepted) return
+    setBusy(true)
+    try {
+      const result = await api.deleteRoutingGroup(group.id)
+      setGroups(result.groups || [])
+      toast(`已删除路由组「${group.name}」；provider、账号和模型未改变`)
+    } catch (e) {
+      toast(`删除失败：${e.message}`, 'err')
+    } finally { setBusy(false) }
   }
 
   if (loading && !groups) return <Loading text="读取跨平台路由组…" />
@@ -145,6 +170,11 @@ export default function RoutingGroups({ embedded = false }) {
               {g.routing && g.routing !== 'order'
                 && <span className="badge gray" title="该策略不看成员顺序，调整顺序不会生效">{g.routing}</span>}
             </button>
+            {!g.auto && (
+              <div className="routing-group-actions">
+                <button className="btn sm danger" disabled={busy} onClick={() => removeGroup(g)}>删除自定义组</button>
+              </div>
+            )}
             {open === g.id && <ol className="routing-group-members" id={`rg-${g.id}`}>
               {g.members.map((id, i) => {
                 const info = g.memberInfo.find((m) => m.id === id) || {}

@@ -56,9 +56,20 @@ async function main() {
     assert.strictEqual(existing.getPlatform('workbuddy').workDir, 'E:/mine', '已有目录不能被迁移');
 
     const p = store.getPlatform('workbuddy');
+    const portProbe = http.createServer();
+    await new Promise((resolve) => portProbe.listen(0, '127.0.0.1', resolve));
+    const isolatedPort = portProbe.address().port;
+    await new Promise((resolve) => portProbe.close(resolve));
+    p.port = isolatedPort;
+    p.health.url = `http://127.0.0.1:${isolatedPort}/`;
     p.workDir = path.join(root, 'fresh');
     manager = new PlatformManager({ store, dataDir: store.dataDir });
-    const updater = new PlatformUpdater({ manager, store, dataDir: store.dataDir });
+    const updater = new PlatformUpdater({
+      manager, store, dataDir: store.dataDir,
+      // 该用例只验证降级，绝不能因仓库里存在 tools/magpie 而写真实配置。
+      magpieBinary: path.join(root, 'missing-magpie.exe'),
+      magpieDir: path.join(root, 'missing-magpie-config'),
+    });
     updater.check = async () => ({ checked: true, latest: '1.0.0', assetName: 'gateway.zip', assetUrl: `${base}/asset`, assetSize: payload.length, sha256: digest });
     const first = await updater.install('workbuddy');
     const second = await updater.install('workbuddy');
@@ -69,7 +80,7 @@ async function main() {
     assert.strictEqual(result.status, 'error', 'mock 无可执行文件时必须报告启动失败');
     assert(fs.existsSync(path.join(p.workDir, 'README.md')), '完整发布包需要安装');
     const config = JSON.parse(fs.readFileSync(path.join(p.workDir, 'config.json'), 'utf8'));
-    assert.strictEqual(config.listen, '127.0.0.1:7863');
+    assert.strictEqual(config.listen, `127.0.0.1:${isolatedPort}`);
     assert.strictEqual(config.api_key.length, 64);
     assert.strictEqual(assetRequests, 1);
     const configRaw = fs.readFileSync(path.join(p.workDir, 'config.json'), 'utf8');
@@ -100,6 +111,95 @@ async function main() {
 
     const invalidProvider = await updater.registerProvider('magpie');
     assert.strictEqual(invalidProvider.ok, false, '非四网关不能走注册路径');
+
+    // 已存在 provider 只更新 Key；缺失才允许手动 add。全部使用内存 CLI 桩，避免真实 magpie。
+    const credentialRoot = path.join(root, 'credentials');
+    const magpieDir = path.join(root, 'magpie-config');
+    fs.mkdirSync(credentialRoot, { recursive: true });
+    fs.mkdirSync(magpieDir, { recursive: true });
+    const credentialConfigs = {
+      workbuddy: { api_keys: [{ key: 'wb-config', region: 'cn' }] },
+      codearts: { api_key: 'ca-ordinary', admin_key: 'ca-admin-must-not-use' },
+      loomy: { api_keys: ['loomy-config'] },
+      lingxi: { api_key: 'lx-config' },
+    };
+    const credentialPlatforms = new Map();
+    for (const [id, cfg] of Object.entries(credentialConfigs)) {
+      const workDir = path.join(credentialRoot, id);
+      fs.mkdirSync(workDir);
+      fs.writeFileSync(path.join(workDir, 'config.json'), JSON.stringify(cfg));
+      credentialPlatforms.set(id, { id, port: 10000, workDir, run: { env: {
+        WB2A_API_KEY: id === 'workbuddy' ? 'wb-env' : '',
+        CA2A_API_KEY: '',
+        LOOMY_API_KEYS: id === 'loomy' ? 'loomy-first,loomy-second' : '',
+        API_KEY: '',
+      } } });
+    }
+    const providerFile = path.join(magpieDir, 'providers.json');
+    const writeProviders = (ids) => fs.writeFileSync(providerFile, JSON.stringify({ providers: ids.map((id) => ({ id })) }));
+    const providerIds = Object.keys(credentialConfigs).map((id) => `wanneng-${id}`);
+    writeProviders(providerIds);
+    const keyCalls = [];
+    let failUpdate = false;
+    const magpie = require('../src/magpie-adapter');
+    const credentialUpdater = new PlatformUpdater({
+      manager: { isInstalled: () => true },
+      store: { getPlatform: (id) => credentialPlatforms.get(id), platformWorkDir: (p) => p.workDir },
+      dataDir: root,
+      magpieBinary: path.join(root, 'mock-magpie.exe'), magpieDir,
+      magpie: {
+        getCustomProvider: magpie.getCustomProvider,
+        updateProviderKey: async (_bin, { id, key }) => {
+          keyCalls.push({ action: 'key', id, key });
+          if (failUpdate) return { ok: false, stderr: `cannot save ${key}` };
+          const doc = JSON.parse(fs.readFileSync(providerFile, 'utf8'));
+          const row = doc.providers.find((p) => p.id === id);
+          if (row) row.key = key;
+          fs.writeFileSync(providerFile, JSON.stringify(doc));
+          return { ok: true, stdout: '', stderr: '' };
+        },
+        addProvider: async (_bin, { id, key }) => { keyCalls.push({ action: 'add', id, key }); return { ok: true, stdout: '', stderr: '' }; },
+      },
+    });
+    for (const id of Object.keys(credentialConfigs)) {
+      const synced = await credentialUpdater.syncProviderKey(id);
+      assert.strictEqual(synced.ok, true, `${id} 已注册 Key 应可同步`);
+      assert.strictEqual(synced.updated, true);
+    }
+    assert.deepStrictEqual(keyCalls.map((c) => [c.id, c.key]), [
+      ['wanneng-workbuddy', 'wb-env'],
+      ['wanneng-codearts', 'ca-ordinary'],
+      ['wanneng-loomy', 'loomy-first'],
+      ['wanneng-lingxi', 'lx-config'],
+    ]);
+    assert(keyCalls.every((c) => c.action === 'key'), '已有 provider 绝不能重复 add');
+    assert(keyCalls.every((c) => c.key !== 'ca-admin-must-not-use'), 'CodeArts admin_key 不能作为普通 Key');
+    const beforeUnchanged = keyCalls.length;
+    const unchanged = await credentialUpdater.syncProviderKey('workbuddy');
+    assert.strictEqual(unchanged.unchanged, true, 'Key 已一致时不应再次调用 CLI');
+    assert.strictEqual(keyCalls.length, beforeUnchanged);
+
+    writeProviders(providerIds.filter((id) => id !== 'wanneng-lingxi'));
+    const beforeMissing = keyCalls.length;
+    const missingSync = await credentialUpdater.syncProviderKey('lingxi');
+    assert.strictEqual(missingSync.skipped, true, '后台发现缺失 provider 只能跳过');
+    assert.strictEqual(keyCalls.length, beforeMissing);
+    const missingRegister = await credentialUpdater.registerProvider('lingxi');
+    assert.strictEqual(missingRegister.ok, true);
+    assert.strictEqual(keyCalls.at(-1).action, 'add', '手动注册缺失 provider 才允许 add');
+
+    failUpdate = true;
+    writeProviders(providerIds);
+    const failedKey = await credentialUpdater.syncProviderKey('lingxi');
+    assert.strictEqual(failedKey.ok, false);
+    assert(!failedKey.message.includes('lx-config'), 'CLI 错误必须对本次 Key 脱敏');
+    failUpdate = false;
+
+    fs.writeFileSync(providerFile, '{broken');
+    const beforeBroken = keyCalls.length;
+    const broken = await credentialUpdater.registerProvider('lingxi');
+    assert.strictEqual(broken.ok, false);
+    assert.strictEqual(keyCalls.length, beforeBroken, 'provider 文件损坏不能误判缺失后 add');
 
     const successDir = path.join(root, 'success');
     const successStore = new ConfigStore(path.join(root, 'success-data'));

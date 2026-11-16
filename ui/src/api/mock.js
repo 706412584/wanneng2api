@@ -14,6 +14,14 @@ const MOCK_SETTINGS = {
   },
   manager: { listen: '127.0.0.1:17800', logLevel: 'info' },
   update: { checkOnLaunch: true, channel: 'stable', githubToken: '', keepBackups: 3 },
+  proxy: {
+    enabled: false,
+    url: '',
+    scopes: {
+      selfUpdate: false, platformUpdate: false, pluginRegistry: false, magpieKernel: false,
+      tunnelDownload: false, tunnelRuntime: false, magpieSubscription: false, magpiePlugin: false
+    }
+  },
   sub2api: { pgPort: 5433, redisPort: 6380, dataDir: '' }
 }
 
@@ -187,6 +195,38 @@ function nextVersion(v) {
   const parts = v.split('.').map(Number)
   parts[parts.length - 1] += 1
   return parts.join('.')
+}
+
+const MOCK_TUNNELS = [
+  { id: 'workbuddy', name: 'WorkBuddy2API', kind: 'api', mode: 'quick', autoStart: true, phase: 'running', stage: 'idle', publicUrl: 'https://demo-workbuddy.trycloudflare.com', configuredPublicUrl: '', guardUrl: 'http://127.0.0.1:17901', upstreamPort: 7863, pid: 45601, localHealth: 'ok', publicHealth: 'ok', desiredRunning: true, hasToken: false },
+  { id: 'codearts', name: 'CodeArts2API', kind: 'api', mode: 'named', autoStart: false, phase: 'stopped', stage: 'idle', publicUrl: '', configuredPublicUrl: 'https://codearts.example.com', guardUrl: 'http://127.0.0.1:17902', upstreamPort: 7866, pid: 0, localHealth: 'unknown', publicHealth: 'unknown', desiredRunning: false, hasToken: true, verifiedAt: 1763260000000, tunnelId: 'demo-codearts-tunnel' },
+  { id: 'loomy', name: 'Loomy2API', kind: 'api', mode: 'quick', autoStart: false, phase: 'stopped', stage: 'idle', publicUrl: '', configuredPublicUrl: '', guardUrl: 'http://127.0.0.1:17903', upstreamPort: 17990, pid: 0, localHealth: 'unknown', publicHealth: 'unknown', desiredRunning: false, hasToken: false },
+  { id: 'lingxi', name: 'Lingxi2API', kind: 'api', mode: 'quick', autoStart: false, phase: 'stopped', stage: 'idle', publicUrl: '', configuredPublicUrl: '', guardUrl: 'http://127.0.0.1:17904', upstreamPort: 6789, pid: 0, localHealth: 'unknown', publicHealth: 'unknown', desiredRunning: false, hasToken: false },
+  { id: 'magpie', name: 'Magpie 统一 API', kind: 'api', mode: 'quick', autoStart: false, phase: 'stopped', stage: 'idle', publicUrl: '', configuredPublicUrl: '', guardUrl: 'http://127.0.0.1:17905', upstreamPort: 3425, pid: 0, localHealth: 'unknown', publicHealth: 'unknown', desiredRunning: false, hasToken: false },
+  { id: 'manager', name: 'Wanneng2API 管理台', kind: 'manager', mode: 'named', autoStart: false, phase: 'stopped', stage: 'idle', publicUrl: '', configuredPublicUrl: 'https://manager.example.com', guardUrl: 'http://127.0.0.1:17906', upstreamPort: 17800, pid: 0, localHealth: 'unknown', publicHealth: 'unknown', desiredRunning: false, hasToken: true, verifiedAt: 1763260000000, tunnelId: 'demo-manager-tunnel', passwordConfigured: true },
+]
+const MOCK_BINARY = { version: '2026.10.6', installed: true, verified: true, downloading: false, received: 0, total: null, error: '' }
+const MOCK_ROUTING_GROUPS = [
+  { id: 'auto-demo', name: '自动共享组', auto: true, routing: '', members: ['workbuddy/glm', 'codearts/glm'], memberInfo: [] },
+  { id: 'custom-demo', name: '自定义入口', auto: false, routing: 'order', members: ['loomy/deepseek'], memberInfo: [] },
+]
+const MOCK_ALIAS_STATE = {
+  available: true,
+  selectedKeyId: 'key-public', selectedKeyName: '公网专用',
+  keys: [
+    { id: 'key-public', name: '公网专用', off: false, eligible: true, reason: '', accountsRestricted: false },
+    { id: 'key-browser', name: '浏览器扩展', off: false, eligible: false, reason: '浏览器扩展专用 Key 不能作为同步目标', accountsRestricted: false },
+  ],
+  providers: [
+    { id: 'wanneng-lingxi', name: '灵犀', source: 'self-hosted', off: false, ready: true, authorized: true, modelCount: 11, modelCountKnown: true, credential: 'config', lastSuccessAt: BOOT, error: '' },
+    { id: 'trae-cn', name: 'Trae CN', source: 'community', off: false, ready: true, authorized: false, modelCount: 24, modelCountKnown: true, credential: 'magpie', lastSuccessAt: 0, error: '' },
+    { id: 'local-relay', name: '本地转发', source: 'local', off: false, ready: true, authorized: false, modelCount: 2, modelCountKnown: true, credential: 'magpie', lastSuccessAt: 0, error: '' },
+  ],
+  authorizedCount: 1,
+  usage: { aliases: { used: 11, managed: 11, limit: 200 }, models: { used: 11, managed: 11, limit: 500 } },
+  conflicts: [{ code: 'group-required', message: '裸名 glm 跨多个 provider，但没有对应路由组', model: 'glm', providerIds: ['wanneng-lingxi', 'trae-cn'] }],
+  disabledBySync: false, lastSuccessAt: BOOT, lastError: '',
+  status: { phase: 'idle', revision: 1, pending: false, lastStartedAt: 0, lastFinishedAt: 0, lastError: '' },
 }
 
 export const mockApi = {
@@ -364,6 +404,165 @@ export const mockApi = {
     return { ok: true, reloadedAt: Date.now() }
   },
 
+  async routingGroups() {
+    return {
+      groups: clone(MOCK_ROUTING_GROUPS),
+      bindable: [
+        { id: 'workbuddy', name: 'WorkBuddy', models: [{ id: 'glm' }] },
+        { id: 'codearts', name: 'CodeArts', models: [{ id: 'glm' }] },
+        { id: 'loomy', name: 'Loomy', models: [{ id: 'deepseek' }] },
+      ],
+    }
+  },
+
+  async reorderRoutingGroup(id, members) {
+    const group = MOCK_ROUTING_GROUPS.find((item) => item.id === id)
+    if (!group) throw new Error('路由组不存在')
+    group.members = members
+    group.auto = false
+    return { groups: clone(MOCK_ROUTING_GROUPS) }
+  },
+
+  async bindRoutingGroup({ name, providers }) {
+    const id = `group-${Date.now()}`
+    const members = providers.map((provider) => `${provider}/model`)
+    MOCK_ROUTING_GROUPS.push({ id, name, auto: false, routing: 'order', members, memberInfo: [] })
+    return { saved: { id, name, members }, groups: clone(MOCK_ROUTING_GROUPS) }
+  },
+
+  async deleteRoutingGroup(id) {
+    const group = MOCK_ROUTING_GROUPS.find((item) => item.id === id)
+    if (!group) throw new Error('路由组不存在')
+    if (group.auto) throw new Error('自动合并的分组不能删除')
+    MOCK_ROUTING_GROUPS.splice(MOCK_ROUTING_GROUPS.indexOf(group), 1)
+    return { groups: clone(MOCK_ROUTING_GROUPS) }
+  },
+
+  async magpieAliasSync() {
+    await latency(60)
+    return clone(MOCK_ALIAS_STATE)
+  },
+
+  async magpieAliasAction(action, body = {}) {
+    await latency(120)
+    if (action === 'select-key') {
+      const selected = MOCK_ALIAS_STATE.keys.find((item) => item.id === body.keyId && item.eligible)
+      if (!selected) throw new Error('目标 Key 不可用')
+      MOCK_ALIAS_STATE.selectedKeyId = selected.id
+      MOCK_ALIAS_STATE.selectedKeyName = selected.name
+      return { ok: true, selectedKeyId: selected.id }
+    }
+    if (action === 'provider-set') {
+      const provider = MOCK_ALIAS_STATE.providers.find((item) => item.id === body.providerId)
+      if (!provider) throw new Error('provider 不存在')
+      provider.authorized = !!body.authorized
+      MOCK_ALIAS_STATE.authorizedCount = MOCK_ALIAS_STATE.providers.filter((item) => item.authorized).length
+    } else if (action !== 'sync') throw new Error('不支持的 aliases 同步操作')
+    MOCK_ALIAS_STATE.status.phase = 'syncing'
+    MOCK_ALIAS_STATE.status.pending = true
+    MOCK_ALIAS_STATE.status.revision += 1
+    const revision = MOCK_ALIAS_STATE.status.revision
+    setTimeout(() => {
+      const models = MOCK_ALIAS_STATE.providers.filter((item) => item.authorized)
+        .reduce((total, item) => total + (item.modelCount || 0), 0)
+      MOCK_ALIAS_STATE.usage.aliases.used = models
+      MOCK_ALIAS_STATE.usage.aliases.managed = models
+      MOCK_ALIAS_STATE.usage.models.used = models
+      MOCK_ALIAS_STATE.usage.models.managed = models
+      MOCK_ALIAS_STATE.status.phase = 'idle'
+      MOCK_ALIAS_STATE.status.pending = false
+      MOCK_ALIAS_STATE.lastSuccessAt = Date.now()
+    }, 700)
+    return { ok: true, revision, status: 'syncing' }
+  },
+
+  async tunnels() {
+    await latency(80)
+    return { targets: clone(MOCK_TUNNELS), binary: clone(MOCK_BINARY) }
+  },
+
+  async tunnelBinaryStatus() { return clone(MOCK_BINARY) },
+
+  async installTunnelBinary() {
+    MOCK_BINARY.downloading = true
+    setTimeout(() => { MOCK_BINARY.downloading = false; MOCK_BINARY.installed = true; MOCK_BINARY.verified = true }, 800)
+    return { started: true, status: clone(MOCK_BINARY) }
+  },
+
+  async saveTunnelConfig(id, patch) {
+    const target = MOCK_TUNNELS.find((item) => item.id === id)
+    if (!target) throw new Error('未知外网目标')
+    for (const key of ['mode', 'autoStart', 'guardPort']) if (patch[key] !== undefined) target[key] = patch[key]
+    if (patch.publicUrl !== undefined) target.configuredPublicUrl = patch.publicUrl
+    if (patch.token !== undefined) {
+      target.hasToken = patch.token !== ''
+      target.verifiedAt = 0
+      target.tunnelId = ''
+    }
+    target.updatedAt = Date.now()
+    return clone(target)
+  },
+
+  async verifyTunnelToken(id, token) {
+    await latency(250)
+    if (token === 'invalid') {
+      const error = new Error('Cloudflare 拒绝了此 Tunnel Token')
+      error.code = 'TOKEN_REFUSED'
+      throw error
+    }
+    const target = MOCK_TUNNELS.find((item) => item.id === id)
+    if (!target) throw new Error('未知外网目标')
+    if (token || target.hasToken) {
+      target.hasToken = true
+      target.verifiedAt = Date.now()
+      target.tunnelId = `demo-${id}-tunnel`
+    }
+    return { ok: true, verifiedAt: target.verifiedAt, tunnelId: target.tunnelId }
+  },
+
+  async preflightTunnel(id) {
+    await latency(180)
+    return { ok: true, id, keyVerified: true, localHealth: 'ok', targetStatus: 200 }
+  },
+
+  async startTunnel(id) {
+    const target = MOCK_TUNNELS.find((item) => item.id === id)
+    if (!target) throw new Error('未知外网目标')
+    target.phase = 'starting'
+    target.stage = 'registering'
+    target.desiredRunning = true
+    setTimeout(() => {
+      target.phase = 'running'
+      target.stage = 'idle'
+      target.pid = 45000 + MOCK_TUNNELS.indexOf(target)
+      target.localHealth = 'ok'
+      target.publicHealth = 'ok'
+      target.publicUrl = target.mode === 'quick' ? `https://demo-${id}.trycloudflare.com` : target.configuredPublicUrl
+    }, 700)
+    return { ...clone(target), started: true }
+  },
+
+  async stopTunnel(id) {
+    const target = MOCK_TUNNELS.find((item) => item.id === id)
+    if (!target) throw new Error('未知外网目标')
+    target.phase = 'stopped'
+    target.stage = 'idle'
+    target.desiredRunning = false
+    target.pid = 0
+    target.publicUrl = ''
+    return clone(target)
+  },
+
+  async tunnelLogs(id) {
+    return { id, lines: [`INFO ${id} 隧道状态已刷新`, 'INFO 日志中的 Token、Key 与 Cookie 均已脱敏'] }
+  },
+
+  async setTunnelManagerPassword() {
+    const target = MOCK_TUNNELS.find((item) => item.id === 'manager')
+    target.passwordConfigured = true
+    return { configured: true, updatedAt: Date.now() }
+  },
+
   async getSettings() {
     await latency(110)
     return clone(MOCK_SETTINGS)
@@ -375,6 +574,10 @@ export const mockApi = {
     Object.assign(MOCK_SETTINGS.manager, settings.manager || {})
     Object.assign(MOCK_SETTINGS.update, settings.update || {})
     Object.assign(MOCK_SETTINGS.sub2api, settings.sub2api || {})
+    if (settings.proxy) {
+      Object.assign(MOCK_SETTINGS.proxy, settings.proxy)
+      Object.assign(MOCK_SETTINGS.proxy.scopes, settings.proxy.scopes || {})
+    }
     return { ok: true }
   }
 }

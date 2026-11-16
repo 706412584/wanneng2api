@@ -72,10 +72,13 @@ class PlatformUpdater {
    * @param {string} opts.dataDir
    * @param {object} [opts.logger]
    */
-  constructor({ manager, store, dataDir, logger }) {
+  constructor({ manager, store, dataDir, logger, magpie, magpieBinary, magpieDir }) {
     this.manager = manager;
     this.store = store;
     this.dataDir = dataDir;
+    this.magpie = magpie || null;
+    this.magpieBinary = magpieBinary || '';
+    this.magpieDir = magpieDir || '';
     this.log = logger || { info: () => {}, warn: () => {}, error: () => {} };
     this.busy = new Set(); // 正在 apply 的平台
     this._releaseCache = new Map(); // repo -> { at, data }
@@ -353,25 +356,69 @@ class PlatformUpdater {
     try { return JSON.parse(fs.readFileSync(path.join(workDir, 'config.json'), 'utf8')); } catch { return {}; }
   }
 
-  async registerProvider(id) {
+  /** 四家普通 API Key：只用于 magpie provider，CodeArts admin_key 永远不能进入这里。 */
+  _gatewayApiKey(id, platform, cfg) {
+    const env = { ...process.env, ...((platform.run && platform.run.env) || {}) };
+    const clean = (value) => typeof value === 'string' ? value.trim() : '';
+    const first = (raw, objects = false) => {
+      const list = Array.isArray(raw) ? raw : String(raw || '').split(',');
+      for (const item of list) {
+        const value = clean(objects && item && typeof item === 'object' ? item.key : item);
+        if (value) return value;
+      }
+      return '';
+    };
+    if (id === 'workbuddy') return clean(env.WB2A_API_KEY) || clean(cfg.api_key) || first(cfg.api_keys, true);
+    if (id === 'codearts') return clean(env.CA2A_API_KEY) || clean(cfg.api_key);
+    if (id === 'loomy') return first(env.LOOMY_API_KEYS || env.API_KEY || cfg.api_keys);
+    if (id === 'lingxi') return clean(env.WB2A_API_KEY) || clean(cfg.api_key);
+    return '';
+  }
+
+  async _providerKeyAction(id, { allowAdd }) {
     const p = this.store.getPlatform(id);
     if (!p || !['workbuddy', 'codearts', 'loomy', 'lingxi'].includes(id)) return { ok: false, message: '该平台不支持注册为自研网关' };
-    if (!this.manager.isInstalled(id)) return { ok: false, message: '网关尚未安装' };
-    const magpie = require('./magpie-adapter');
-    const bin = findMagpieBinary(this.dataDir);
+    if (!this.manager.isInstalled(id)) {
+      return allowAdd
+        ? { ok: false, message: '网关尚未安装' }
+        : { ok: true, skipped: true, message: '网关尚未安装，跳过凭证同步' };
+    }
+    const magpie = this.magpie || require('./magpie-adapter');
+    const bin = this.magpieBinary || findMagpieBinary(this.dataDir);
     if (!bin) return { ok: false, message: 'magpie 尚未安装，安装内核后可重试注册' };
     const cfg = this._gatewayConfig(this.store.platformWorkDir(p));
-    const firstKey = Array.isArray(cfg.api_keys) ? cfg.api_keys[0] : '';
-    const key = cfg.api_key || (typeof firstKey === 'string' ? firstKey : firstKey && firstKey.key) || '';
+    const key = this._gatewayApiKey(id, p, cfg);
     if (!key) return { ok: false, message: '未找到网关 API 密钥，未修改 magpie 配置' };
-    const args = [`url=http://127.0.0.1:${p.port}`];
-    if (id !== 'lingxi') args.push(`anthropic=http://127.0.0.1:${p.port}`);
-    args.push('models=*');
-    const result = await magpie.addProvider(bin, { id: `wanneng-${id}`, key, args });
+    const providerId = `wanneng-${id}`;
+    let existing;
+    try { existing = magpie.getCustomProvider(providerId, this.magpieDir || undefined); }
+    catch (e) { return { ok: false, message: `读取 magpie provider 配置失败，未修改：${e.message}` }; }
+    if (!existing && !allowAdd) return { ok: true, skipped: true, message: `${providerId} 尚未注册，仅首次安装或手动重试时创建` };
+    if (existing && existing.key === key) return { ok: true, unchanged: true, message: 'magpie provider 密钥已一致' };
+    let result;
+    if (existing) {
+      result = await magpie.updateProviderKey(bin, { id: providerId, key });
+    } else {
+      const args = [`url=http://127.0.0.1:${p.port}`];
+      if (id !== 'lingxi') args.push(`anthropic=http://127.0.0.1:${p.port}`);
+      args.push('models=*');
+      result = await magpie.addProvider(bin, { id: providerId, key, args });
+    }
     const redact = (value) => String(value || '').replace(/\b[A-Fa-f0-9]{32,}\b/g, '[已隐藏]')
       .replace(/([?&](?:k|key|token|api_key)=)[^&\s]+/gi, '$1[已隐藏]').slice(0, 300);
-    return { ok: result.ok, message: result.ok ? '已注册到 magpie' : redact(result.stderr || result.stdout || 'magpie 注册失败，可重试').replaceAll(key, '[已隐藏]') };
+    return {
+      ok: result.ok,
+      updated: !!existing && result.ok,
+      message: result.ok
+        ? (existing ? '已同步 magpie provider 密钥' : '已注册到 magpie')
+        : redact(result.stderr || result.stdout || 'magpie 注册失败，可重试').replaceAll(key, '[已隐藏]'),
+    };
   }
+
+  async registerProvider(id) { return this._providerKeyAction(id, { allowAdd: true }); }
+
+  /** 后台只修正已注册 provider；缺失时绝不自动创建。 */
+  async syncProviderKey(id) { return this._providerKeyAction(id, { allowAdd: false }); }
 
   // ── §7.2 / §7.3 应用 ──
 

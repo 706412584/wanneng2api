@@ -10,12 +10,14 @@ import Updates from './pages/Updates'
 import Hub from './pages/Hub'
 import Logs from './pages/Logs'
 import Settings from './pages/Settings'
+import ExternalAccess from './pages/ExternalAccess'
 
 const NAV = [
   { to: '/overview', ico: '▤', label: '概览', group: '工作区' },
   { to: '/platforms', ico: '▦', label: '平台管理', group: null },
   { to: '/updates', ico: '⟳', label: '更新中心', group: null },
   { to: '/hub', ico: '⇄', label: 'Hub 聚合', group: '系统模块' },
+  { to: '/tunnels', ico: '⇧', label: '外网访问', group: null },
   { to: '/logs', ico: '▥', label: '日志', group: null },
   { to: '/settings', ico: '⚙', label: '设置', group: null }
 ]
@@ -25,6 +27,7 @@ const TITLES = {
   '/platforms': '平台管理',
   '/updates': '更新中心',
   '/hub': 'Hub 聚合层',
+  '/tunnels': '外网访问',
   '/logs': '日志',
   '/settings': '设置'
 }
@@ -111,6 +114,7 @@ export default function App() {
                 <Route path="/platforms" element={<Platforms />} />
                 <Route path="/updates" element={<Updates />} />
                 <Route path="/hub" element={<Hub />} />
+                <Route path="/tunnels" element={<ExternalAccess />} />
                 <Route path="/logs" element={<Logs />} />
                 <Route path="/settings" element={<Settings />} />
                 <Route path="*" element={<Overview />} />

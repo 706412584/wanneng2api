@@ -6,8 +6,18 @@ import { mockApi, mockLogStream } from './mock'
 // 之前构建产物落到 mock，打包后打开就是假数据，和桌面版应有的行为相反。
 const MODE = (import.meta.env.VITE_API_MODE
   || (import.meta.env.PROD ? 'live' : 'mock')).toLowerCase()
-const BASE = (import.meta.env.VITE_API_BASE || 'http://127.0.0.1:17800').replace(/\/$/, '')
+const DEFAULT_BASE = typeof window !== 'undefined' && /^https?:$/.test(window.location.protocol)
+  ? window.location.origin
+  : 'http://127.0.0.1:17800'
+const BASE = (import.meta.env.VITE_API_BASE || DEFAULT_BASE).replace(/\/$/, '')
 const TIMEOUT_MS = 8000
+
+function remoteCsrf() {
+  if (typeof document === 'undefined') return ''
+  const item = document.cookie.split(';').map((part) => part.trim())
+    .find((part) => part.startsWith('__Host-wanneng_csrf='))
+  return item ? item.slice('__Host-wanneng_csrf='.length) : ''
+}
 
 export const isMock = MODE === 'mock'
 
@@ -19,14 +29,17 @@ export const isMock = MODE === 'mock'
 async function request(path, { method = 'GET', body, timeout = TIMEOUT_MS } = {}) {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), timeout)
+  const csrf = remoteCsrf()
   try {
     const res = await fetch(BASE + path, {
       method,
+      credentials: 'same-origin',
       // X-Wanneng-Client：壳用 file:// 回退加载 UI 时 Origin 是 null，
 // 与「任意网页的 sandbox iframe」无法区分。带这个自定义头证明是本台 UI
 // （跨站写请求无法设置它，会先触发预检并被拒绝）。
       headers: {
         'X-Wanneng-Client': 'wanneng2api',
+        ...(csrf ? { 'X-Wanneng-CSRF': csrf } : {}),
         ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -204,6 +217,9 @@ export const api = new Proxy({
   bindRoutingGroup: ({ id, name, providers }) => request('/api/magpie/routing-groups', {
     method: 'POST', body: { action: 'bind', id, name, providers }, timeout: 60000,
   }),
+  deleteRoutingGroup: (id) => request('/api/magpie/routing-groups', {
+    method: 'POST', body: { action: 'delete', id }, timeout: 60000,
+  }),
   magpiePluginPanel: (pkg, provider) => request(`/api/magpie/plugin-panel?${new URLSearchParams({ package: pkg, provider })}`, { timeout: 40000 }),
   magpiePluginAction: (pkg, provider, action, body = {}) => request('/api/magpie/plugin-panel', {
     method: 'POST', body: { ...body, package: pkg, provider, action }, timeout: 60000,
@@ -223,6 +239,29 @@ export const api = new Proxy({
   // 安装 / 移除 provider（走 magpie CLI）
   magpieAddProvider: (id, key, args) => request('/api/magpie/providers/add', { method: 'POST', body: { id, key, args }, timeout: 180000 }),
   magpieRemoveProvider: (id) => request('/api/magpie/providers/remove', { method: 'POST', body: { id }, timeout: 60000 }),
+  // 公网模型 aliases：只允许选择 Key/provider，权限与目标由后端规划。
+  magpieAliasSync: () => request('/api/magpie/alias-sync', { timeout: 45000 }),
+  magpieAliasAction: (action, body = {}) => request('/api/magpie/alias-sync', {
+    method: 'POST', body: { action, ...body }, timeout: 45000,
+  }),
+
+  // 统一外网访问：秘密只提交到本机 Manager；远程会话使用同源 Cookie + CSRF。
+  tunnels: () => request('/api/tunnels'),
+  tunnelBinaryStatus: () => request('/api/tunnels/binary/status'),
+  installTunnelBinary: () => request('/api/tunnels/binary/install', { method: 'POST', timeout: 30000 }),
+  saveTunnelConfig: (id, patch) => request(`/api/tunnels/${encodeURIComponent(id)}/config`, {
+    method: 'PUT', body: patch, timeout: 30000,
+  }),
+  preflightTunnel: (id) => request(`/api/tunnels/${encodeURIComponent(id)}/preflight`, { method: 'POST', timeout: 30000 }),
+  verifyTunnelToken: (id, token) => request(`/api/tunnels/${encodeURIComponent(id)}/verify-token`, {
+    method: 'POST', body: { token }, timeout: 60000,
+  }),
+  startTunnel: (id) => request(`/api/tunnels/${encodeURIComponent(id)}/start`, { method: 'POST', timeout: 30000 }),
+  stopTunnel: (id) => request(`/api/tunnels/${encodeURIComponent(id)}/stop`, { method: 'POST', timeout: 60000 }),
+  tunnelLogs: (id, tail = 200) => request(`/api/tunnels/${encodeURIComponent(id)}/logs?tail=${tail}`),
+  setTunnelManagerPassword: (currentPassword, newPassword) => request('/api/tunnels/manager/password', {
+    method: 'PUT', body: { currentPassword, newPassword }, timeout: 30000,
+  }),
 
   getSettings: () => request('/api/settings'),
   putSettings: (settings) => request('/api/settings', { method: 'PUT', body: settings })
@@ -239,8 +278,57 @@ export const api = new Proxy({
  * @param {(line: {id: string, text: string}) => void} onLine
  * @returns {() => void} 取消函数
  */
+function appendOnlyNewLines(previous, current) {
+  const maxOverlap = Math.min(previous.length, current.length)
+  for (let size = maxOverlap; size > 0; size--) {
+    let same = true
+    for (let i = 0; i < size; i++) {
+      if (previous[previous.length - size + i] !== current[i]) {
+        same = false
+        break
+      }
+    }
+    if (same) return current.slice(size)
+  }
+  return current
+}
+
+/** Cloudflare 部分链路不转发 SSE；远程管理会话改用去重轮询，避免 EventSource 永久空等。 */
+function openPollingLogStream(ids, onLine) {
+  let alive = true
+  let running = false
+  let timer = null
+  const previous = new Map()
+  const poll = async () => {
+    if (!alive || running) return
+    running = true
+    try {
+      await Promise.all(ids.map(async (id) => {
+        try {
+          const result = await api.getLogs(id, 200)
+          const current = Array.isArray(result?.lines) ? result.lines : []
+          const old = previous.get(id) || []
+          for (const text of appendOnlyNewLines(old, current)) onLine({ id, text })
+          previous.set(id, current)
+        } catch {
+          // 单个平台失败不影响其他平台，下一轮自动恢复。
+        }
+      }))
+    } finally {
+      running = false
+      if (alive) timer = setTimeout(poll, 2000)
+    }
+  }
+  void poll()
+  return () => {
+    alive = false
+    if (timer) clearTimeout(timer)
+  }
+}
+
 export function openLogStream(ids, onLine) {
   if (isMock) return mockLogStream(ids, onLine)
+  if (remoteCsrf()) return openPollingLogStream(ids, onLine)
   const sources = []
   for (const id of ids) {
     try {

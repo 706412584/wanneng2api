@@ -118,8 +118,39 @@ async function main() {
     download: async () => ({ supported: true, status: 'downloading' }),
     install: async () => ({ ok: true }),
   };
-  const api = new ApiServer({ manager, updater, store, openExternal: () => {}, selfUpdate });
+  const tunnelCalls = [];
+  const tunnelManager = {
+    snapshot: () => ({ targets: [{ id: 'workbuddy', phase: 'stopped' }], binary: { installed: true } }),
+    binaryStatus: () => ({ installed: true, version: '2026.10.6' }),
+    installBinary: async () => { tunnelCalls.push('binary'); return { path: '/fake/cloudflared' }; },
+    setManagerPassword: async () => ({ configured: true }),
+    updateConfig: (id, patch) => { tunnelCalls.push(`config:${id}`); return { id, ...patch }; },
+    preflight: async (id) => {
+      if (id === 'unknown') {
+        const error = new Error('未知目标');
+        error.code = 'UNKNOWN_TARGET';
+        error.statusCode = 404;
+        throw error;
+      }
+      return { ok: true, id, keyVerified: true };
+    },
+    verifyToken: async (id) => ({ ok: true, id, verifiedAt: 123456, tunnelId: 'tunnel-a' }),
+    start: (id) => { tunnelCalls.push(`start:${id}`); return { id, phase: 'starting' }; },
+    stop: async (id) => ({ id, phase: 'stopped' }),
+    logs: (id) => ({ id, lines: ['safe-log'] }),
+  };
+  const aliasCalls = [];
+  const aliasSync = {
+    status: async () => ({ available: true, selectedKeyId: 'key-a', keys: [], providers: [], conflicts: [] }),
+    selectKey: async (keyId) => { aliasCalls.push(['select-key', keyId]); return { ok: true, selectedKeyId: keyId }; },
+    setProvider: async (providerId, authorized) => { aliasCalls.push(['provider-set', providerId, authorized]); return { ok: true, revision: 2 }; },
+    request: (reason, options) => { aliasCalls.push(['request', reason, options]); return { ok: true, revision: 3, status: 'idle' }; },
+    start: () => { aliasCalls.push(['start']); },
+    close: async () => { aliasCalls.push(['close']); },
+  };
+  const api = new ApiServer({ manager, updater, store, openExternal: () => {}, selfUpdate, tunnelManager, aliasSync });
   await api.listen('127.0.0.1:17809');
+  api.startAliasSync();
   console.log(`api up, dataDir=${dataDir}\n`);
 
   // ── CORS ──
@@ -225,6 +256,24 @@ async function main() {
     JSON.stringify(mc.json.warnings));
   ok('没有数据时 models 为空数组', mc.json.models.length === 0);
 
+  // ── Magpie aliases 自动同步 API ──
+  console.log('\n[magpie alias-sync]');
+  const as = await req('GET', '/api/magpie/alias-sync');
+  ok('alias-sync 状态 200 且不包含原生 Key 对象', as.status === 200 && as.json.selectedKeyId === 'key-a');
+  const ask = await req('POST', '/api/magpie/alias-sync', { action: 'select-key', keyId: 'key-b' });
+  ok('select-key 202 且只传 keyId', ask.status === 202 && aliasCalls.some((c) => c[0] === 'select-key' && c[1] === 'key-b'));
+  const ap = await req('POST', '/api/magpie/alias-sync', { action: 'provider-set', providerId: 'wanneng-lingxi', authorized: true });
+  ok('provider-set 202 且进入授权动作', ap.status === 202 && aliasCalls.some((c) => c[0] === 'provider-set' && c[2] === true));
+  const asyncReq = await req('POST', '/api/magpie/alias-sync', { action: 'sync' });
+  ok('手工同步 202/revision', asyncReq.status === 202 && asyncReq.json.revision === 3);
+  const badAlias = await req('POST', '/api/magpie/alias-sync', { action: 'sync', models: ['all'] });
+  ok('前端直传 Models 被拒绝', badAlias.status === 400 && !aliasCalls.some((c) => c[0] === 'request' && c[1] === 'manual' && c[2]?.models));
+  manager.emit('status', 'lingxi', 'healthy', {});
+  ok('四家 healthy 触发模型刷新同步', aliasCalls.some((c) => c[0] === 'request' && c[1] === 'platform-healthy' && c[2]?.refresh === true));
+  const beforeUnrelatedStatus = aliasCalls.length;
+  manager.emit('status', 'mocka', 'healthy', {});
+  ok('无关平台状态不触发 aliases 同步', aliasCalls.length === beforeUnrelatedStatus);
+
   // ── settings ──
   console.log('\n[settings GET/PUT]');
   const sg = await req('GET', '/api/settings');
@@ -324,6 +373,31 @@ async function main() {
   console.log('\n[updates/summary]');
   const us = await req('GET', '/api/updates/summary');
   ok('summary 200 数组', us.status === 200 && Array.isArray(us.json.updates) && us.json.updates.length === 2);
+
+  // ── 统一外网访问 API ──
+  console.log('\n[统一外网访问]');
+  const tl = await req('GET', '/api/tunnels');
+  ok('tunnels 快照 200', tl.status === 200 && Array.isArray(tl.json.targets));
+  const tc = await req('PUT', '/api/tunnels/workbuddy/config', { autoStart: true });
+  ok('隧道配置保存 200', tc.status === 200 && tc.json.autoStart === true);
+  const tp = await req('POST', '/api/tunnels/workbuddy/preflight');
+  ok('隧道 preflight 不暴露秘密', tp.status === 200 && tp.json.keyVerified === true);
+  const tv = await req('POST', '/api/tunnels/workbuddy/verify-token', { token: 'candidate-secret' });
+  ok('Token 验证路由返回 tunnelId', tv.status === 200 && tv.json.tunnelId === 'tunnel-a');
+  ok('Token 验证路由不回显候选 Token', !tv.raw.includes('candidate-secret'));
+  const ts = await req('POST', '/api/tunnels/workbuddy/start');
+  ok('隧道启动下发 202', ts.status === 202 && ts.json.started === true && ts.json.phase === 'starting');
+  const tg = await req('GET', '/api/tunnels/workbuddy/logs?tail=10');
+  ok('隧道日志 200', tg.status === 200 && tg.json.lines[0] === 'safe-log');
+  const tmPassword = await req('PUT', '/api/tunnels/manager/password', { newPassword: 'not-returned-secret' });
+  ok('管理密码接口不回显秘密', tmPassword.status === 200 && !tmPassword.raw.includes('not-returned-secret'));
+  const tb = await req('POST', '/api/tunnels/binary/install');
+  ok('cloudflared 安装下发 202', tb.status === 202 && tb.json.started === true);
+  const tx = await req('POST', '/api/tunnels/workbuddy/stop');
+  ok('隧道停止 200', tx.status === 200 && tx.json.phase === 'stopped');
+  const tu = await req('POST', '/api/tunnels/unknown/preflight');
+  ok('未知隧道目标返回稳定错误码', tu.status === 404 && tu.json.code === 'UNKNOWN_TARGET');
+  ok('隧道动作确实进入 TunnelManager', tunnelCalls.includes('start:workbuddy') && tunnelCalls.includes('config:workbuddy'));
 
   // ── 404 / 未知平台 ──
   console.log('\n[404 与错误处理]');

@@ -1,4 +1,5 @@
 // 设置页：manager.json 读写（general / update / sub2api）+ 关于区（版本/检查壳更新）
+import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { api, apiMode } from '../api/client'
 import { usePolling } from '../hooks/usePolling'
@@ -21,12 +22,14 @@ const EMPTY_SETTINGS = {
   sub2api: { pgPort: 5433, redisPort: 6380 }
 }
 
-/** 代理范围：前四项由壳执行（挂 agent），后两项写入 magpie 自己的设置 */
+/** 代理范围：壳自身用途挂 agent，magpie 两项写入 magpie 自己的设置 */
 const PROXY_SCOPES = [
   { id: 'selfUpdate', label: '壳自更新' },
   { id: 'platformUpdate', label: '平台更新（检查 + 下载）' },
   { id: 'pluginRegistry', label: '插件市场' },
   { id: 'magpieKernel', label: 'magpie 内核更新' },
+  { id: 'tunnelDownload', label: 'cloudflared 下载' },
+  { id: 'tunnelRuntime', label: 'cloudflared 出网与公网健康检查' },
   { id: 'magpieSubscription', label: '订阅流量（magpie proxy）' },
   { id: 'magpiePlugin', label: '插件流量（magpie pluginProxy）' }
 ]
@@ -286,7 +289,8 @@ export default function Settings() {
           Node 默认不读系统代理，所以壳的更新/下载必须在这里显式开启。<br />
           「订阅流量 / 插件流量」写入 magpie 自己的 proxy / pluginProxy；<b>取消勾选会明确设为不走代理</b>——
           magpie 的空值含义是「跟随系统代理」，而系统代理可能对你的目标不通。<br />
-          四个自研网关的流量不受此设置影响（它们各自的代理由自己的配置决定）。
+          四个自研网关的流量不受此设置影响（它们各自的代理由自己的配置决定）。<br />
+          cloudflared 运行时代理变更会在对应隧道下次启动或重连时生效，不会自动重启现有隧道。
         </div>
       </div>
 

@@ -44,13 +44,25 @@ async function main() {
   }
 
   const store = new ConfigStore();
+  const proxy = require('./src/proxy');
+  proxy.init(store);
+  proxy.setLogger(log.info);
   const manager = new PlatformManager({ store, dataDir: store.dataDir, logger: log });
   const updater = new PlatformUpdater({ store, manager, logger: log });
+  const tunnelManager = require('./src/tunnel').createTunnelSystem({
+    configStore: store,
+    dataDir: store.dataDir,
+    managerOrigin: `http://${HOST}:${PORT}`,
+    staticDir: UI_DIR,
+    proxy,
+    logger: log,
+  }).manager;
 
   const api = new ApiServer({
     manager,
     updater,
     store,
+    tunnelManager,
     openExternal: (url) => {
       // 无 Electron：交给系统默认浏览器打开
       const cmd = process.platform === 'win32' ? `start "" "${url}"` : `xdg-open "${url}"`;
@@ -58,6 +70,7 @@ async function main() {
     },
   });
   await api.listen(`${HOST}:${PORT}`);
+  api.startAliasSync();
 
   // 同一个端口托管 UI：/api/* 走 Manager API，其余走静态文件。
   // ApiServer 已经监听在该端口上，静态资源由它的 404 分支兜底会更简单，
@@ -73,12 +86,14 @@ async function main() {
   if (AUTO_START) {
     log.info('自动启动已启用平台…');
     await manager.startAutoStart();
+    tunnelManager.startAutoStart();
   } else {
     log.info('已跳过自动启动（--no-autostart）');
   }
 
   const shutdown = async (sig) => {
-    log.info(`收到 ${sig}，正在停止全部平台…`);
+    log.info(`收到 ${sig}，正在停止外网隧道与全部平台…`);
+    await tunnelManager.stopAll().catch(() => {});
     await manager.stopAll().catch(() => {});
     await api.close().catch(() => {});
     process.exit(0);

@@ -549,6 +549,22 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 }
 .collapse-head .caret.open { transform: rotate(90deg); }
 
+/* ===== Magpie 公网模型别名 ===== */
+.alias-sync-card { margin-top: 16px; padding: 0; overflow: hidden; }
+.alias-sync-card .collapse-head .sub { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.alias-sync-body { display: flex; flex-direction: column; gap: 14px; padding: 0 16px 16px; }
+.alias-sync-key-row { display: flex; align-items: flex-end; gap: 10px; }
+.alias-sync-key-row .field { flex: 1; }
+.alias-sync-actions, .alias-sync-usage { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.alias-sync-usage { color: var(--text-3); font-size: 12px; gap: 18px; }
+.alias-sync-conflicts { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid color-mix(in srgb, var(--orange) 30%, var(--border)); border-radius: var(--radius); background: color-mix(in srgb, var(--orange) 5%, var(--card)); }
+.alias-sync-conflict { display: flex; flex-direction: column; gap: 3px; font-size: 12px; line-height: 1.6; }
+.alias-provider-error { color: var(--red); font-size: 11.5px; overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .alias-sync-key-row { align-items: stretch; flex-direction: column; }
+  .alias-sync-card .collapse-head .sub { white-space: normal; }
+}
+
 /* ===== 自绘标题栏（frame:false） ===== */
 .titlebar {
   position: fixed; top: 0; left: 0; right: 0; height: 34px; z-index: 300;
@@ -757,3 +773,64 @@ html.has-titlebar .plugin-manager-mask { top: 34px; }
   .content { padding: 14px 12px 24px; }
   .log-stream { height: 60vh; }
 }
+
+/* ===== 外网访问 ===== */
+.tunnel-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(390px, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+.tunnel-card { display: flex; flex-direction: column; gap: 10px; height: 270px; min-height: 270px; overflow: hidden; }
+.tunnel-card-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tunnel-public-field { min-height: 59px; }
+.tunnel-error-clamp {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+.tunnel-card-title { justify-content: space-between; margin-bottom: 0; }
+.tunnel-binary-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.tunnel-progress { display: grid; gap: 6px; margin-top: 12px; }
+.tunnel-status-row { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-3); }
+.tunnel-error {
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--red) 30%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--red) 8%, transparent);
+  color: var(--red);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.tunnel-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: auto; }
+.tunnel-token-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tunnel-password {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-soft);
+}
+.tunnel-preflight { padding: 8px 10px; border-radius: 8px; font-size: 12px; }
+.tunnel-preflight.ok { color: var(--green); background: color-mix(in srgb, var(--green) 9%, transparent); }
+.tunnel-preflight.err { color: var(--red); background: color-mix(in srgb, var(--red) 9%, transparent); }
+.tunnel-log-stream { height: min(55vh, 520px); min-height: 240px; overflow-wrap: anywhere; }
+.tunnel-modal { width: min(720px, 100%); max-height: calc(100vh - 40px); overflow-y: auto; }
+.tunnel-modal.wide { width: min(900px, 100%); }
+.tunnel-modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.tunnel-modal-body { display: flex; flex-direction: column; gap: 14px; }
+.tunnel-draft-warning { color: var(--orange); }
+.text-ok { color: var(--green); }
+.text-err { color: var(--red); }
+@media (max-width: 520px) {
+  .tunnel-grid { grid-template-columns: minmax(0, 1fr); }
+  .tunnel-card { min-width: 0; }
+  .tunnel-actions .btn { flex: 1 1 auto; }
+}
+
+.routing-group-actions { display: flex; justify-content: flex-end; padding: 4px 0 2px; }

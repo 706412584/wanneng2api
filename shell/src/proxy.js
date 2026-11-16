@@ -21,7 +21,7 @@
  */
 
 /** 壳 agent 覆盖的用途 */
-const PURPOSES = ['selfUpdate', 'platformUpdate', 'pluginRegistry', 'magpieKernel'];
+const PURPOSES = ['selfUpdate', 'platformUpdate', 'pluginRegistry', 'magpieKernel', 'tunnelDownload', 'tunnelRuntime'];
 
 /** 设置里的勾选项 → magpie 自己的设置键（这两项由 magpie 执行，不走壳 agent） */
 const MAGPIE_SCOPE_KEYS = {

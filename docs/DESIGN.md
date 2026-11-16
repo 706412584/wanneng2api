@@ -53,7 +53,7 @@
 │  Electron 壳（wanneng2api）                                              │
 │  · PlatformManager：spawn / 健康巡检 / 崩溃退避重启 / 端口预检          │
 │  · Manager API :17800（仅 127.0.0.1）                                    │
-│  · React UI 六页：概览 / 平台管理 / 更新中心 / Hub / 日志 / 设置         │
+│  · React UI 七页：概览 / 平台管理 / 更新中心 / Hub / 外网访问 / 日志 / 设置 │
 │  · 托盘 / 开机自启 / 更新器（replace-binary / replace-dir + 回滚）       │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -101,6 +101,7 @@ OpenAI 协议（`/v1/messages` 明确留给未来实现，当前 404）。由 ma
 | 端口 | 用途 | 来源 |
 |---|---|---|
 | **17800** | 壳子 Manager API（仅 127.0.0.1） | 新增 |
+| **17901-17906** | 外网安全入口（仅 127.0.0.1；依次对应四网关、magpie、管理台） | 新增 |
 | **3425** | magpie 统一网关（外部托管，壳只探测） | magpie 默认（`MAGPIE_ADDR` 可改） |
 | **6789** | lingxi2api | 保持不变（config.json `listen`） |
 | **17810** | Hub 统一 API 入口（127.0.0.1，可配置对外） | 新增 |
@@ -121,7 +122,12 @@ OpenAI 协议（`/v1/messages` 明确留给未来实现，当前 404）。由 ma
 %AppData%\wanneng2api\
 ├── manager.json                 # 壳子全局配置（见 §4.1）
 ├── platforms.json               # 平台注册表（见 §4.2）
+├── tunnels.json                 # 外网目标公共配置（Quick/Named、autoStart、入口端口）
+├── private\
+│   └── tunnel-secrets.json      # Named Token 与管理台 scrypt 密码记录（API 不回显）
+├── bin\cloudflared\             # 固定版本、经 SHA-256 验证的连接器缓存
 ├── logs\
+│   ├── tunnels\<id>.log         # 各目标脱敏隧道日志（复用轮转策略）
 │   ├── manager.log              # 壳子自身日志
 │   └── platforms\<id>.log       # 各平台 stdout/stderr（按 10MB 轮转，保留 5 份）
 ├── hub\
@@ -327,6 +333,7 @@ GET    /api/updates/summary              全平台版本汇总（UI「更新中�
 | 平台管理 | 每平台一张卡：状态灯、版本、uptime、启停按钮、健康、打开面板按钮、更新按钮（有新版显示徽标）、日志入口。sub2api 卡额外显示 PG/Redis 依赖状态 |
 | 更新中心 | 全平台版本对照表 + 「一键检查」「逐个/批量更新」+ 更新进度实时流 + 失败回滚记录 |
 | Hub | 模型路由表（模型模式 → 平台链）、统一入口地址展示（一键复制 base_url + key）、实时用量表 |
+| 外网访问 | cloudflared 安装状态、六目标折叠卡片；Quick/Named、autoStart、预检、启停、Service URL 与日志均在配置/日志弹窗中操作 |
 | 日志 | 平台多选 + 实时流 + 级别过滤 + 搜索 |
 | 设置 | manager.json 全部字段 + 平台启用开关 + sub2api 依赖端口设置 + 关于/检查壳更新 |
 
@@ -554,3 +561,81 @@ stop sub2api:
 - 不改动三个现有网关的代码与配置格式
 - 不做 PG→SQLite 移植（决策 D1）
 - 不做 Linux/macOS 适配（首期 Windows；技术选型天然可移植，后按需加）
+
+---
+
+## 13. 统一外网访问模块（2026-11-15 实现）
+
+### 13.1 范围与边界
+
+`shell/src/tunnel/` 是独立的 Cloudflare Tunnel 管理模块，覆盖 workbuddy / codearts / loomy / lingxi / magpie / manager 六类目标，每目标支持 Quick 与 Named、autoStart、预检、启停、健康和日志。首版不做 Pinggy、FRP、P2P、Tailscale，也不自动创建 Cloudflare Tunnel、DNS 或 ingress。
+
+- 不调用 LAN 开关，不修改原网关监听地址，不隐式启动/重启平台。
+- 每目标独立受限 loopback 网关和 cloudflared 进程，默认入口依次为 17901-17906；Named 每目标独立 Token 与 Public Hostname。
+- Quick 使用 `--url http://127.0.0.1:<guardPort>` 并解析临时地址；Named Token 仅经 `TUNNEL_TOKEN` 环境传递，不进入 argv。
+- cloudflared 固定为 2026.10.6，官方资产按平台 SHA-256 校验；缓存校验失败不得执行，多目标共享整个校验/安装 singleflight。
+- 只有连接器注册成功且公网固定健康端点验证通过，状态才进入 running；崩溃和连续公网失败按退避重连。旧进程未确认停止时严禁创建新实例。
+
+### 13.2 API 目标安全
+
+`target-adapters.js` 按各网关源码固化普通 API Key、环境变量优先级和 path/method 白名单；`public-api-gateway.js` 每次请求重新按 mtime 读取有效 Key，常量时间比较，并流式转发允许的模型请求。
+
+- CodeArts `admin_key` 不属于公开 API Key；magpie 读取 `caller-keys.json` 中启用且未过期的 Gateway Key。
+- 不接受 query 传 Key，外部客户端仍使用原服务普通 API Key；密钥不注入、不自动生成、不改写。
+- 管理面板、账号、配置、日志、签到、用量管理和 Upgrade 默认拒绝；拒绝二次编码与点段，清理伪造转发头。
+- 无法证明目标鉴权与路由安全时 preflight 阻断，不能退化为无鉴权开放。
+
+### 13.3 远程管理台安全
+
+Manager 隧道指向 `remote-gateway.js`，绝不直接指向 17800。固定单管理员、至少 12 位密码，scrypt 哈希落私有配置；登录包含全局/IP 失败限流及进行中 scrypt 并发上限。
+
+- 随机会话只存内存，服务端保存 SHA-256 索引，12 小时过期；Cookie 为 `__Host-`、`HttpOnly; Secure; SameSite=Strict; Path=/`。
+- 每会话独立 CSRF secret，写请求校验会话、CSRF、公网 Origin 和 Host；响应统一 `frame-ancestors 'none'` 与 `X-Frame-Options: DENY`。
+- 认证后静态 UI、Manager API 和本机 SSE 才允许流式代理；内部请求规范化为本机 Host/Origin，不转发远程 Cookie/CSRF。实网验证发现部分 Cloudflare Quick 链路只返回响应头、不转发 SSE 数据帧，因此远程日志在会话中自动使用 2 秒去重轮询，桌面本机仍使用 SSE。
+- 注销、停止入口与修改密码撤销会话；Manager 非 loopback 或 UI 未挂载时禁止启动。
+
+### 13.4 配置、日志与生命周期
+
+公共配置 `<dataDir>/tunnels.json`；秘密配置 `<dataDir>/private/tunnel-secrets.json`，原子写入、损坏 fail closed、API 只返回 hasToken/passwordConfigured。日志复用 RingBuffer + RotatingFileWriter，Token、API Key、Cookie、Authorization 与代理凭据在落盘前脱敏。
+
+Electron、纯 Web、自更新退出均按 `TunnelManager.stopAll()` → `PlatformManager.stopAll()` → `ApiServer.close()` 清理。autoStart 只恢复隧道，不启动目标平台；本机健康探测固定直连，不经过 tunnelRuntime 代理。
+
+UI 为独立「外网访问」页。六张卡片默认折叠、统一 270px；卡片只展示状态、公网地址与操作，配置及日志使用带焦点锁/滚动锁的独立弹窗，未保存配置关闭时确认，密码输入关闭即清空。
+
+### 13.5 验证边界
+
+`npm --prefix shell run test:tunnels` 覆盖存储、固定资产与断流、Quick/Named 进程、API 白名单、远程认证和六目标状态机，全部使用临时目录、fake cloudflared 与 loopback mock。真实 Quick/Named 公网地址只有用户另行确认后才创建，不作为默认测试或启动动作。
+
+### 13.6 Named Token 前置验证（2026-11-16 补充）
+
+Named 配置顺序为 Token → 验证 → Public Hostname。`parseNamedTokenInfo()` 仅校验 base64url JSON 的 `a/t/s` 和 tunnelId，真正验证由独立临时 cloudflared 完成：收到 `Registered tunnel connection` 后先确认进程停止，再把候选 Token、verifiedAt、tunnelId 和 fingerprint 原子写入同一个私有 `tunnel-secrets.json`。
+
+`POST /api/tunnels/:id/verify-token` 不要求 publicUrl，不启动 guard gateway 或公网健康检查。验证进程与正式进程互斥并纳入 stopAll；验证期间配置变化、重复验证、停止失败和旧代次结果均不得保存。Token 修改或清除会删除对应验证记录。
+
+Named `startConfig()` 同时要求 publicUrl、verifiedAt/tunnelId 匹配和 fingerprint 匹配，未验证返回 `TOKEN_VERIFICATION_REQUIRED`，不进行自动重试。现有运行实例不停止，但下次启动前需完成一次验证。UI 在验证通过前禁用 Public Hostname，草稿 Token 变化立即恢复未验证状态。
+
+### 13.7 模型 aliases 与 Hub 自定义组删除（2026-11-16 补充）
+
+公网使用的独立 Gateway Key 采用 magpie 原生 aliases：裸模型名在目录中原位显示，请求在路由和权限判断前还原为 `wanneng-lingxi/<真实模型>`。aliases 不扩大权限，不修改 `public-api-gateway`，也不把裸名加入 `Models`。配置时保留已有映射并备份 caller-keys，单次写入完整 aliases，防止覆盖。
+
+Hub 管理视图使用 `RoutingGroups.manageable()` 返回全部自定义组和多成员 auto 组，修复单成员绑定不可见；`shared()` 仍保留给原模型目录聚合。`remove(id)` 按精确 id 重新读取目标，`auto:true` 或不存在均拒绝，只有非 auto 自定义组才调用内核 `groups/delete`。
+
+前端仅对非 auto 组显示删除按钮，按钮不嵌套在组标题按钮内。确认文案明确“删除自定义路由组，不删除 provider、账号或模型”，并提示控制台手建组也可删除。请求代次防止删除前的旧响应覆盖新列表。测试桩 save 使用 upsert、delete 真实过滤 state.groups，覆盖自动组零调用、单成员可见、重复/缺失 id 和 provider 不变。
+
+### 13.8 通用 aliases 自动同步与灵犀硬冷却（2026-11-16 补充）
+
+`magpie-alias-sync.js` 以 magpie 原生 providers/groups/caller-keys 为唯一边界，覆盖四家自建、本地 custom 和社区/内置插件 provider，不逐插件编写适配器，也不改 `public-api-gateway` 的透明转发与鉴权范围。外网页的默认折叠卡片只选择“aliases 同步目标 Key”，不默认第一把、不自动创建 Key；provider 首次必须逐个明确授权，之后自动跟随启用模型。前端只能提交 `select-key/provider-set/sync`，不能提交 Models、Aliases、target、members 或通配符。
+
+`alias-sync.json` 只保存目标 Key ID、授权 provider、上次实际托管项、模型缓存、pendingWrite、suppression 和冲突，不保存任何 secret。状态文件损坏时禁止写入；caller-keys 只读安全字段，写操作使用原生 `models-key/aliases-key/off-key/on-key`，不直接修改 `caller-keys.json`。Models 与 Aliases 分步写入并回读，实际进度只合并到磁盘最新状态，singleflight + revision 保证写入途中撤销不会复活旧授权；select-key/provider-set 另有独立 mutation queue，等待 provider 快照后重新读取状态再修改。pendingWrite 只在回读值与待写值一致时补记托管进度，缺失项允许重试。外部删除以带 provider 归属的 suppression 持久化，后续 reconciliation 不得加回，只有重新明确授权该 provider 才解除。模型刷新后重新读取目标 Key，每次全量写前再比较 Models/Aliases 快照，发现外部漂移就放弃本轮，不能把旧计划覆盖到用户新配置上。
+
+已授权 provider 在启动、授权/手工同步、相关事件和 10 分钟周期调用原生 `provider/models`，利用 `Refetch/dropGonePicks` 持久化模型下架；60 秒 reconciliation 只核对本地状态。刷新失败使用缓存并报告，空目录未知与明确 `noModels`/全 off 严格区分。这修复了“灵犀真实 11 模型，但 magpie/公网长期保留旧 27 模型和 7 个 GPT”的旧快照问题，不能在代理层按模型名硬过滤。
+
+唯一裸名指向 direct ref；同名裸名只可使用唯一、静态、无动态成员、keys 允许当前 Key 且成员集合与已授权同名模型精确相等的现有路由组。auto 组使用原始公开 ref，自定义组使用 `group/<id>`。任何冲突都不得回退第一家，同步器不写 `groups/save`。首次授权可接管该 provider 的 direct aliases、精确模型和 `provider/*`；无关手工项与 Accounts 保留，外部修改不反复覆盖。Aliases 最多 200、Models 最多 500，超限零写入。
+
+Models 空数组可能表示“不限制”，因此不能用来撤销。仍有手工 Models 时只移除托管项；没有手工 Models、手工 aliases 和 Accounts 限制且曾存在托管项时，最后撤销才通过 `off-key` 禁用目标 Key，旧 Models/Aliases 保留以便后续收敛。存在手工 aliases 或 Accounts 而 Models 将变空时记录冲突并要求人工处理，不写空 Models，也不禁用 Key。只有 `disabledBySync` 的 Key 才能在恢复非空计划后自动 `on-key`。初始配置即冲突且没有托管项时只报错，不直接禁用 Key。
+
+四家普通 API Key 自动从本机 env/config 同步：已有 provider 使用 `provider key` 且值一致时零写入，缺失只能由安装或手动注册 `provider add`，读取损坏不得误判缺失。CodeArts `admin_key` 永不作为普通 Key。社区/本地插件凭证不读取、不复制。
+
+灵犀 `Pool.Revive` 补齐清理 `degradeUntil/consecutiveFails`，并经既有 dirty/Flush 持久化。连败降权为严格硬冷却：未到期不参与 weighted-random 全冷却兜底，旧在途 `NoteSuccess` 只清计数、不提前解除截止；到期惰性恢复，人工 Revive 可立即恢复。阈值、错误归因和权重不在本轮改动。壳适配层展示降权状态并提供显式解冻；恢复选号必须显式发送 `paused:false`。源码修复不自动替换或重启当前灵犀服务，需另行授权部署。
+
+验证使用 `test-magpie-alias-sync.js` 的临时目录与原生 API 桩，覆盖旧 27→真实 11、首次接管、手工项保留、组冲突、外部修改、上限、最后撤销、部分完成和写入途中撤销；`test-platform-install.js` 固定使用不存在的 magpie 路径，禁止测试误写真实 provider。灵犀 pool/全量 Go 测试覆盖并发硬冷却、旧成功不解封和 Revive 持久化。真实公网修复与灵犀部署必须另行确认。

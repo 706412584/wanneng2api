@@ -215,8 +215,8 @@ export default function GatewayManager({ platform, onClose, onChanged }) {
     }
   }
 
-  const accountExtras = async (account, action, label) => {
-    await act(label, action, { id: account.id })
+  const accountExtras = async (account, action, label, extra = {}) => {
+    await act(label, action, { id: account.id, ...extra })
   }
 
   /** 账号是否今日已签（各家字段名不同，统一收敛） */
@@ -347,8 +347,8 @@ function AccountsSection({ data, accounts, query, setQuery, busy, isBusy, onTogg
                 <span className="sub mono">{a.masked || a.user || a.id}</span>
                 <span className="sub">{accountDetail(a)}</span>
               </div>
-              <span className={`badge ${a.enabled ? 'green' : 'gray'}`}>
-                {a.enabled ? (a.cooling ? '冷却中' : '启用中') : '已停用'}
+              <span className={`badge ${!a.enabled ? 'gray' : (a.degraded || a.cooling) ? 'orange' : 'green'}`}>
+                {!a.enabled ? '已停用' : a.degraded ? '连败降权' : a.cooling ? '冷却中' : '启用中'}
               </span>
               {a.expired && <span className="badge red">已过期</span>}
               {a.paused && <span className="badge orange">暂停选号</span>}
@@ -387,10 +387,14 @@ function AccountsSection({ data, accounts, query, setQuery, busy, isBusy, onTogg
                 )}
                 {data.id === 'lingxi' && (
                   <>
+                    {a.degraded && <button className="btn sm" disabled={!!busy}
+                      onClick={() => onExtras(a, 'account-toggle', '解冻账号', { enabled: true })}>解冻</button>}
                     <button className="btn sm ghost" disabled={!!busy}
                       onClick={() => onExtras(a, 'balance-refresh', '刷新额度')}>刷新额度</button>
                     <button className="btn sm ghost" disabled={!!busy}
-                      onClick={() => onExtras(a, 'account-pause', '暂停选号')}>{a.paused ? '恢复选号' : '暂停选号'}</button>
+                      onClick={() => onExtras(a, 'account-pause', a.paused ? '恢复选号' : '暂停选号', { paused: !a.paused })}>
+                      {a.paused ? '恢复选号' : '暂停选号'}
+                    </button>
                   </>
                 )}
                 <button className="btn sm ghost" disabled={!!busy} onClick={() => onRemove(a)}>移除</button>
@@ -414,6 +418,8 @@ function accountDetail(a) {
   if (a.requests != null && a.requests > 0) parts.push(`请求 ${fmtNum(a.requests)}`)
   if (a.errCount > 0) parts.push(`错误 ${a.errCount}`)
   if (a.cooldownLeft > 0) parts.push(`冷却剩余 ${fmtSec(a.cooldownLeft)}`)
+  if (a.degraded) parts.push(`连败降权剩余 ${fmtSec(a.degradeRemaining)}`)
+  else if (a.consecutiveFails > 0) parts.push(`连续失败 ${a.consecutiveFails} 次`)
   if (a.sessionDaysLeft != null) parts.push(`会话剩 ${a.sessionDaysLeft} 天`)
   if (a.tokenRemaining) parts.push(`token ${a.tokenRemaining}`)
   if (a.expiresAt) parts.push(`到期 ${String(a.expiresAt).slice(0, 10)}`)

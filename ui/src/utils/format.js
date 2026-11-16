@@ -47,3 +47,15 @@ export function fmtAgo(ts) {
   if (diff < 86400) return `${Math.floor(diff / 3600)}小时前`
   return `${Math.floor(diff / 86400)}天前`
 }
+
+export function fmtBytes(n) {
+  if (!n) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = n
+  let index = 0
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024
+    index++
+  }
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[index]}`
+}

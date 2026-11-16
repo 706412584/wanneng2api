@@ -844,7 +844,11 @@ class GatewayPanel {
 
   async _lxOverview(platform) {
     const r = await this._json(platform, '/panel/api/overview', { headers: this._authHeaders(platform) });
-    const accounts = arr(r.accounts).filter((a) => a && typeof a.uid === 'string').map((a) => ({
+    const accounts = arr(r.accounts).filter((a) => a && typeof a.uid === 'string').map((a) => {
+      const degradeUntil = iso(a.degrade_until);
+      const degradeAt = Date.parse(degradeUntil);
+      const degraded = Number.isFinite(degradeAt) && degradeAt > Date.now();
+      return {
       id: a.uid,
       name: text(a.nickname) || text(a.uid).slice(0, 8),
       realm: text(a.realm),
@@ -859,6 +863,10 @@ class GatewayPanel {
       disabledReason: redact(a.disabled_reason || ''),
       enabled: !bool(a.disabled),
       paused: bool(a.paused),
+      degraded,
+      degradeUntil: degraded ? degradeUntil : '',
+      degradeRemaining: degraded ? Math.max(0, Math.ceil((degradeAt - Date.now()) / 1000)) : 0,
+      consecutiveFails: num(a.consecutive_fails) ?? 0,
       expiryBuckets: arr(a.credits_expiry_buckets).map((b) => ({
         date: text(b.date), expiresAt: text(b.expires_at), remain: num(b.remain),
       })),
@@ -871,7 +879,8 @@ class GatewayPanel {
         prompt: num(a.token_usage.prompt), completion: num(a.token_usage.completion),
         total: num(a.token_usage.total),
       } : null,
-    }));
+      };
+    });
     return {
       accounts,
       total: num(r.total) ?? accounts.length,

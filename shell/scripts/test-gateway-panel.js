@@ -143,6 +143,7 @@ async function main() {
       accounts: [{
         uid: 'x1', nickname: '灵犀一', realm: 'cn', enterprise: false, credits: 100, credits_total: 200,
         cooling: false, disabled: false, paused: true, success_count: 5, err_total: 1,
+        degrade_until: new Date(Date.now() + 60000).toISOString(), consecutive_fails: 4,
         checkin_done: true, last_success: '2026-11-11T10:00:00Z',
         credits_expiry_buckets: [{ date: '2026-12-01', expires_at: '2026-12-01T00:00:00Z', remain: 50 }],
         token_usage: { prompt: 1, completion: 2, total: 3 },
@@ -245,6 +246,9 @@ async function main() {
     const x = await panel.detail('lingxi');
     assert.equal(x.accounts.accounts.length, 1);
     assert.equal(x.accounts.accounts[0].paused, true);
+    assert.equal(x.accounts.accounts[0].degraded, true);
+    assert.equal(x.accounts.accounts[0].consecutiveFails, 4);
+    assert.ok(x.accounts.accounts[0].degradeRemaining > 0);
     assert.equal(x.accounts.accounts[0].checkinDone, true);
     assert.equal(x.usage.totals.totalTokens, 3);
     assert.ok(lx.calls.every((c2) => c2.auth === 'Bearer lx-secret'));
@@ -343,8 +347,12 @@ async function main() {
     // ── Lingxi 动作（uid 走 path，必须编码） ──
     await panel.action('lingxi', 'account-toggle', { id: 'x1', enabled: false });
     assert.equal(lx.calls.filter((c2) => c2.path === '/panel/api/accounts/x1/disable').length, 1);
+    await panel.action('lingxi', 'account-toggle', { id: 'x1', enabled: true });
+    assert.equal(lx.calls.filter((c2) => c2.path === '/panel/api/accounts/x1/revive').length, 1);
     await panel.action('lingxi', 'account-pause', { id: 'x1', paused: true });
     assert.equal(lx.calls.filter((c2) => c2.path === '/panel/api/accounts/x1/pause').length, 1);
+    await panel.action('lingxi', 'account-pause', { id: 'x1', paused: false });
+    assert.equal(lx.calls.filter((c2) => c2.path === '/panel/api/accounts/x1/resume').length, 1);
     const lxCk = await panel.action('lingxi', 'checkin', { id: 'x1' });
     assert.equal(lxCk.done, true);
     // 一键签到：走内核自带的全量签到端点（异步触发）
@@ -398,6 +406,7 @@ async function main() {
     const api = new ApiServer({
       store: { getPlatform: (id) => platforms[id] },
       gatewayPanel: panel,
+      aliasSync: { request: () => ({ ok: true }), close: async () => {}, start: () => {} },
     });
     await api.listen('127.0.0.1:0');
     const port = api.server.address().port;

@@ -86,11 +86,19 @@ async function main() {
     if (u.pathname === '/api/groups/save') {
       calls.push({ path: 'groups-save', body });
       if (failSave) { res.writeHead(500); return res.end('nope'); }
-      state.groups = (state.groups || []).map((g) => g.id === body.id ? { ...g, auto: false, members: body.members } : g);
-      if (!body.id) state.groups.push({ id: 'bound-1', name: body.name, auto: false, routing: body.routing, members: body.members, memberInfo: [] });
+      const existing = (state.groups || []).findIndex((g) => g.id === body.id);
+      if (existing >= 0) {
+        state.groups[existing] = { ...state.groups[existing], ...body, auto: false };
+      } else {
+        state.groups.push({ ...body, auto: false, memberInfo: [] });
+      }
       return send({ groups: state.groups });
     }
-    if (u.pathname === '/api/groups/delete') { calls.push({ path: 'groups-delete', body }); return send({ groups: state.groups || [] }); }
+    if (u.pathname === '/api/groups/delete') {
+      calls.push({ path: 'groups-delete', body });
+      state.groups = (state.groups || []).filter((group) => group.id !== body.id);
+      return send({ groups: state.groups });
+    }
     if (u.pathname === '/api/usage/quotas') return send([
       { provider: 'test', name: '测试插件', user: 'alice', checkins: true, plan: 'Free',
         checkinBy: 'plugin:test', checkinKey: 'test|alice',
@@ -306,13 +314,43 @@ async function main() {
     assert.deepEqual(upd.weights, { 'p1/chat': 3 });
     assert.deepEqual(upd.rules, [{ when: 'night' }]);
 
+    // Hub 删除：auto 拒绝、单成员自定义可见且真实删除，重复/缺失 id 报错
+    const manageable = await routing.manageable();
+    assert.ok(manageable.some((group) => group.id === zhBody.id && group.members.length === 1),
+      '单成员自定义绑定必须出现在管理列表');
+    const providersBeforeDelete = JSON.stringify(state.providers);
+    const deleteCallsBefore = calls.filter((x) => x.path === 'groups-delete').length;
+    state.groups.push({ id: 'auto-delete', name: '自动组', auto: true, routing: '', members: ['p1/chat', 'p2/chat'] });
+    await assert.rejects(routing.remove('auto-delete'), /自动合并/);
+    assert.equal(calls.filter((x) => x.path === 'groups-delete').length, deleteCallsBefore,
+      'auto 组不得调用 groups/delete');
+    await assert.rejects(routing.remove('missing-group'), /不存在/);
+    const remaining = await routing.remove(zhBody.id);
+    assert.ok(!remaining.some((group) => group.id === zhBody.id), '自定义组删除后必须消失');
+    assert.deepEqual(calls.filter((x) => x.path === 'groups-delete').at(-1).body, { id: zhBody.id });
+    assert.equal(JSON.stringify(state.providers), providersBeforeDelete, '删除组不得修改 providers');
+    await assert.rejects(routing.remove(zhBody.id), /不存在/, '重复删除必须报不存在');
+
     const apiPanel = new PluginPanel({ getConfig: () => config });
-    api = new ApiServer({ store: { getPlatform: () => config }, pluginPanel: apiPanel });
+    api = new ApiServer({
+      store: { getPlatform: () => config }, pluginPanel: apiPanel,
+      aliasSync: { request: () => ({ ok: true }), close: async () => {}, start: () => {} },
+    });
     await api.listen('127.0.0.1:0');
     const url = `http://127.0.0.1:${api.server.address().port}/api/magpie/plugin-panel`;
     const res = await fetch(url + '?' + new URLSearchParams({ package: pkg, provider: 'test' }));
     assert.equal(res.status, 200);
     assert.equal((await res.json()).provider, 'test');
+    const boundForApi = await routing.bind({ name: 'api-delete', providers: ['p1'] });
+    const groupsUrl = `http://127.0.0.1:${api.server.address().port}/api/magpie/routing-groups`;
+    const beforeApiDelete = await (await fetch(groupsUrl)).json();
+    assert.ok(beforeApiDelete.groups.some((group) => group.id === boundForApi.id), 'API 列表必须包含单成员绑定');
+    const apiDelete = await fetch(groupsUrl, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'delete', id: boundForApi.id }),
+    });
+    assert.equal(apiDelete.status, 200);
+    assert.ok(!(await apiDelete.json()).groups.some((group) => group.id === boundForApi.id), 'API 删除后组必须消失');
     const wrong = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ package: pkg, provider: 'other', action: 'account-remove', user: 'bob' }) });
     assert.equal(wrong.status, 400);

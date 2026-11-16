@@ -50,6 +50,8 @@ function defaultManagerConfig() {
         platformUpdate: false,      // 平台更新（GitHub 检查 + 资产下载）
         pluginRegistry: false,      // magpie 插件市场目录
         magpieKernel: false,        // magpie 内核检测与下载
+        tunnelDownload: false,      // cloudflared 二进制下载
+        tunnelRuntime: false,       // cloudflared 出网与公网健康检查
         magpieSubscription: false,  // 写入 magpie proxy：订阅流量
         magpiePlugin: false,        // 写入 magpie pluginProxy：插件流量
       },

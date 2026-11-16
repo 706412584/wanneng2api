@@ -118,11 +118,44 @@ class ApiServer {
       getConfig: () => deps.store.getPlatform('magpie-web'),
       // 模型倍率只能从四家网关的原生接口读到（magpie 侧只有名字里的括号）
       getPanel: () => this.gatewayPanel,
+      onModelsRefreshed: () => this.aliasSync && this.aliasSync.request('models-refreshed'),
     });
     // 自研网关原生管理：凭据由适配器自己从各网关工作目录读取，API 层不接触密钥
     this.gatewayPanel = deps.gatewayPanel || new (require('./gateway-panel').GatewayPanel)({
       getPlatform: (id) => deps.store.getPlatform(id),
     });
+    this.tunnelManager = deps.tunnelManager || null;
+    this.aliasSync = deps.aliasSync || new (require('./magpie-alias-sync').MagpieAliasSync)({
+      dataDir: deps.store.dataDir,
+      store: deps.store,
+      updater: deps.updater || null,
+      panel: this.pluginPanel,
+      routingGroups: this.routingGroups,
+    });
+    this.aliasStatusListener = null;
+  }
+
+  startAliasSync() {
+    if (this.aliasStatusListener || !this.aliasSync) return;
+    const manager = this.deps.manager;
+    if (manager && typeof manager.on === 'function') {
+      this.aliasStatusListener = (id, status) => {
+        if (!['workbuddy', 'codearts', 'loomy', 'lingxi', 'magpie-web'].includes(id)) return;
+        this.aliasSync.request(`platform-${status}`, { refresh: status === 'healthy' && id !== 'magpie-web' });
+      };
+      manager.on('status', this.aliasStatusListener);
+    }
+    this.aliasSync.start();
+  }
+
+  _tunnels() {
+    if (!this.tunnelManager) {
+      const error = new Error('外网访问模块尚未初始化');
+      error.code = 'TUNNEL_UNAVAILABLE';
+      error.statusCode = 503;
+      throw error;
+    }
+    return this.tunnelManager;
   }
 
   listen(listenAddr = '127.0.0.1:17800') {
@@ -187,9 +220,13 @@ class ApiServer {
     });
   }
 
-  close() {
-    if (this.server) return new Promise((r) => this.server.close(r));
-    return Promise.resolve();
+  async close() {
+    if (this.aliasStatusListener && this.deps.manager && typeof this.deps.manager.removeListener === 'function') {
+      this.deps.manager.removeListener('status', this.aliasStatusListener);
+      this.aliasStatusListener = null;
+    }
+    if (this.aliasSync) await this.aliasSync.close();
+    if (this.server) await new Promise((r) => this.server.close(r));
   }
 
   async _handler(req, res) {
@@ -230,8 +267,8 @@ class ApiServer {
       }
       return json(res, r.__code || 200, r, origin);
     } catch (e) {
-      const code = /未知平台|未配置|不存在|未找到/.test(e.message) ? 404 : 400;
-      return json(res, code, { error: e.message }, origin);
+      const code = Number(e.statusCode) || (/未知平台|未配置|不存在|未找到/.test(e.message) ? 404 : 400);
+      return json(res, code, { error: e.message, ...(e.code ? { code: e.code } : {}) }, origin);
     }
   }
 
@@ -277,12 +314,69 @@ class ApiServer {
       return { platforms: manager.statusList() };
     }
 
+    // 统一外网访问：所有隧道进程与秘密仍只由本机 Manager 管理。
+    if (parts[1] === 'tunnels') {
+      const tunnels = this._tunnels();
+      if (method === 'GET' && parts.length === 2) return tunnels.snapshot();
+      if (parts[2] === 'binary' && parts[3] === 'status' && method === 'GET') return tunnels.binaryStatus();
+      if (parts[2] === 'binary' && parts[3] === 'install' && method === 'POST') {
+        void tunnels.installBinary().catch(() => {});
+        return { started: true, status: tunnels.binaryStatus(), __code: 202 };
+      }
+      if (parts[2] === 'manager' && parts[3] === 'password' && method === 'PUT') {
+        return tunnels.setManagerPassword(body.currentPassword, body.newPassword);
+      }
+      const id = parts[2] ? decodeURIComponent(parts[2]) : '';
+      if (parts[3] === 'config' && method === 'PUT') return tunnels.updateConfig(id, body);
+      if (parts[3] === 'verify-token' && method === 'POST') return tunnels.verifyToken(id, body.token || '');
+      if (parts[3] === 'preflight' && method === 'POST') return tunnels.preflight(id);
+      if (parts[3] === 'start' && method === 'POST') return { ...tunnels.start(id), started: true, __code: 202 };
+      if (parts[3] === 'stop' && method === 'POST') return tunnels.stop(id);
+      if (parts[3] === 'logs' && method === 'GET') return tunnels.logs(id, u.searchParams.get('tail'));
+    }
+
+    // Magpie 公网模型 aliases：前端只能选择 Key/provider，不能直传权限或路由目标。
+    if (parts[1] === 'magpie' && parts[2] === 'alias-sync' && parts.length === 3) {
+      if (method === 'GET') return this.aliasSync.status();
+      if (method === 'POST') {
+        const action = body && body.action;
+        const allowed = {
+          'select-key': ['action', 'keyId'],
+          'provider-set': ['action', 'providerId', 'authorized'],
+          sync: ['action'],
+        }[action];
+        if (!allowed) throw new Error('不支持的 aliases 同步操作');
+        if (Object.keys(body || {}).some((key) => !allowed.includes(key))) {
+          const error = new Error('请求包含不允许的权限字段');
+          error.statusCode = 400;
+          throw error;
+        }
+        if (action === 'select-key') {
+          const result = await this.aliasSync.selectKey(body.keyId);
+          return { ...result, __code: 202 };
+        }
+        if (action === 'provider-set') {
+          const result = await this.aliasSync.setProvider(body.providerId, body.authorized);
+          return { ...result, __code: 202 };
+        }
+        const result = this.aliasSync.request('manual', { refresh: true });
+        return { ...result, __code: 202 };
+      }
+    }
+
     // 原生插件面板：动作由适配器限定，不允许调用方指定内核 URL。
     if (parts[1] === 'magpie' && parts[2] === 'plugin-panel' && parts.length === 3) {
       const pkg = method === 'GET' ? u.searchParams.get('package') : body.package;
       const provider = method === 'GET' ? u.searchParams.get('provider') : body.provider;
       if (method === 'GET') return this.pluginPanel.detail(pkg, provider);
-      if (method === 'POST') return this.pluginPanel.action(pkg, provider, body.action, body);
+      if (method === 'POST') {
+        const result = await this.pluginPanel.action(pkg, provider, body.action, body);
+        const immediate = ['models-save', 'models-refresh', 'provider-toggle', 'account-on', 'account-off', 'account-remove'];
+        const signedIn = body.action === 'signin-start'
+          && ['done', 'signed-in', 'complete', 'success'].includes(result && result.state);
+        if (immediate.includes(body.action) || signedIn) this.aliasSync.request(`plugin-${body.action}`, { refresh: true });
+        return result;
+      }
     }
 
     // 自研网关原生管理面板（WorkBuddy / CodeArts / Loomy / Lingxi）。
@@ -311,16 +405,24 @@ class ApiServer {
     // 路由组：同一模型被多个平台提供时的顺序（只重排、不增删成员）
     if (parts[1] === 'magpie' && parts[2] === 'routing-groups') {
       const groups = this.routingGroups;
-      if (method === 'GET') return { groups: await groups.shared(), bindable: await groups.bindable() };
+      if (method === 'GET') return { groups: await groups.manageable(), bindable: await groups.bindable() };
       if (method === 'POST') {
         // action=bind 新建/更新一个只含所选平台的顺序组；否则按 id 重排
         if (body.action === 'bind') {
           const saved = await groups.bind({ id: body.id, name: body.name, providers: body.providers });
-          return { saved, groups: await groups.shared() };
+          this.aliasSync.request('routing-bind');
+          return { saved, groups: await groups.manageable() };
+        }
+        if (body.action === 'delete') {
+          if (typeof body.id !== 'string') throw new Error('缺少路由组标识');
+          const result = { groups: await groups.remove(body.id) };
+          this.aliasSync.request('routing-delete');
+          return result;
         }
         if (typeof body.id !== 'string') throw new Error('缺少路由组标识');
         await groups.reorder(body.id, body.members);
-        return { groups: await groups.shared() };
+        this.aliasSync.request('routing-reorder');
+        return { groups: await groups.manageable() };
       }
     }
 
@@ -354,6 +456,7 @@ class ApiServer {
       const pkg = body && body.package;
       if (!pkg) throw new Error('缺少 package');
       const r = await magpie.addPlugin(bin, pkg);
+      if (r.ok) this.aliasSync.request('plugin-add', { refresh: true });
       return { ok: r.ok, package: pkg, stdout: r.stdout, stderr: r.stderr, __code: r.ok ? 200 : 400 };
     }
 
@@ -364,6 +467,7 @@ class ApiServer {
       const target = body && (body.spec || body.package || body.name);
       if (!target) throw new Error('缺少插件标识');
       const r = await magpie.removePlugin(bin, target);
+      if (r.ok) this.aliasSync.request('plugin-remove', { refresh: true });
       return { ok: r.ok, removed: target, stdout: r.stdout, stderr: r.stderr, __code: r.ok ? 200 : 400 };
     }
 
@@ -402,6 +506,7 @@ class ApiServer {
       const provider = body && body.provider;
       if (!provider) throw new Error('缺少 provider');
       const r = await magpie.logoutProvider(this._magpieBinary(), provider);
+      if (r.ok) this.aliasSync.request('plugin-logout', { refresh: true });
       return { ok: r.ok, provider, stdout: r.stdout, stderr: r.stderr, __code: r.ok ? 200 : 400 };
     }
 
@@ -492,6 +597,7 @@ class ApiServer {
         key: typeof key === 'string' ? key.trim() : '',
         args: Array.isArray(args) ? args : [],
       });
+      if (r.ok) this.aliasSync.request('provider-add', { refresh: true });
       return { ok: r.ok, id, stdout: r.stdout, stderr: r.stderr, __code: r.ok ? 200 : 400 };
     }
 
@@ -502,6 +608,7 @@ class ApiServer {
       const id = body && body.id;
       if (!id) throw new Error('缺少 provider id');
       const r = await magpie.removeProvider(bin, id);
+      if (r.ok) this.aliasSync.request('provider-remove', { refresh: true });
       return { ok: r.ok, id, stdout: r.stdout, stderr: r.stderr, __code: r.ok ? 200 : 400 };
     }
 
@@ -552,7 +659,11 @@ class ApiServer {
 
       if (method === 'POST') {
         if (action === 'install') return updater.install(id);
-        if (action === 'register-provider') return updater.registerProvider(id);
+        if (action === 'register-provider') {
+          const result = await updater.registerProvider(id);
+          if (result.ok) this.aliasSync.request('register-provider', { refresh: true });
+          return result;
+        }
         if (action === 'start') return manager.start(id, { force: !!(body && body.force) });
         if (action === 'stop') return manager.stop(id);
         if (action === 'restart') return manager.restart(id, { force: !!(body && body.force) });

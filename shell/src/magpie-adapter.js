@@ -89,6 +89,18 @@ function readJson(file, fallback) {
 }
 
 /**
+ * 严格读取一个四家自建 custom provider。与展示用的 readJson 不同：
+ * 文件损坏或结构不兼容必须抛错，不能把“读取失败”误判为“provider 不存在”后重复 add。
+ */
+function getCustomProvider(id, dir = magpieConfigDir()) {
+  const file = path.join(dir, 'providers.json');
+  if (!fs.existsSync(file)) return null;
+  const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (!data || !Array.isArray(data.providers)) throw new Error('magpie providers.json 结构不兼容');
+  return data.providers.find((p) => p && p.id === id) || null;
+}
+
+/**
  * 我们的网关 id 清单。这些在 magpie 里是 custom provider，
  * 但语义上属于"我们自己接入的"，UI 标记为「插件」。
  */
@@ -588,6 +600,25 @@ function addProvider(binaryPath, { id, key, args = [] }, { timeoutMs = 180000 } 
   });
 }
 
+function updateProviderKey(binaryPath, { id, key }, { timeoutMs = 60000 } = {}) {
+  return new Promise((resolve) => {
+    if (!binaryPath) return resolve({ ok: false, stdout: '', stderr: '未找到 magpie 可执行文件' });
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(String(id || ''))) {
+      return resolve({ ok: false, stdout: '', stderr: `非法 provider id: ${id}` });
+    }
+    if (typeof key !== 'string' || !key.trim() || key.length > 16384) {
+      return resolve({ ok: false, stdout: '', stderr: '网关 API 密钥无效' });
+    }
+    execFile(binaryPath, ['provider', 'key', id, key], { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
+      resolve({
+        ok: !err,
+        stdout: String(stdout || '').trim(),
+        stderr: String(stderr || '').trim() || (err && err.message) || '',
+      });
+    });
+  });
+}
+
 function removeProvider(binaryPath, id, { timeoutMs = 60000 } = {}) {
   return new Promise((resolve) => {
     if (!binaryPath || !/^[a-z0-9][a-z0-9-]*$/.test(String(id || ''))) {
@@ -1001,14 +1032,22 @@ class RoutingGroups {
    * @param {Function} [opts.getPanel]      () => GatewayPanel 实例（读四家原生倍率）
    * @param {number}   [opts.timeoutMs]
    */
-  constructor({ getConfig, getPanel, timeoutMs = 15000 }) {
+  constructor({ getConfig, getPanel, timeoutMs = 15000, onModelsRefreshed }) {
     this.panel = new PluginPanel({ getConfig, timeoutMs });
     this.getPanel = getPanel || null;
+    this.onModelsRefreshed = onModelsRefreshed || null;
+  }
+
+  /** 后台同步使用的原始组快照：不刷新模型、不裁剪 keys/动态成员等安全字段。 */
+  async raw() {
+    const data = await this.panel._api('groups');
+    const groups = Array.isArray(data) ? data : Array.isArray(data?.groups) ? data.groups : null;
+    if (!groups) throw new Error('magpie 路由组响应结构不兼容');
+    return groups;
   }
 
   async list() {
-    const data = await this.panel._api('groups');
-    const groups = Array.isArray(data) ? data : Array.isArray(data?.groups) ? data.groups : [];
+    const groups = await this.raw();
     return groups.filter((g) => g && typeof g.id === 'string').map((g) => ({
       id: g.id,
       name: typeof g.name === 'string' ? g.name : g.id,
@@ -1032,6 +1071,13 @@ class RoutingGroups {
       || a.name.localeCompare(b.name));
   }
 
+  /** Hub 管理视图：全部自定义组 + 多成员 auto 组，单成员绑定也不能消失。 */
+  async manageable() {
+    const groups = await this.list();
+    return groups.filter((g) => !g.auto || g.members.length > 1)
+      .sort((a, b) => b.members.length - a.members.length || a.name.localeCompare(b.name));
+  }
+
   /**
    * 列出可绑定的平台：每个 provider 的 id/名称/是否启用/模型数。
    * 只给「已安装的 provider」，不做成通用 provider 编辑器。
@@ -1049,8 +1095,9 @@ class RoutingGroups {
       && !p.off && p.ready && !(Array.isArray(p.models) && p.models.length));
     if (needsFetch.length) {
       // 并发拉取：这些是本机网关，一次往返很快；串行会让打开面板明显变卡
-      await Promise.all(needsFetch.map((p) =>
-        this.panel._api('provider/models', { id: p.id }).catch(() => null)));
+      const refreshed = await Promise.all(needsFetch.map((p) =>
+        this.panel._api('provider/models', { id: p.id }).then(() => true).catch(() => false)));
+      if (refreshed.some(Boolean) && this.onModelsRefreshed) this.onModelsRefreshed();
       data = await this.panel._api('providers');
       rows = Array.isArray(data?.providers) ? data.providers : [];
     }
@@ -1295,6 +1342,17 @@ class RoutingGroups {
     return { name: body.name, members, id: saved?.id || body.id || '' };
   }
 
+  async remove(id) {
+    if (typeof id !== 'string' || !id.trim()) throw new Error('路由组标识无效');
+    const data = await this.panel._api('groups');
+    const groups = Array.isArray(data) ? data : Array.isArray(data?.groups) ? data.groups : [];
+    const target = groups.find((group) => group && group.id === id);
+    if (!target) throw new Error('路由组不存在');
+    if (target.auto) throw new Error('自动合并的分组不能删除');
+    await this.panel._api('groups/delete', { id });
+    return this.manageable();
+  }
+
   async reorder(id, members) {
     if (typeof id !== 'string' || !id) throw new Error('路由组标识无效');
     const data = await this.panel._api('groups');
@@ -1441,6 +1499,28 @@ class PluginPanel {
       throw new Error(reason ? `内核拒绝该操作：${reason}` : '内核拒绝该操作，请检查登录状态或配置');
     }
     return data;
+  }
+
+  /** Gateway Key 的原生写边界；调用方负责规划，前端永远不能直传 Models/Aliases。 */
+  async callerKey(action, keyId, change = {}) {
+    if (!['models-key', 'aliases-key', 'off-key', 'on-key'].includes(action)) throw new Error('不支持的 Gateway Key 操作');
+    if (!/^[a-z0-9]{8,64}$/i.test(String(keyId || ''))) throw new Error('Gateway Key 标识无效');
+    const body = { key: keyId };
+    if (action === 'models-key') {
+      if (!Array.isArray(change.models) || change.models.length > 500
+        || !change.models.every((m) => typeof m === 'string' && m.length > 0 && m.length <= 300)) {
+        throw new Error('Gateway Key 模型权限无效');
+      }
+      body.models = change.models;
+    } else if (action === 'aliases-key') {
+      const entries = change.aliases && typeof change.aliases === 'object' && !Array.isArray(change.aliases)
+        ? Object.entries(change.aliases) : null;
+      if (!entries || entries.length > 200 || !entries.every(([name, target]) => name && typeof target === 'string' && target)) {
+        throw new Error('Gateway Key aliases 无效');
+      }
+      body.aliases = change.aliases;
+    }
+    return this._api(`caller-keys/${action}`, body);
   }
 
   /** 从内核的错误响应体里取出可读原因（{error} 或 {message}，否则原样文本） */
@@ -1769,6 +1849,7 @@ module.exports = {
   PluginPanel,
   RoutingGroups,
   magpieConfigDir,
+  getCustomProvider,
   listProviders,
   listGroups,
   checkViaCli,
@@ -1785,6 +1866,7 @@ module.exports = {
   listPresets,
   parsePresets,
   addProvider,
+  updateProviderKey,
   removeProvider,
   detectVersion,
   latestRelease,

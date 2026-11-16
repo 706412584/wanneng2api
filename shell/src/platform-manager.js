@@ -1263,6 +1263,7 @@ module.exports = {
   PlatformManager,
   STATES,
   checkPortFree,
+  taskkillTree,
   findListeningPid,
   simpleGlobMatch,
   findMagpieBinary,

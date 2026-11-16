@@ -25,6 +25,7 @@ let manager = null;
 let updater = null;
 let selfUpdater = null;
 let api = null;
+let tunnelManager = null;
 let mainWindow = null;
 let splashWindow = null;
 let tray = null;
@@ -352,6 +353,7 @@ function setupSelfUpdater() {
       reason: '壳自更新在当前平台不可用（仅 Windows 安装包与 Linux AppImage 支持）',
       beforeInstall: async () => {
         // quitAndInstall 会跳过 Electron 的 before-quit 生命周期，先按正常退出收尾。
+        if (tunnelManager) await tunnelManager.stopAll();
         if (manager) await manager.stopAll();
         if (api) await api.close();
       },
@@ -404,7 +406,7 @@ function applyProxyToUpdater() {
 // ── 启动流程 ──
 app.whenReady().then(async () => {
   // 1. 读配置（数据目录 %AppData%/wanneng2api）
-  const dataDir = path.join(app.getPath('appData'), 'wanneng2api');
+  const dataDir = process.env.WANNENG_DATA_DIR || path.join(app.getPath('appData'), 'wanneng2api');
   store = new ConfigStore(dataDir);
   proxy.init(store);
   proxy.setLogger((m) => shellLog('info', m));
@@ -418,11 +420,26 @@ app.whenReady().then(async () => {
     error: (m) => shellLog('error', m),
   };
 
-  // 2. PlatformManager + Updater + Manager API
+  // 2. PlatformManager + Updater + TunnelManager + Manager API
   manager = new PlatformManager({ store, dataDir, shellRoot: path.resolve(__dirname, '..'), logger });
   updater = new PlatformUpdater({ manager, store, dataDir, logger });
+  const listen = (store.manager.manager && store.manager.manager.listen) || '127.0.0.1:17800';
+  try {
+    tunnelManager = require('./tunnel').createTunnelSystem({
+      configStore: store,
+      dataDir,
+      managerOrigin: `http://${listen}`,
+      staticDir: () => api && api.deps.staticDir,
+      proxy,
+      logger,
+    }).manager;
+  } catch (e) {
+    dialog.showErrorBox('外网访问配置错误', e.message);
+    app.quit();
+    return;
+  }
   api = new ApiServer({
-    manager, updater, store,
+    manager, updater, store, tunnelManager,
     openExternal: (u) => shell.openExternal(u),
     // 设置保存后（代理可能变了）：壳自更新要重新下发代理
     onSettingsSaved: () => applyProxyToUpdater(),
@@ -435,9 +452,9 @@ app.whenReady().then(async () => {
   if (!uiInfo.placeholder && uiInfo.file) {
     api.serveStatic(path.dirname(uiInfo.file));
   }
-  const listen = (store.manager.manager && store.manager.manager.listen) || '127.0.0.1:17800';
   try {
     const addr = await api.listen(listen);
+    api.startAliasSync();
     logger.info(`Manager API listening on ${addr.address}:${addr.port}`);
   } catch (e) {
     dialog.showErrorBox('端口冲突', `Manager API ${listen} 启动失败: ${e.message}`);
@@ -456,6 +473,7 @@ app.whenReady().then(async () => {
   // 若有平台起不来，整个界面会一起卡在 Splash 上。让它在后台跑，
   // Splash 只等"有平台健康"或总超时。
   manager.startAutoStart().catch((e) => logger.error(`自启编排失败: ${e.message}`));
+  try { tunnelManager.startAutoStart(); } catch (e) { logger.error(`外网隧道自启失败: ${e.message}`); }
   await waitForPlatforms(45);
   closeSplash();
   showMainWindow();
@@ -473,6 +491,7 @@ app.whenReady().then(async () => {
 async function gracefulQuit() {
   if (quitting) return;
   quitting = true;
+  try { if (tunnelManager) await tunnelManager.stopAll(); } catch (_e) { /* ignore */ }
   try { if (manager) await manager.stopAll(); } catch (_e) { /* ignore */ }
   try { if (api) await api.close(); } catch (_e) { /* ignore */ }
   destroyTray();
@@ -480,7 +499,9 @@ async function gracefulQuit() {
 }
 
 app.on('before-quit', (e) => {
-  if (!quitting && manager && manager.statusList().some((s) => s.pid)) {
+  if (!quitting && ((manager && manager.statusList().some((s) => s.pid))
+    || (tunnelManager && tunnelManager.hasActiveProcesses())
+    || (api && api.aliasSync && api.aliasSync.inflight))) {
     e.preventDefault();
     gracefulQuit();
   }

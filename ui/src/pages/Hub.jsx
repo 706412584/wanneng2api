@@ -12,7 +12,7 @@ import { useToast } from '../components/Toast'
 import { Empty, ErrorBox, Loading, StateDot, STATE_TEXT } from '../components/Bits'
 import ModelList from '../components/ModelList'
 import RoutingGroups from '../components/RoutingGroups'
-import { fmtNum, fmtTime, fmtAgo } from '../utils/format'
+import { fmtNum, fmtTime, fmtAgo, fmtBytes as formatBytes } from '../utils/format'
 
 const PERIODS = [
   ['today', '今天'],
@@ -314,13 +314,4 @@ function McpList() {
       ))}
     </div>
   )
-}
-
-function formatBytes(n) {
-  if (!n) return '0'
-  const units = ['B', 'KB', 'MB', 'GB']
-  let v = n
-  let i = 0
-  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++ }
-  return `${v < 10 ? v.toFixed(1) : Math.round(v)}${units[i]}`
 }
