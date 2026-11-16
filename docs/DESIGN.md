@@ -628,7 +628,7 @@ Hub 管理视图使用 `RoutingGroups.manageable()` 返回全部自定义组和�
 
 `alias-sync.json` 只保存目标 Key ID、授权 provider、上次实际托管项、模型缓存、pendingWrite、suppression 和冲突，不保存任何 secret。状态文件损坏时禁止写入；caller-keys 只读安全字段，写操作使用原生 `models-key/aliases-key/off-key/on-key`，不直接修改 `caller-keys.json`。Models 与 Aliases 分步写入并回读，实际进度只合并到磁盘最新状态，singleflight + revision 保证写入途中撤销不会复活旧授权；select-key/provider-set 另有独立 mutation queue，等待 provider 快照后重新读取状态再修改。pendingWrite 只在回读值与待写值一致时补记托管进度，缺失项允许重试。外部删除以带 provider 归属的 suppression 持久化，后续 reconciliation 不得加回，只有重新明确授权该 provider 才解除。模型刷新后重新读取目标 Key，每次全量写前再比较 Models/Aliases 快照，发现外部漂移就放弃本轮，不能把旧计划覆盖到用户新配置上。
 
-已授权 provider 在启动、授权/手工同步、相关事件和 10 分钟周期调用原生 `provider/models`，利用 `Refetch/dropGonePicks` 持久化模型下架；60 秒 reconciliation 只核对本地状态。刷新失败使用缓存并报告，空目录未知与明确 `noModels`/全 off 严格区分。这修复了“灵犀真实 11 模型，但 magpie/公网长期保留旧 27 模型和 7 个 GPT”的旧快照问题，不能在代理层按模型名硬过滤。
+四家自建 provider 的模型刷新与本机 Gateway 目录、外网 aliases 授权**完全解耦**：壳启动、平台恢复健康以及 10 分钟周期都会调用原生 `provider/models`，因此本地 `127.0.0.1:17899` 的 Gateway 页面同样能看到上游新增模型（如 `kimi-k3.1-pro`），旧模型（如已下架的 GPT）也会被新快照替换。magpie 的 `Refetch/dropGonePicks` 会持久化替换快照：曾全选的 picks 接住新增模型，用户手工取消的不会被加回。仅刷新模型不写 caller-key；未注册的 provider 跳过，不算刷新失败；控制台不可用时保留缓存。已授权的本地/社区 provider 在同一轮内按缓存周期跟随刷新，60 秒 reconciliation 只核对本地状态。刷新失败使用缓存并报告，空目录未知与明确 `noModels`/全 off 严格区分。这修复了“灵犀真实 11 模型，但 magpie/公网长期保留旧 27 模型和 7 个 GPT”的旧快照问题，不能在代理层按模型名硬过滤。
 
 唯一裸名指向 direct ref；同名裸名只可使用唯一、静态、无动态成员、keys 允许当前 Key 且成员集合与已授权同名模型精确相等的现有路由组。auto 组使用原始公开 ref，自定义组使用 `group/<id>`。任何冲突都不得回退第一家，同步器不写 `groups/save`。首次授权可接管该 provider 的 direct aliases、精确模型和 `provider/*`；无关手工项与 Accounts 保留，外部修改不反复覆盖。Aliases 最多 200、Models 最多 500，超限零写入。
 

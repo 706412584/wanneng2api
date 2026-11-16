@@ -296,6 +296,40 @@ async function testConcurrentMutations() {
   } finally { await f.cleanup(); }
 }
 
+async function testOwnedModelRefreshWithoutAliases() {
+  const stale = ['gpt-6-astra', 'gpt-5.5', 'kimi-k2.7', 'glm-5.2', 'glm-5.3'];
+  const current = ['glm-5.2', 'glm-5.3', 'kimi-k3.1-pro', 'qwen3.8_max'];
+  const f = fixture({
+    providers: [row('wanneng-lingxi', stale), row('wanneng-workbuddy', ['hy3'])],
+    keys: [key([], {})],
+    onRefresh: (id, currentRow) => id === 'wanneng-lingxi' ? row(id, current) : currentRow,
+  });
+  try {
+    // 未选择 Key、未授权任何 provider，启动同步仍必须刷新模型目录。
+    await f.sync.runNow({ refresh: true });
+    const refreshed = f.calls.filter((c) => c.action === 'refresh').map((c) => c.id);
+    assert(refreshed.includes('wanneng-lingxi'), '未授权 aliases 时也必须刷新自建 provider 模型');
+    assert(refreshed.includes('wanneng-workbuddy'));
+    assert(!f.calls.some((c) => ['models-key', 'aliases-key'].includes(c.action)), '仅刷新模型不得写 caller-key');
+    const lingxi = f.providers.find((p) => p.id === 'wanneng-lingxi');
+    assert(!lingxi.models.some((m) => /^gpt-/.test(m.id)), '旧 GPT 模型必须被新快照替换');
+    assert(lingxi.models.some((m) => m.id === 'kimi-k3.1-pro'), '上游新增模型必须进入 magpie 目录');
+    const cache = f.readState().providers['wanneng-lingxi'];
+    assert(cache.models.includes('kimi-k3.1-pro'));
+    assert(!cache.models.includes('gpt-5.5'));
+    assert.strictEqual(f.readKey().models.length, 0, '不得因模型刷新改动 Key 权限');
+  } finally { await f.cleanup(); }
+
+  // provider 未注册：跳过，不产生刷新失败噪声
+  const missing = fixture({ providers: [row('wanneng-lingxi', ['glm-5.2'])], keys: [key([], {})] });
+  try {
+    await missing.sync.runNow({ refresh: true });
+    const ids = missing.calls.filter((c) => c.action === 'refresh').map((c) => c.id);
+    assert(!ids.includes('wanneng-codearts'), '未注册的 provider 不应触发刷新');
+    assert(!missing.readState().conflicts.some((c) => c.code === 'model-refresh'), '未注册不能被当成刷新失败');
+  } finally { await missing.cleanup(); }
+}
+
 async function testSuppressionAcrossRuns() {
   const f = fixture({ providers: [row('local', ['one', 'two'])], keys: [key(['local/*'], {})] });
   try {
@@ -365,6 +399,7 @@ async function main() {
     ['写入途中撤销的代次收敛', testRevisionDuringWrite],
     ['手工权限保护与崩溃日志收敛', testManualPermissionsAndCrashRecovery],
     ['并发授权与撤销串行化', testConcurrentMutations],
+    ['未授权 aliases 也刷新自建模型', testOwnedModelRefreshWithoutAliases],
     ['外部删除跨轮 suppression', testSuppressionAcrossRuns],
     ['caller-key 外部漂移保护', testCallerKeyDrift],
   ];

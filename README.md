@@ -51,7 +51,7 @@ Loomy 需要 Python 3.9+（未捆绑解释器时使用系统 Python）。首次�
 
 - 「外网访问」的 **Magpie 公网模型别名**折叠卡片用于选择 aliases 同步目标 Key，并逐个授权自建、本地及社区 provider。不会默认选择第一把 Key，也不会改变隧道当前接受哪些 caller keys。
 - 唯一裸名映射到 `provider/model`；跨 provider 同名模型只使用成员全部已授权且精确匹配的静态 Hub 路由组。无法安全解析时保留冲突提示，不静默选择第一家，不自动建组或开放 `all`、`auto/*`。
-- 已授权 provider 在启动、相关变更及每 10 分钟刷新模型；magpie 原生 `Refetch/dropGonePicks` 负责持久化下架模型，同步器再收敛 Models/Aliases。刷新失败沿用上次目录，不当作全部删除。每 Key aliases 上限 200、Models 上限 500。
+- 壳启动、平台恢复健康及每 10 分钟都会自动刷新四家自建 provider 的模型目录，**不依赖外网 aliases 是否授权**；因此本机 `127.0.0.1:17899` 的 Gateway 页面也能看到上游新增模型，旧模型不会长期混在目录里。magpie 原生 `Refetch/dropGonePicks` 负责持久化替换快照，用户手工取消的模型不会被加回。刷新失败沿用上次目录，不当作全部删除。每 Key aliases 上限 200、Models 上限 500。
 - 首次授权可接管该 provider 的现有 direct aliases 和 `provider/*`，收敛为明确启用模型；无关手工映射与 Accounts 限制保留。外部修改会报告冲突而不反复覆盖，外部删除会持久抑制，只有重新明确授权该 provider 才恢复。最后撤销绝不写入可能表示“不限制”的空 Models：没有手工 Models、aliases 和 Accounts 时才改为禁用目标 Key，且只自动重新启用同步器自己禁用的 Key。
 - 四家自建 provider 的普通 API Key 自动从各自本机 config/env 同步；已有 provider 只执行 `provider key`，缺失才由安装或手动注册创建。社区/本地插件凭证始终由 magpie 管理，壳不读取或复制。
 - Hub「模型优先级」展示全部自定义路由组和多成员自动组，单成员绑定也可管理。自定义组可删除，删除前显示名称与确认框；自动合并组禁止删除。删除只影响路由入口，不修改 provider、账号或模型。

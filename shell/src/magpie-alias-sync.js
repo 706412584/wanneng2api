@@ -617,10 +617,58 @@ class MagpieAliasSync {
     return results;
   }
 
-  async _collect(state, refresh) {
+  /**
+   * 刷新四家自建 provider 的模型目录，与外网 aliases 授权无关。
+   *
+   * magpie 只在模型为空时才自动拉取；已安装的 provider 一旦有旧快照就会一直保留，
+   * 于是本地 127.0.0.1:17899 的 Gateway 页面看不到上游新增模型（如 kimi-k3.1-pro），
+   * 旧模型（如已下架的 GPT）也继续混在目录里。原生 provider/models 会用 Refetch
+   * 替换快照并把下架项移入 Delisted：曾全选的 picks 会接住新增模型，用户手工取消的
+   * 不会被加回。刷新失败只记录错误，保留上次可用目录。
+   */
+  async _refreshOwnedModels(state, force) {
+    const now = Date.now();
+    const refreshed = new Set();
+    const conflicts = [];
+    let rows;
+    try { rows = await this._providers(); }
+    catch { return { refreshed, conflicts }; } // 控制台不可用：保留缓存，不算本次状态
+    const byId = new Map(rows.map((p) => [p.id, p]));
+    for (const id of SELF_HOSTED) {
+      const pid = `wanneng-${id}`;
+      const current = byId.get(pid);
+      if (!current) continue; // 未注册：交给安装/手动注册，不当作刷新失败
+      const cached = state.providers[pid] || {};
+      if (!force && now - (cached.lastRefreshAt || 0) < this.refreshMs) continue;
+      if (current.off || current.noModels) {
+        state.providers[pid] = { models: [], lastRefreshAt: now, lastSuccessAt: now, error: '' };
+        continue;
+      }
+      try {
+        const result = await this.panel._api('provider/models', { id: pid });
+        let row = result && result.provider && typeof result.provider.id === 'string' ? result.provider : null;
+        if (!row) row = (await this._providers()).find((p) => p.id === pid) || null;
+        const active = activeModels(row);
+        state.providers[pid] = {
+          models: active.known ? active.ids : (cached.models || []),
+          lastRefreshAt: now,
+          lastSuccessAt: active.known ? now : (cached.lastSuccessAt || 0),
+          error: active.known ? '' : '刷新后模型目录仍未知',
+        };
+        if (active.known) refreshed.add(pid);
+      } catch (e) {
+        state.providers[pid] = { ...cached, lastRefreshAt: now, error: e.message };
+        conflicts.push(conflict('model-refresh', `${pid} 模型刷新失败：${e.message}`, { providerIds: [pid] }));
+      }
+    }
+    return { refreshed, conflicts };
+  }
+
+  async _collect(state, refresh, skipIds = new Set()) {
     let providers = await this._providers();
     const now = Date.now();
     for (const pid of state.authorizedProviderIds) {
+      if (skipIds.has(pid)) continue;
       const cached = state.providers[pid] || {};
       const current = providers.find((p) => p.id === pid);
       if (current && (current.off || current.noModels)) {
@@ -670,17 +718,19 @@ class MagpieAliasSync {
       const credentials = await this._syncCredentials(state);
       const credentialConflicts = Object.entries(credentials).filter(([, r]) => r && r.ok === false)
         .map(([providerId, r]) => conflict('credential-sync', `${providerId}：${r.message}`, { providerIds: [providerId] }));
+      // 先同步四家自建 provider 的模型目录：与本机 Gateway 页面、aliases 授权都无关。
+      const owned = await this._refreshOwnedModels(state, refresh);
+      this._checkRevision(revision);
       if (!state.selectedKeyId || !state.authorizedProviderIds.length
         && !state.managed.models.length && !Object.keys(state.managed.aliases).length && !state.disabledBySync) {
-        state.conflicts = credentialConflicts;
-        state.lastSuccessAt = Date.now();
-        this._checkRevision(revision);
+        state.conflicts = [...credentialConflicts, ...owned.conflicts];
+        if (!state.conflicts.length) state.lastSuccessAt = Date.now();
         this.stateStore.write(state);
-        this.runtime.phase = credentialConflicts.length ? 'partial' : 'idle';
+        this.runtime.phase = state.conflicts.length ? 'partial' : 'idle';
         return;
       }
       let key = this._selected(state, keys);
-      const collected = await this._collect(state, refresh);
+      const collected = await this._collect(state, refresh, owned.refreshed);
       // 模型刷新可能耗时很久；规划必须使用此刻最新的 caller-key，而不是刷新前快照。
       key = this._selected(state, readCallerKeys(this.callerKeysFile));
       if (!collected.providers.length && state.authorizedProviderIds.length) {
@@ -695,7 +745,8 @@ class MagpieAliasSync {
       const merged = mergePlan({ key, state, planned });
       state.suppressedModels = merged.suppressedModels;
       state.suppressedAliases = merged.suppressedAliases;
-      state.conflicts = [...credentialConflicts, ...merged.conflicts].map(({ fatal, ...item }) => item);
+      state.conflicts = [...credentialConflicts, ...owned.conflicts, ...merged.conflicts]
+        .map(({ fatal, ...item }) => item);
       if (merged.conflicts.some((c) => c.fatal)) throw new Error(merged.conflicts.find((c) => c.fatal).message);
       const hasManagedWork = state.authorizedProviderIds.length || state.managed.models.length
         || Object.keys(state.managed.aliases).length || state.disabledBySync;
