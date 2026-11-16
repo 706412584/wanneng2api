@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const {
-  PluginPanel, RoutingGroups, magpieConfigDir,
+  PluginPanel, RoutingGroups, magpieConfigDir, getCustomProvider,
 } = require('./magpie-adapter');
 
 const SELF_HOSTED = ['workbuddy', 'codearts', 'loomy', 'lingxi'];
@@ -423,13 +423,14 @@ function mergePlan({ key, state, planned }) {
 
 class MagpieAliasSync {
   constructor({
-    dataDir, store, updater, panel, routingGroups, magpieDir,
+    dataDir, store, updater, panel, routingGroups, gatewayPanel, magpieDir,
     reconcileMs = 60000, refreshMs = 600000, debounceMs = 50,
   }) {
     if (!dataDir || !store) throw new Error('AliasSync 缺少数据目录或平台配置');
     this.dataDir = dataDir;
     this.store = store;
     this.updater = updater || null;
+    this.gatewayPanel = gatewayPanel || null;
     this.panel = panel || new PluginPanel({ getConfig: () => store.getPlatform('magpie-web'), timeoutMs: 45000 });
     this.routingGroups = routingGroups || new RoutingGroups({ getConfig: () => store.getPlatform('magpie-web'), timeoutMs: 45000 });
     this.callerKeysFile = path.join(magpieDir || magpieConfigDir(), 'caller-keys.json');
@@ -626,6 +627,46 @@ class MagpieAliasSync {
    * 替换快照并把下架项移入 Delisted：曾全选的 picks 会接住新增模型，用户手工取消的
    * 不会被加回。刷新失败只记录错误，保留上次可用目录。
    */
+  /** 各网关自己的真实模型列表（不经 magpie 缓存），失败返回 null。 */
+  async _vendorModels(id) {
+    if (!this.gatewayPanel) return null;
+    try {
+      const result = await this.gatewayPanel.models(id);
+      const ids = (result && Array.isArray(result.models) ? result.models : [])
+        .map((m) => m && m.id).filter((x) => typeof x === 'string' && x);
+      return ids.length ? [...new Set(ids)] : null;
+    } catch { return null; }
+  }
+
+  /**
+   * magpie 的 provider/models 只把新模型追加到 picks，不会移除已下架的旧 picks
+   * （首次 Refetch 前 catalog 为空时 dropGonePicks 直接跳过）。因此刷新后还要用
+   * 网关真实列表收敛 picks，否则已下架的 GPT 会一直留在目录里。
+   * 只对四家自建 provider 生效；缺失的高级字段由 magpie 保留。
+   */
+  async _syncPicks(pid, row, vendor) {
+    let current = null;
+    try { current = getCustomProvider(pid, path.dirname(this.callerKeysFile)); }
+    catch { current = null; }
+    const picks = Array.isArray(current?.models) ? current.models.filter((m) => typeof m === 'string') : null;
+    if (picks && sameSet(picks, vendor)) return false;
+    const payload = { id: pid };
+    // provider/save 要求至少一个 base URL；缺失会报 “a provider needs a base URL”。
+    for (const key of ['chat', 'responses', 'anthropic', 'gemini', 'name', 'preset', 'icon']) {
+      if (typeof row[key] === 'string' && row[key]) payload[key] = row[key];
+    }
+    for (const key of ['bestInFamily', 'unlisted', 'hiddenDrawers', 'hiddenVideomakers', 'fallback', 'contexts',
+      'outputs', 'compacts', 'proxy', 'accountProxies', 'maxConcurrency', 'maxAccounts', 'queueLimit', 'queueWait',
+      'maxRPM', 'priceRate', 'rateWindows', 'pinUpstream', 'unredacted', 'countFree', 'billing', 'nativeCompaction',
+      'routing', 'affinity', 'sink', 'modelPrefs', 'searches']) {
+      if (Object.hasOwn(row, key)) payload[key] = row[key];
+    }
+    payload.models = [...vendor];
+    payload.noModels = false;
+    await this.panel._api('provider/save', payload);
+    return true;
+  }
+
   async _refreshOwnedModels(state, force) {
     const now = Date.now();
     const refreshed = new Set();
@@ -648,14 +689,20 @@ class MagpieAliasSync {
         const result = await this.panel._api('provider/models', { id: pid });
         let row = result && result.provider && typeof result.provider.id === 'string' ? result.provider : null;
         if (!row) row = (await this._providers()).find((p) => p.id === pid) || null;
+        const vendor = await this._vendorModels(id);
         const active = activeModels(row);
+        const models = vendor || (active.known ? active.ids : (cached.models || []));
         state.providers[pid] = {
-          models: active.known ? active.ids : (cached.models || []),
+          models,
           lastRefreshAt: now,
-          lastSuccessAt: active.known ? now : (cached.lastSuccessAt || 0),
-          error: active.known ? '' : '刷新后模型目录仍未知',
+          lastSuccessAt: (vendor || active.known) ? now : (cached.lastSuccessAt || 0),
+          error: (vendor || active.known) ? '' : '刷新后模型目录仍未知',
         };
-        if (active.known) refreshed.add(pid);
+        if (vendor && row) {
+          try { await this._syncPicks(pid, row, vendor); }
+          catch (e) { conflicts.push(conflict('model-picks', `${pid} 模型选择收敛失败：${e.message}`, { providerIds: [pid] })); }
+          refreshed.add(pid);
+        } else if (active.known) refreshed.add(pid);
       } catch (e) {
         state.providers[pid] = { ...cached, lastRefreshAt: now, error: e.message };
         conflicts.push(conflict('model-refresh', `${pid} 模型刷新失败：${e.message}`, { providerIds: [pid] }));

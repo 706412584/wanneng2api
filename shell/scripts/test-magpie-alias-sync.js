@@ -20,7 +20,7 @@ const key = (models = [], aliases = {}, extra = {}) => ({
   models, aliases, ...extra,
 });
 
-function fixture({ providers, groups = [], keys = [key()], onRefresh, onWrite } = {}) {
+function fixture({ providers, groups = [], keys = [key()], onRefresh, onWrite, vendor = {} } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'w2a-alias-sync-'));
   const dataDir = path.join(root, 'data');
   const magpieDir = path.join(root, 'magpie');
@@ -29,6 +29,14 @@ function fixture({ providers, groups = [], keys = [key()], onRefresh, onWrite } 
   const callerFile = path.join(magpieDir, 'caller-keys.json');
   const writeKeys = () => fs.writeFileSync(callerFile, JSON.stringify(keys, null, 2));
   writeKeys();
+  const providerFile = path.join(magpieDir, 'providers.json');
+  const persistProviders = () => fs.writeFileSync(providerFile, JSON.stringify({
+    providers: providers.map((p) => ({
+      id: p.id,
+      models: (p.models || []).filter((m) => m && m.on !== false).map((m) => m.id),
+    })),
+  }));
+  persistProviders();
   const calls = [];
   const panel = {
     async _api(endpoint, body) {
@@ -40,6 +48,15 @@ function fixture({ providers, groups = [], keys = [key()], onRefresh, onWrite } 
         const next = onRefresh ? onRefresh(body.id, clone(providers[index])) : clone(providers[index]);
         providers[index] = next;
         return { provider: clone(next) };
+      }
+      if (endpoint === 'provider/save') {
+        calls.push({ action: 'save', id: body.id, models: body.models });
+        const index = providers.findIndex((p) => p.id === body.id);
+        if (index >= 0) {
+          providers[index] = { ...providers[index], models: (body.models || []).map((id) => ({ id, on: true })) };
+        }
+        persistProviders();
+        return { providers: clone(providers) };
       }
       throw new Error(`unexpected api ${endpoint}`);
     },
@@ -59,7 +76,9 @@ function fixture({ providers, groups = [], keys = [key()], onRefresh, onWrite } 
   };
   const sync = new MagpieAliasSync({
     dataDir, magpieDir, store: {}, updater: { syncProviderKey: async () => ({ ok: true, unchanged: true }) },
-    panel, routingGroups: { raw: async () => clone(groups) }, debounceMs: 0,
+    panel, routingGroups: { raw: async () => clone(groups) },
+    gatewayPanel: { models: async (id) => ({ models: (vendor[id] || []).map((x) => ({ id: x })) }) },
+    debounceMs: 0,
   });
   return {
     root, sync, calls, providers, groups, keys, callerFile,
@@ -330,6 +349,31 @@ async function testOwnedModelRefreshWithoutAliases() {
   } finally { await missing.cleanup(); }
 }
 
+async function testPicksConvergeToVendor() {
+  const stale = ['gpt-5.5', 'gpt-6-astra', 'glm-5.3', 'kimi-k3'];
+  const vendor = ['glm-5.3', 'kimi-k3', 'kimi-k3.1-pro'];
+  const f = fixture({
+    providers: [row('wanneng-lingxi', stale)], keys: [key([], {})], vendor: { lingxi: vendor },
+  });
+  try {
+    await f.sync.runNow({ refresh: true });
+    const save = f.calls.find((c) => c.action === 'save' && c.id === 'wanneng-lingxi');
+    assert(save, '刷新后必须收敛 picks，否则下架模型会一直保留');
+    assert.deepStrictEqual(save.models, vendor);
+    assert(!f.providers[0].models.some((m) => /^gpt-/.test(m.id)), '旧 GPT 必须从目录移除');
+    assert(f.providers[0].models.some((m) => m.id === 'kimi-k3.1-pro'), '新模型必须进入目录');
+    assert.strictEqual(f.readState().providers['wanneng-lingxi'].models.length, vendor.length);
+    assert(!f.calls.some((c) => ['models-key', 'aliases-key'].includes(c.action)), '不得改 Key 权限');
+  } finally { await f.cleanup(); }
+
+  // 已经一致时不重复写
+  const same = fixture({ providers: [row('wanneng-lingxi', vendor)], keys: [key([], {})], vendor: { lingxi: vendor } });
+  try {
+    await same.sync.runNow({ refresh: true });
+    assert(!same.calls.some((c) => c.action === 'save'), 'picks 已一致时不应重复保存');
+  } finally { await same.cleanup(); }
+}
+
 async function testSuppressionAcrossRuns() {
   const f = fixture({ providers: [row('local', ['one', 'two'])], keys: [key(['local/*'], {})] });
   try {
@@ -400,6 +444,7 @@ async function main() {
     ['手工权限保护与崩溃日志收敛', testManualPermissionsAndCrashRecovery],
     ['并发授权与撤销串行化', testConcurrentMutations],
     ['未授权 aliases 也刷新自建模型', testOwnedModelRefreshWithoutAliases],
+    ['刷新后模型选择收敛到网关真实列表', testPicksConvergeToVendor],
     ['外部删除跨轮 suppression', testSuppressionAcrossRuns],
     ['caller-key 外部漂移保护', testCallerKeyDrift],
   ];

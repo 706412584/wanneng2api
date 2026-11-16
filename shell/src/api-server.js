@@ -131,6 +131,7 @@ class ApiServer {
       updater: deps.updater || null,
       panel: this.pluginPanel,
       routingGroups: this.routingGroups,
+      gatewayPanel: this.gatewayPanel,
     });
     this.aliasStatusListener = null;
   }
