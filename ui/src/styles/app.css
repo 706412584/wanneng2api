@@ -219,18 +219,19 @@ html[data-theme='dark'] .banner { background: #3a1d1d; color: #f2a19d; border-co
 .plat-stats > span { white-space: nowrap; }
 .plat-stats > span.ellipsis { overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
 .plat-stats b { color: var(--text); font-variant-numeric: tabular-nums; }
-.plat-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding-top: 4px; }
+.plat-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding-top: 4px; position: relative; }
 .platform-actions-main { gap: 6px; }
 .platform-actions-main > .btn.primary { margin-right: auto; }
 .platform-actions-main > .btn,
 .platform-more > summary { padding: 0 10px; }
-.platform-more { position: relative; }
+/* 下拉层锚定整行操作区右缘，而不是“更多”按钮：窄屏按钮换行到左侧时
+   仍能完整落在卡片内，不会被视口裁掉。 */
 .platform-more > summary { list-style: none; user-select: none; }
 .platform-more > summary::-webkit-details-marker { display: none; }
 .platform-more[open] { z-index: 3; }
 .platform-more-list {
   position: absolute; right: 0; bottom: calc(100% + 6px);
-  width: 168px; padding: 6px;
+  width: 168px; max-width: calc(100vw - 32px); padding: 6px;
   display: flex; flex-direction: column; gap: 4px;
   background: var(--card); border: 1px solid var(--border);
   border-radius: 10px; box-shadow: var(--shadow-lg);
