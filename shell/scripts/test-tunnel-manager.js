@@ -153,6 +153,18 @@ async function main() {
     assert.strictEqual(processes[1].stopCalls, 1);
     assert.ok(gateways.every((gateway) => gateway.closeCalls >= 1));
 
+    // 首次启动失败（START_TIMEOUT）也必须持续重连，不能停在 error 等用户手动点
+    console.log('\n[启动失败自动重连]');
+    const startError = new Error('cloudflared 建立连接超时');
+    startError.code = 'START_TIMEOUT';
+    nextStartPromise = new Promise((_, reject) => setTimeout(() => reject(startError), 0));
+    const beforeFailedStart = processes.length;
+    manager.start('loomy');
+    await waitFor(() => processes.length >= beforeFailedStart + 2, '首次启动失败后应自动重连');
+    await waitFor(() => manager.statusOf('loomy').phase === 'running', '重连后应上线', 5000);
+    assert.strictEqual(manager.statusOf('loomy').phase, 'running', '非致命启动错误必须继续重连直到成功');
+    await manager.stop('loomy');
+
     unavailable.add('codearts');
     store.updateTarget('codearts', { autoStart: true });
     manager.startAutoStart();

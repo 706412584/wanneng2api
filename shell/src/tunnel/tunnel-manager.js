@@ -390,8 +390,10 @@ class TunnelManager {
     const runtime = this._runtime(id);
     if (runtime.generation !== generation) return;
     this._log(id, `${error.code || 'START_FAILED'}: ${error.message}`);
-    const canRetry = runtime.desiredRunning && !FATAL_CODES.has(error.code)
-      && (runtime.wasRunning || runtime.restoring);
+    // 只要用户仍希望这条隧道运行、且不是配置类致命错误，就持续退避重连。
+    // 不能只依赖 wasRunning：网络中断时 cloudflared 可能从未成功注册，或某次
+    // 重连失败后 wasRunning 为 false，旧逻辑会永久停下，直到用户手动重启。
+    const canRetry = runtime.desiredRunning && !FATAL_CODES.has(error.code);
     try {
       await this._cleanupAttempt(runtime);
     } catch (cleanupError) {

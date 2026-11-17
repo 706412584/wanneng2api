@@ -655,3 +655,9 @@ magpie 原生 `Limit` 已支持 `period: day|week|month|days|hours|total`，`day
 `main.js` 监听 `powerMonitor` 的 `resume`（5 秒去抖，锁屏不处理），延迟 3 秒后调用 `PlatformManager.handleResume()` 与 `TunnelManager.handleResume()`：只重置健康失败计数、清掉旧健康定时器并延迟重新探测，**不主动 spawn/start**。进程已退出仍走既有 exit 重启/退避；`reconnecting` 状态保留原重连路径。这样避免唤醒瞬间网络未就绪被误判为“隧道已死”而重启，Quick 隧道也不会因此换 URL。`handleResume` 可用 `delayMs` 注入，测试用 fake 进程验证“唤醒不重启、只重置计数”。
 
 必须实机验证的部分：本机实际睡眠状态（`powercfg /a`）、唤醒后网络恢复耗时、cloudflared 同进程重连是否保留 Quick URL、四家网关上游连接是否恢复（本地 `/healthz` 可能仍 200）。睡眠/唤醒行为不承诺“服务持续运行”。
+
+### 13.11 隧道启动失败持续重连（2026-11-17 补充）
+
+旧逻辑在 `_handleStartError` 中要求 `runtime.wasRunning || runtime.restoring` 才重连，网络中断时 cloudflared 可能从未成功注册（`START_TIMEOUT`），或某次重连失败后 `wasRunning` 为 false，于是隧道停在 `error` 直到用户手动重启。现象是日志里最后一次失败后长时间没有新的 `Starting tunnel`。
+
+现在只要 `desiredRunning` 为真且错误不在 `FATAL_CODES`（配置、Token、鉴权、端口冲突等）中，就持续按指数退避重连（2 秒起，封顶 60 秒）；网络恢复后自动上线。`START_TIMEOUT`、`TARGET_UNAVAILABLE`、`PUBLIC_HEALTH_FAILED`、`PROCESS_EXIT` 都可重试。清理旧实例失败（`STOP_UNCONFIRMED`）仍会停止并阻断新实例，避免双实例。测试 `test-tunnel-manager.js` 注入一次 `START_TIMEOUT`，断言会自动创建第二个进程并上线。
