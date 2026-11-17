@@ -112,7 +112,7 @@ export default function Platforms() {
         <InstalledPlugins rev={pluginRev} onRemoved={() => setPluginRev((v) => v + 1)} />
       </div>
 
-      <PluginMarket onInstalled={() => setPluginRev((v) => v + 1)} onRemoved={() => setPluginRev((v) => v + 1)} />
+      <PluginMarket rev={pluginRev} onInstalled={() => setPluginRev((v) => v + 1)} onRemoved={() => setPluginRev((v) => v + 1)} />
       {/* 「同模型优先级」已移到 Hub 页（模型优先级 tab），与模型列表共用一份数据 */}
       <Collapsible title="已配置的内置 Provider" summaryKey="已接入的厂商 / 中转 / 订阅">
         <MagpieProviders />
@@ -259,10 +259,14 @@ function Collapsible({ title, summaryKey, children, defaultOpen = false }) {
 }
 
 /** 插件市场：magpie 社区插件目录（Trae / Qoder / WorkBuddy / Loomy / CodeArts …） */
-function PluginMarket({ onInstalled, onRemoved }) {
+function PluginMarket({ rev, onInstalled, onRemoved }) {
   const fetchPlugins = useCallback(() => api.magpiePlugins(false), [])
   const { data, error, loading, refresh } = usePolling(fetchPlugins, 0)
   const toast = useToast()
+
+  useEffect(() => {
+    if (rev > 0) refresh()
+  }, [rev, refresh])
 
   const [kind, setKind] = useState('全部')
   const [search, setSearch] = useState('')
@@ -671,6 +675,8 @@ function PlatformCard({ p, busy, onAction, onOpenPanel, onRefresh }) {
   const fmtBytes = (n) => `${(Number(n || 0) / 1048576).toFixed(1)} MB`
   const disabled = BUSY_STATES.includes(p.state) || !!busy
   const running = ['healthy', 'degraded', 'unhealthy', 'starting', 'updating'].includes(p.state)
+  const startLabel = p.type === 'external' ? '开始监控' : '启动'
+  const stopLabel = p.adopted ? '停止托管' : p.type === 'external' ? '停止监控' : '停止'
   // 四家自研网关有原生管理面板；内核（external）没有，仍走「打开面板」
   const hasManager = !!p.id && ['workbuddy', 'codearts', 'loomy', 'lingxi'].includes(p.id)
   const [managerOpen, setManagerOpen] = useState(false)
@@ -766,29 +772,51 @@ function PlatformCard({ p, busy, onAction, onOpenPanel, onRefresh }) {
 
       {p.id === 'sub2api' && <DepDots p={p} />}
 
-      <div className="plat-actions">
+      <div className="plat-actions platform-actions-main">
         {needsInstall ? (
           <button className="btn primary" disabled={installBusy} onClick={startInstall}>
             {installBusy ? '安装中…' : install?.status === 'error' ? '重试安装' : install?.status === 'needs-import' ? '重试检测' : install?.status === 'installed-without-provider' ? '注册到 magpie' : '安装'}
           </button>
-        ) : running ? (
-          <>
-            <button className="btn" disabled={disabled} onClick={() => onAction(p, 'restart', '重启')}>重启</button>
-            <button className="btn danger" disabled={disabled} onClick={() => onAction(p, 'stop', '停止')}>停止</button>
-          </>
+        ) : !p.enabled ? (
+          <button className="btn primary" disabled={disabled} onClick={() => onAction(p, 'enable', '启用')}>启用</button>
+        ) : !running ? (
+          <button className="btn primary" disabled={disabled} onClick={() => onAction(p, 'start', startLabel)}>{startLabel}</button>
+        ) : hasManager ? (
+          <button className="btn primary" disabled={disabled || needsInstall} onClick={() => setManagerOpen(true)} title="账号 / 签到 / 统计 / 日志">管理</button>
         ) : (
-          <button className="btn primary" disabled={disabled || !p.enabled} onClick={() => onAction(p, 'start', '启动')}>启动</button>
+          <button className="btn primary" onClick={() => onOpenPanel(p)}>打开面板</button>
         )}
-        {p.enabled
-          ? <button className="btn ghost" disabled={disabled} onClick={() => onAction(p, 'disable', '禁用')}>禁用</button>
-          : <button className="btn ghost" disabled={disabled} onClick={() => onAction(p, 'enable', '启用')}>启用</button>}
-        <span style={{ flex: 1 }} />
-        {hasManager && (
-          <button className="btn sm primary" disabled={!running} onClick={() => setManagerOpen(true)}
-            title={running ? '原生管理：账号 / 签到 / 统计 / 日志' : '网关未在运行，先启动它'}>管理</button>
+        {!needsInstall && running && (
+          <button className="btn danger" disabled={disabled} onClick={() => onAction(p, 'stop', stopLabel)}>{stopLabel}</button>
         )}
-        <button className="btn sm" onClick={() => onOpenPanel(p)} title={`http://127.0.0.1:${p.port}`}>打开面板</button>
-        <Link className="btn sm" to={`/logs?id=${p.id}`}>日志</Link>
+        <Link className="btn ghost" to={`/logs?id=${p.id}`}>日志</Link>
+        <details className="platform-more"
+          onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) e.currentTarget.open = false }}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') {
+              e.currentTarget.open = false
+              e.currentTarget.querySelector('summary')?.focus()
+              e.stopPropagation()
+            }
+          }}
+          onClick={(e) => { if (e.target.closest('button, a')) e.currentTarget.open = false }}
+        >
+          <summary className="btn" aria-label={`${p.name} 更多操作`}>更多 <span aria-hidden="true">⌄</span></summary>
+          <div className="platform-more-list">
+            <button className="btn ghost" onClick={() => onOpenPanel(p)}>打开原面板</button>
+            {hasManager && !running && (
+              <button className="btn ghost" disabled title="网关未在运行，先启动它">管理账号</button>
+            )}
+            {!needsInstall && running && (
+              <button className="btn ghost" disabled={disabled} onClick={() => onAction(p, 'restart', '重启')}>
+                {p.adopted || p.type === 'external' ? '重新检测' : '重启服务'}
+              </button>
+            )}
+            {p.enabled && (
+              <button className="btn ghost" disabled={disabled} onClick={() => onAction(p, 'disable', '禁用')}>禁用平台</button>
+            )}
+          </div>
+        </details>
       </div>
 
       {managerOpen && (

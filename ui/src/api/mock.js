@@ -187,6 +187,7 @@ const UPDATES_SUMMARY = () => ({
     current: p.version,
     latest: p.updateAvailable ? nextVersion(p.version) : p.version,
     updateAvailable: p.updateAvailable,
+    hasUpdater: p.id !== 'hub',
     state: p.state === 'updating' ? 'updating' : p.updateAvailable ? 'available' : 'up-to-date',
     notes: p.updateAvailable ? '修复上游协议变更；账号池冷却策略优化；建议尽快更新。' : ''
   }))
@@ -228,10 +229,14 @@ const MOCK_GATEWAY_KEYS = [
 
 const MOCK_ALIAS_STATE = {
   available: true,
-  selectedKeyId: 'key-public', selectedKeyName: '公网专用',
+  targets: [{
+    id: 'key-public', name: '公网专用', eligible: true, reason: '', disabledBySync: false,
+    aliases: { used: 11, managed: 11, limit: 200 }, models: { used: 11, managed: 11, limit: 500 },
+    lastSuccessAt: BOOT, lastError: '', conflicts: [],
+  }],
   keys: [
-    { id: 'key-public', name: '公网专用', off: false, eligible: true, reason: '', accountsRestricted: false },
-    { id: 'key-browser', name: '浏览器扩展', off: false, eligible: false, reason: '浏览器扩展专用 Key 不能作为同步目标', accountsRestricted: false },
+    { id: 'key-public', name: '公网专用', off: false, eligible: true, reason: '', accountsRestricted: false, isTarget: true },
+    { id: 'key-browser', name: '浏览器扩展', off: false, eligible: false, reason: '浏览器扩展专用 Key 不能作为同步目标', accountsRestricted: false, isTarget: false },
   ],
   providers: [
     { id: 'wanneng-lingxi', name: '灵犀', source: 'self-hosted', off: false, ready: true, authorized: true, modelCount: 11, modelCountKnown: true, credential: 'config', lastSuccessAt: BOOT, error: '' },
@@ -245,14 +250,83 @@ const MOCK_ALIAS_STATE = {
   status: { phase: 'idle', revision: 1, pending: false, lastStartedAt: 0, lastFinishedAt: 0, lastError: '' },
 }
 
+const MOCK_PLUGINS = [
+  { name: 'Trae（演示）', package: '@magpie-community/opencode-trae-auth', kind: 'provider', providers: ['trae'], summary: { zh: '演示插件，用于预览安装、筛选和卡片布局。' }, installed: false, signedIn: false },
+  { name: 'Qoder（演示）', package: '@magpie-community/opencode-qoder-auth', kind: 'provider', providers: ['qoder'], summary: { zh: '演示已安装的平台插件。' }, installed: true, signedIn: false },
+  { name: '提示词改写（演示）', package: '@demo/prompt-guard', kind: 'middleware', providers: [], summary: { zh: '演示中间件，不连接真实插件仓库。' }, installed: false, signedIn: false },
+]
+
 export const mockApi = {
-  platformInstallStatus: async (id) => ({ id, status: 'not-installed' }),
+  platformInstallStatus: async (id) => ({ id, status: platforms.find((p) => p.id === id)?.installed ? 'installed' : 'not-installed' }),
   installPlatform: async (id) => ({ id, started: false, installed: true, status: 'installed' }),
   registerPlatformProvider: async () => ({ ok: true }),
   shellUpdateStatus: async () => ({ supported: false, reason: '开发预览不连接桌面壳更新' }),
   checkShellUpdate: async () => ({ supported: false, reason: '开发预览不连接桌面壳更新' }),
   downloadShellUpdate: async () => ({ supported: false }),
   installShellUpdate: async () => ({ supported: false }),
+  magpieVersion: async () => ({ current: '0.1.0', latest: '0.1.0', hasUpdate: false, binary: 'demo/magpie', checkedAt: Date.now(), updating: false }),
+  magpieInstallStatus: async () => ({ installed: true, binary: 'demo/magpie', progress: null }),
+
+  async magpiePlugins() {
+    await latency(80)
+    const kinds = {}
+    for (const plugin of MOCK_PLUGINS) kinds[plugin.kind] = (kinds[plugin.kind] || 0) + 1
+    return { plugins: clone(MOCK_PLUGINS), kinds }
+  },
+
+  async magpieAddPlugin(pkg) {
+    await latency(160)
+    const plugin = MOCK_PLUGINS.find((item) => item.package === pkg)
+    if (!plugin) throw new Error('演示插件不存在')
+    plugin.installed = true
+    return { ok: true }
+  },
+
+  async magpieRemovePlugin(pkg) {
+    await latency(160)
+    const plugin = MOCK_PLUGINS.find((item) => item.package === pkg)
+    if (!plugin) throw new Error('演示插件不存在')
+    plugin.installed = false
+    plugin.signedIn = false
+    return { ok: true }
+  },
+
+  async magpiePluginPanel(pkg, provider) {
+    const plugin = MOCK_PLUGINS.find((item) => item.package === pkg)
+    if (!plugin?.installed) throw new Error('请先安装演示插件')
+    return { name: plugin.name, provider, accounts: [], methods: [], chosen: [], models: [], options: [] }
+  },
+
+  async magpieProviders() {
+    return { providers: [], pluginCount: 0, officialCount: 0, configDir: '演示数据' }
+  },
+
+  async magpiePresets() {
+    return { presets: [], groups: [] }
+  },
+
+  async gatewayPanel(id) {
+    const platform = platforms.find((p) => p.id === id)
+    if (!platform) throw new Error('演示平台不存在')
+    return { id, name: platform.name, port: platform.port, capabilities: ['accounts', 'logs'], accounts: { accounts: [] } }
+  },
+
+  async gatewayLogs(id) {
+    return { id, lines: clone(LOG_SAMPLES[id] || []) }
+  },
+
+  async magpieGateway(what) {
+    if (what === 'overview') return { version: 'demo', models: 0, apis: ['/v1/chat/completions', '/v1/messages'] }
+    if (what === 'usage') return { calls: reqCounter, errors: 0, input: tokCounter, output: 0, cost: 0, retried: 0, series: [] }
+    if (what === 'requests') return { rows: [] }
+    if (what === 'quotas') return { data: [] }
+    if (what === 'mcp') return { servers: [] }
+    return {}
+  },
+
+  async modelCatalog() {
+    return { models: [], warnings: [] }
+  },
 
   async getOverview() {
     await latency(120)
@@ -492,11 +566,27 @@ export const mockApi = {
 
   async magpieAliasAction(action, body = {}) {
     await latency(120)
+    if (action === 'target-add' || action === 'target-remove') {
+      const target = MOCK_ALIAS_STATE.keys.find((item) => item.id === body.keyId && item.eligible)
+      if (action === 'target-add' && !target) throw new Error('目标 Key 不可用')
+      const active = action === 'target-add'
+      const existing = MOCK_ALIAS_STATE.keys.find((item) => item.id === body.keyId)
+      if (existing) existing.isTarget = active
+      if (active && !MOCK_ALIAS_STATE.targets.some((item) => item.id === body.keyId)) {
+        MOCK_ALIAS_STATE.targets.push({
+          id: existing.id, name: existing.name, eligible: true, reason: '', disabledBySync: false,
+          aliases: { used: 0, managed: 0, limit: 200 }, models: { used: 0, managed: 0, limit: 500 },
+          lastSuccessAt: 0, lastError: '', conflicts: [],
+        })
+      } else {
+        MOCK_ALIAS_STATE.targets = MOCK_ALIAS_STATE.targets.filter((item) => item.id !== body.keyId)
+      }
+      return { ok: true, targetKeyIds: MOCK_ALIAS_STATE.targets.map((item) => item.id) }
+    }
     if (action === 'select-key') {
       const selected = MOCK_ALIAS_STATE.keys.find((item) => item.id === body.keyId && item.eligible)
       if (!selected) throw new Error('目标 Key 不可用')
-      MOCK_ALIAS_STATE.selectedKeyId = selected.id
-      MOCK_ALIAS_STATE.selectedKeyName = selected.name
+      MOCK_ALIAS_STATE.keys.forEach((item) => { item.isTarget = item.id === selected.id })
       return { ok: true, selectedKeyId: selected.id }
     }
     if (action === 'provider-set') {

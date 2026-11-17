@@ -133,7 +133,7 @@ export default function Settings() {
   const dirty = JSON.stringify(form) !== JSON.stringify(normalize(data))
 
   return (
-    <>
+    <div className="settings-page">
       <div className="card section">
         <div className="section-head">
           <h2>通用</h2>
@@ -289,21 +289,15 @@ export default function Settings() {
             </div>
           </div>
         </div>
-        <div style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: 1.9 }}>
-          Node 默认不读系统代理，所以壳的更新/下载必须在这里显式开启。<br />
-          「订阅流量 / 插件流量」写入 magpie 自己的 proxy / pluginProxy；<b>取消勾选会明确设为不走代理</b>——
-          magpie 的空值含义是「跟随系统代理」，而系统代理可能对你的目标不通。<br />
-          四个自研网关的流量不受此设置影响（它们各自的代理由自己的配置决定）。<br />
-          cloudflared 运行时代理变更会在对应隧道下次启动或重连时生效，不会自动重启现有隧道。
-        </div>
-      </div>
-
-      <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-        <button className="btn primary" disabled={saving || !dirty} onClick={save}>
-          {saving ? '保存中…' : dirty ? '保存设置' : '无改动'}
-        </button>
-        {dirty && <span style={{ fontSize: 12, color: 'var(--orange)' }}>有未保存的修改</span>}
-        {error && <span style={{ fontSize: 12, color: 'var(--red)' }}>上次刷新失败：{error.message}</span>}
+        <p className="settings-note">只对所选范围生效。四个自研网关继续使用各自的代理配置。</p>
+        <details className="settings-help">
+          <summary>代理如何生效</summary>
+          <div className="settings-help-body">
+            <p>壳的更新与下载需要在此显式开启代理。</p>
+            <p>「订阅流量 / 插件流量」同步到 magpie；取消勾选会明确设为不走代理。</p>
+            <p>cloudflared 运行时代理变更在对应隧道下次启动或重连时生效，现有隧道不会自动重启。</p>
+          </div>
+        </details>
       </div>
 
       <div className="card section">
@@ -327,7 +321,17 @@ export default function Settings() {
           </div>
         </div>
       </div>
-    </>
+
+      <div className="settings-save-bar">
+        <div className="settings-save-status" role="status">
+          <span className={dirty ? 'settings-dirty' : ''}>{dirty ? '有未保存的修改' : '所有设置已保存'}</span>
+          {error && <span className="text-err">上次刷新失败：{error.message}</span>}
+        </div>
+        <button className="btn primary" disabled={saving || !dirty} onClick={save}>
+          {saving ? '保存中…' : '保存设置'}
+        </button>
+      </div>
+    </div>
   )
 }
 

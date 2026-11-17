@@ -131,7 +131,7 @@ export default function Updates() {
             {checkAllBusy ? '检查中…' : '一键检查全部'}
           </button>
         </div>
-        <div className="table-wrap">
+        <div className="table-wrap updates-table">
           <table className="tbl">
             <thead>
               <tr>
@@ -147,10 +147,9 @@ export default function Updates() {
               {items.map((it) => {
                 const plat = platforms.find((p) => p.id === it.id)
                 const isUpdating = plat?.state === 'updating'
-                const pct = isUpdating ? Math.min(95, ((Date.now() % 8000) / 8000) * 100) : null
                 return (
                   <tr key={it.id}>
-                    <td>
+                    <td data-label="平台" className="update-platform">
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                         <StateDot state={plat?.state || 'stopped'} size={7} />
                         <b>{it.name}</b>
@@ -164,15 +163,15 @@ export default function Updates() {
                         </div>
                       )}
                     </td>
-                    <td className="num">{it.current ? `v${it.current}` : '—'}</td>
-                    <td className="num">
+                    <td data-label="当前版本" className="num update-current">{it.current ? `v${it.current}` : '—'}</td>
+                    <td data-label="最新版本" className="num update-latest">
                       {it.latest
                         ? (it.updateAvailable
                             ? <span style={{ color: 'var(--blue)', fontWeight: 700 }}>v{it.latest}</span>
                             : <span style={{ color: 'var(--text-3)' }}>v{it.latest}</span>)
                         : <span style={{ color: 'var(--text-3)' }}>—</span>}
                     </td>
-                    <td>
+                    <td data-label="版本状态" className="update-status">
                       {/* 四种状态必须分开：把「仓库还没发 Release」和「网络/限流失败」
                           都染成红色「检测失败」会让用户去查网络，方向完全错。 */}
                       {it.noRelease
@@ -189,11 +188,11 @@ export default function Updates() {
                                 ? <span className="badge orange">有新版</span>
                                 : <span className="badge green">最新</span>}
                     </td>
-                    <td>{plat ? <span className={`state-pill ${plat.state}`}>{STATE_TEXT[plat.state]}</span> : '—'}</td>
-                    <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                    <td data-label="运行状态" className="update-runtime">{plat ? <span className={`state-pill ${plat.state}`}>{STATE_TEXT[plat.state]}</span> : '—'}</td>
+                    <td data-label="操作" className="update-actions" style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                       <button
                         className="btn sm"
-                        disabled={!!checking[it.id] || isUpdating || anyUpdating && false}
+                        disabled={!!checking[it.id] || checkAllBusy || isUpdating}
                         onClick={() => checkOne(plat || { id: it.id, name: it.name })}
                       >
                         {checking[it.id] ? '检查中…' : '检查更新'}
@@ -428,26 +427,26 @@ function MagpieCoreCard() {
 
       {data && (
         <>
-          <div className="table-wrap">
+          <div className="table-wrap updates-table">
             <table className="tbl">
               <thead>
                 <tr><th>组件</th><th>本机版本</th><th>最新版本</th><th>状态</th><th style={{ textAlign: 'right' }}>操作</th></tr>
               </thead>
               <tbody>
                 <tr>
-                  <td><b>magpie 内核</b>
+                  <td data-label="组件" className="update-platform"><b>magpie 内核</b>
                     {!data.binary && <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 2 }}>未找到可执行文件</div>}
                   </td>
-                  <td className="num">{data.current ? `v${data.current}` : '—'}</td>
-                  <td className="num">{data.latest ? <span style={{ color: data.hasUpdate ? 'var(--blue)' : 'var(--text-3)', fontWeight: data.hasUpdate ? 700 : 400 }}>v{data.latest}</span> : '—'}</td>
-                  <td>
+                  <td data-label="本机版本" className="num update-current">{data.current ? `v${data.current}` : '—'}</td>
+                  <td data-label="最新版本" className="num update-latest">{data.latest ? <span style={{ color: data.hasUpdate ? 'var(--blue)' : 'var(--text-3)', fontWeight: data.hasUpdate ? 700 : 400 }}>v{data.latest}</span> : '—'}</td>
+                  <td data-label="版本状态" className="update-status">
                     {!data.current
                       ? <span className="badge gray">未安装</span>
                       : data.hasUpdate
                         ? <span className="badge orange">有新版</span>
                         : <span className="badge green">最新</span>}
                   </td>
-                  <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                  <td data-label="操作" className="update-actions" style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                     {missing && !installing && (
                       <button className="btn sm primary" onClick={doInstall}>一键安装</button>
                     )}{' '}

@@ -276,7 +276,10 @@ export const api = new Proxy({
   putSettings: (settings) => request('/api/settings', { method: 'PUT', body: settings })
 }, {
   get(live, method) {
-    if (isMock && Object.prototype.hasOwnProperty.call(mockApi, method)) return mockApi[method]
+    if (isMock) {
+      if (Object.prototype.hasOwnProperty.call(mockApi, method)) return mockApi[method]
+      if (typeof live[method] === 'function') return async () => { throw new Error('演示模式暂未提供此操作，请连接 Manager API 后使用') }
+    }
     return live[method]
   },
 })

@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from 'react'
-import { NavLink, Route, Routes, useLocation } from 'react-router-dom'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
+import { Navigate, NavLink, Route, Routes, useLocation } from 'react-router-dom'
 import { apiMode, apiBase, pingManager } from './api/client'
 import { useTheme } from './hooks/useTheme'
 import { ToastProvider } from './components/Toast'
@@ -35,6 +35,7 @@ const TITLES = {
 export default function App() {
   const { mode, cycle } = useTheme()
   const location = useLocation()
+  const sidebarRef = useRef(null)
   const [managerUp, setManagerUp] = useState(null) // null=探测中
   const [probeAt, setProbeAt] = useState(0)
 
@@ -52,6 +53,26 @@ export default function App() {
     return () => clearInterval(t)
   }, [probe])
 
+  useEffect(() => {
+    const nav = sidebarRef.current?.querySelector('.sidebar-nav')
+    if (!nav) return
+    const sidebar = sidebarRef.current
+    const mobile = window.matchMedia('(max-width: 900px)')
+    const revealActive = () => {
+      if (sidebar) sidebar.scrollLeft = 0
+      if (!mobile.matches) return
+      const active = nav.querySelector('.nav-item.active')
+      if (!active) return
+      const navRect = nav.getBoundingClientRect()
+      const activeRect = active.getBoundingClientRect()
+      if (activeRect.left < navRect.left) nav.scrollLeft += activeRect.left - navRect.left
+      else if (activeRect.right > navRect.right) nav.scrollLeft += activeRect.right - navRect.right
+    }
+    revealActive()
+    window.addEventListener('resize', revealActive)
+    return () => window.removeEventListener('resize', revealActive)
+  }, [location.pathname])
+
   const themeIcon = mode === 'auto' ? '◐' : mode === 'light' ? '☀' : '☾'
   const themeLabel = mode === 'auto' ? '跟随系统' : mode === 'light' ? '浅色' : '深色'
 
@@ -61,20 +82,22 @@ export default function App() {
       <BusyProvider>
       <TitleBar />
       <div className="app-shell">
-        <aside className="sidebar">
+        <aside className="sidebar" ref={sidebarRef}>
           <div className="brand">
             <span className="brand-logo">万</span>
             <span>wanneng2api</span>
           </div>
-          {NAV.map((item, i) => (
-            <span key={item.to} style={{ display: 'contents' }}>
-              {item.group && <div className="group-label">{item.group}</div>}
-              <NavLink to={item.to} className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
-                <span className="ico">{item.ico}</span>
-                <span>{item.label}</span>
-              </NavLink>
-            </span>
-          ))}
+          <nav className="sidebar-nav" aria-label="主导航">
+            {NAV.map((item) => (
+              <Fragment key={item.to}>
+                {item.group && <div className="group-label">{item.group}</div>}
+                <NavLink to={item.to} className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
+                  <span className="ico" aria-hidden="true">{item.ico}</span>
+                  <span>{item.label}</span>
+                </NavLink>
+              </Fragment>
+            ))}
+          </nav>
           <div className="sidebar-foot">
             <button className="nav-item" onClick={cycle} title="切换主题">
               <span className="ico">{themeIcon}</span>
@@ -109,7 +132,7 @@ export default function App() {
           <main className="content">
             <div className="content-inner">
               <Routes>
-                <Route path="/" element={<Overview />} />
+                <Route path="/" element={<Navigate to="/overview" replace />} />
                 <Route path="/overview" element={<Overview />} />
                 <Route path="/platforms" element={<Platforms />} />
                 <Route path="/updates" element={<Updates />} />
