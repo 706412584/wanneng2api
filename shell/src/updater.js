@@ -388,6 +388,13 @@ class PlatformUpdater {
     if (!bin) return { ok: false, message: 'magpie 尚未安装，安装内核后可重试注册' };
     const cfg = this._gatewayConfig(this.store.platformWorkDir(p));
     const key = this._gatewayApiKey(id, p, cfg);
+    // loomy 的 api_keys 为空表示关闭鉴权（上游 config.py 语义），此时没有可同步的
+    // 凭证；magpie 已存在的 provider key 任意值都能通过。不要报成配置冲突。
+    if (!key && id === 'loomy') {
+      return allowAdd
+        ? { ok: false, message: 'loomy 未启用 api_keys（免鉴权），注册 provider 需要占位密钥' }
+        : { ok: true, skipped: true, message: 'loomy 未启用 api_keys（免鉴权），跳过凭证同步' };
+    }
     if (!key) return { ok: false, message: '未找到网关 API 密钥，未修改 magpie 配置' };
     const providerId = `wanneng-${id}`;
     let existing;

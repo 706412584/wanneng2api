@@ -885,6 +885,11 @@ class ApiServer {
     if (parts[1] === 'settings' && parts.length === 2) {
       if (method === 'GET') return store.manager;
       if (method === 'PUT') {
+        // 布尔开关只接受真正的布尔值：字符串 "false" 经 !! 会被当成 true。
+        if (body.general && typeof body.general === 'object'
+          && Object.hasOwn(body.general, 'keepAwake') && typeof body.general.keepAwake !== 'boolean') {
+          throw new Error('general.keepAwake 必须是布尔值');
+        }
         const cur = store.manager;
         // 合并一级子对象，避免整对象覆盖丢失默认键；proxy.scopes 是二级对象，
         // 单独再合一次——否则前端只发部分范围时，其余项的当前值会被整体丢掉。

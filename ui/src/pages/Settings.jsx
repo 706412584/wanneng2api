@@ -340,6 +340,7 @@ function normalize(raw) {
       closeAction: raw.general?.closeAction ?? 'tray',
       autoStart: !!raw.general?.autoStart,
       startMinimized: !!raw.general?.startMinimized,
+      keepAwake: !!raw.general?.keepAwake,
       autoStartPlatforms: Array.isArray(raw.general?.autoStartPlatforms) ? raw.general.autoStartPlatforms : []
     },
     update: {

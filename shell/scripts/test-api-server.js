@@ -353,6 +353,9 @@ async function main() {
   const ka = await req('PUT', '/api/settings', { general: { keepAwake: true } });
   ok('防休眠开关可保存', ka.status === 200 && ka.json.general.keepAwake === true);
   ok('防休眠保存不覆盖其他设置', ka.json.general.autoStartPlatforms.length === 6);
+  const kaBad = await req('PUT', '/api/settings', { general: { keepAwake: 'false' } });
+  ok('keepAwake 只接受布尔值（字符串 "false" 不能被当成 true）', kaBad.status === 400,
+    `实际 ${kaBad.status}`);
   await req('PUT', '/api/settings', { general: { keepAwake: false } });
 
   // ── 代理设置 ──

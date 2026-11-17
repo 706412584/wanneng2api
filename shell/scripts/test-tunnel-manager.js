@@ -75,6 +75,9 @@ async function main() {
   let failNextStop = false;
   let nextStartPromise = null;
   let networkReady = true;
+  let proxyEnabled = false;
+  let failStartCount = 0;
+  const probeCalls = [];
   const store = new TunnelStore(root);
   const remoteAuth = new RemoteAuth({ store });
   const adapters = {
@@ -92,7 +95,14 @@ async function main() {
     store, adapters, remoteAuth, staticDir: root,
     binary: { async ensure() { binaryEnsures++; return '/fake/cloudflared'; }, status() { return { installed: true }; } },
     processFactory(options) {
-      const process = new FakeProcess(options, ++processNumber, failNextStop, nextStartPromise);
+      const startPromise = nextStartPromise || (failStartCount > 0
+        ? (failStartCount--, new Promise((_, reject) => setTimeout(() => {
+          const error = new Error('injected start timeout');
+          error.code = 'START_TIMEOUT';
+          reject(error);
+        }, 0)))
+        : null);
+      const process = new FakeProcess(options, ++processNumber, failNextStop, startPromise);
       failNextStop = false;
       nextStartPromise = null;
       processes.push(process);
@@ -107,13 +117,18 @@ async function main() {
     },
     localCheck: async () => ({ ok: true }),
     portCheck: async () => ({ free: true }),
-    proxy: { config: () => ({ enabled: false, scopes: {} }), validProxyUrl: () => false },
+    proxy: {
+      config: () => ({ enabled: proxyEnabled, url: 'http://127.0.0.1:7890', scopes: { tunnelRuntime: proxyEnabled } }),
+      validProxyUrl: () => proxyEnabled,
+      agentFor: () => (proxyEnabled ? { proxy: true } : undefined),
+    },
     reconnectBaseMs: 5,
     reconnectMaxMs: 20,
     publicRetryDelaysMs: [1, 2, 3],
     healthIntervalMs: 10,
-    networkProbe: async () => networkReady,
+    networkProbe: async (options) => { probeCalls.push(options || {}); return networkReady; },
     networkWaitMs: 20,
+    networkProbeTimeoutMs: 10,
   });
 
   try {
@@ -156,6 +171,14 @@ async function main() {
     assert.strictEqual(processes[1].stopCalls, 1);
     assert.ok(gateways.every((gateway) => gateway.closeCalls >= 1));
 
+    // 探测成功不得把退避清零：连续启动失败时 retryAttempt 必须持续增长
+    console.log('\n[重连退避保持]');
+    failStartCount = 3;
+    manager.start('workbuddy');
+    await waitFor(() => manager.statusOf('workbuddy').retryAttempt >= 3, '连续失败必须保留指数退避', 5000);
+    await waitFor(() => manager.statusOf('workbuddy').phase === 'running', '失败结束后应上线', 5000);
+    await manager.stop('workbuddy');
+
     // 首次启动失败（START_TIMEOUT）也必须持续重连，不能停在 error 等用户手动点
     console.log('\n[启动失败自动重连]');
     const startError = new Error('cloudflared 建立连接超时');
@@ -182,6 +205,23 @@ async function main() {
     networkReady = true;
     await waitFor(() => manager.statusOf('lingxi').phase === 'running', '网络恢复后应自动上线', 5000);
     assert.strictEqual(manager.statusOf('lingxi').phase, 'running', '网络恢复后必须上线');
+    await manager.stop('lingxi');
+
+    // 代理启用：探测必须经代理；连续两次失败后跳过预检直接重连
+    console.log('\n[代理探测与降级重连]');
+    proxyEnabled = true;
+    networkReady = false;
+    probeCalls.length = 0;
+    failStartCount = 1;
+    const beforeProxy = processes.length;
+    manager.start('lingxi');
+    await waitFor(() => probeCalls.length >= 2, '代理模式下应连续探测两次', 5000);
+    assert.ok(probeCalls[0].agent, '代理启用时探测必须带 agent');
+    assert.ok(probeCalls[0].signal, '探测必须可被停止取消');
+    await waitFor(() => processes.length > beforeProxy, '连续探测失败后应跳过预检直接拉起 cloudflared', 5000);
+    await waitFor(() => manager.statusOf('lingxi').phase === 'running', '跳过预检后应正常上线', 5000);
+    networkReady = true;
+    proxyEnabled = false;
     await manager.stop('lingxi');
 
     unavailable.add('codearts');
@@ -292,7 +332,17 @@ async function main() {
     assert.ok(!JSON.stringify(manager.snapshot()).includes(NAMED_TOKEN), '快照不得包含 Token');
     assert.ok(!manager.logs('lingxi').lines.join('').includes(NAMED_TOKEN), '日志不得包含 Token');
 
-    console.log('PASS TunnelManager：六目标、崩溃重连、autoStart、公网健康、Named、stopAll 与脱敏');
+    // 探测取消：停止/退出时不得多等一个超时
+    console.log('\n[探测取消]');
+    const { defaultNetworkProbe } = require('../src/tunnel/tunnel-manager');
+    const aborted = new AbortController();
+    aborted.abort();
+    assert.strictEqual(await defaultNetworkProbe({ signal: aborted.signal }), false, '已取消的探测应立即返回');
+    const probeStarted = Date.now();
+    assert.strictEqual(await defaultNetworkProbe({ timeoutMs: 1 }), false, '探测超时应返回不可用');
+    assert.ok(Date.now() - probeStarted < 1000, '探测超时不得阻塞退出');
+
+    console.log('PASS TunnelManager：六目标、崩溃重连、退避保持、代理探测降级、autoStart、公网健康、Named、stopAll 与脱敏');
   } finally {
     if (manager.hasActiveProcesses()) await manager.stopAll().catch(() => {});
     fs.rmSync(root, { recursive: true, force: true });

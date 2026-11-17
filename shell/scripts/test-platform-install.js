@@ -179,6 +179,18 @@ async function main() {
     assert.strictEqual(unchanged.unchanged, true, 'Key 已一致时不应再次调用 CLI');
     assert.strictEqual(keyCalls.length, beforeUnchanged);
 
+    // loomy 的 api_keys 为空 = 上游关闭鉴权：没有可同步的凭证，后台同步跳过而不是报冲突。
+    const loomyPlatform = credentialPlatforms.get('loomy');
+    loomyPlatform.run.env = { LOOMY_API_KEYS: '', API_KEY: '' };
+    fs.writeFileSync(path.join(loomyPlatform.workDir, 'config.json'), JSON.stringify({ api_keys: [] }));
+    const beforeNoAuth = keyCalls.length;
+    const noAuth = await credentialUpdater.syncProviderKey('loomy');
+    assert.strictEqual(noAuth.ok, true, 'loomy 免鉴权不应报失败');
+    assert.strictEqual(noAuth.skipped, true);
+    assert.strictEqual(keyCalls.length, beforeNoAuth, '免鉴权时不应调用 native CLI');
+    loomyPlatform.run.env = { LOOMY_API_KEYS: 'loomy-first,loomy-second', API_KEY: '' };
+    fs.writeFileSync(path.join(loomyPlatform.workDir, 'config.json'), JSON.stringify({ api_keys: ['loomy-config'] }));
+
     writeProviders(providerIds.filter((id) => id !== 'wanneng-lingxi'));
     const beforeMissing = keyCalls.length;
     const missingSync = await credentialUpdater.syncProviderKey('lingxi');

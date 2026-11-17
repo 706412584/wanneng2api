@@ -436,10 +436,11 @@ app.whenReady().then(async () => {
   proxy.init(store);
   proxy.setLogger((m) => shellLog('info', m));
   closeAction = (store.manager.general && store.manager.general.closeAction) || 'tray';
-  applyKeepAwake(!!(store.manager.general && store.manager.general.keepAwake));
 
   managerLogWriter = new (require('./logs').RotatingFileWriter)(
     path.join(dataDir, 'logs', 'manager.log'), { rotateBytes: 10 * 1024 * 1024, keepFiles: 5 });
+  // 初始化日志写入器之后再应用，避免启动日志只进 console、manager.log 里查不到。
+  applyKeepAwake(!!(store.manager.general && store.manager.general.keepAwake));
   const logger = {
     info: (m) => shellLog('info', m),
     warn: (m) => shellLog('warn', m),

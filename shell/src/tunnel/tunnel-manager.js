@@ -23,22 +23,62 @@ const FATAL_CODES = new Set([
 ]);
 
 /**
- * 轻量网络就绪探测：只判断到 Cloudflare 的 TCP 443 是否可达。
+ * 轻量网络就绪探测：只判断到 Cloudflare 的 443 是否可达。
  *
  * 断网期间如果照常重连，每次都会拉起 cloudflared 再等 30 秒启动超时，
  * 日志和进程开销都很大。这里先探测，未就绪就只等待，恢复后立即重连。
+ *
+ * 配置了 tunnelRuntime 代理时必须**经代理**探测：直连被本地策略挡住、
+ * 但 cloudflared 能经代理上线时，直连探测会永久判离线。
+ * 探测本身 unref，不阻止进程退出；signal 用于停止/关闭时立即取消。
  */
-function defaultNetworkProbe({ timeoutMs = 3000 } = {}) {
+function defaultNetworkProbe({ agent, timeoutMs = 3000, signal } = {}) {
+  if (signal && signal.aborted) return Promise.resolve(false);
+  if (agent) {
+    return new Promise((resolve) => {
+      const https = require('https');
+      let settled = false;
+      let timer = null;
+      let req = null;
+      const done = (ok) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        try { if (req) req.destroy(); } catch (_e) { /* ignore */ }
+        resolve(ok);
+      };
+      req = https.get('https://api.cloudflare.com/', { agent, timeout: timeoutMs }, (res) => {
+        res.resume();
+        done(true);
+      });
+      req.on('error', () => done(false));
+      req.on('timeout', () => done(false));
+      req.on('socket', (socket) => socket.unref && socket.unref());
+      timer = setTimeout(() => done(false), timeoutMs);
+      timer.unref && timer.unref();
+      if (signal) signal.addEventListener('abort', () => done(false), { once: true });
+    });
+  }
   return new Promise((resolve) => {
     const net = require('net');
     const socket = net.connect({ host: 'api.cloudflare.com', port: 443 });
+    let settled = false;
+    let timer = null;
     const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
       try { socket.destroy(); } catch (_e) { /* ignore */ }
       resolve(ok);
     };
-    socket.setTimeout(timeoutMs, () => done(false));
+    socket.setNoDelay(true);
+    // 探测不应把退出流程挂住；真正在等待时由 reconnectTimer 维持生命周期。
+    socket.unref();
     socket.once('connect', () => done(true));
     socket.once('error', () => done(false));
+    timer = setTimeout(() => done(false), timeoutMs);
+    timer.unref && timer.unref();
+    if (signal) signal.addEventListener('abort', () => done(false), { once: true });
   });
 }
 
@@ -70,7 +110,7 @@ class TunnelManager {
     staticDir = '', proxy, processFactory, apiGatewayFactory, remoteGatewayFactory,
     healthCheck, localCheck, portCheck = defaultPortCheck, healthIntervalMs = 30000,
     reconnectBaseMs = 2000, reconnectMaxMs = 60000, publicRetryDelaysMs = [1000, 2000, 4000],
-    networkProbe = defaultNetworkProbe, networkWaitMs = 10000, logger } = {}) {
+    networkProbe = defaultNetworkProbe, networkWaitMs = 10000, networkProbeTimeoutMs = 3000, logger } = {}) {
     if (!store || !adapters) throw new TypeError('TunnelManager 需要 store 和 adapters');
     this.store = store;
     this.adapters = adapters;
@@ -91,6 +131,7 @@ class TunnelManager {
     this.publicRetryDelaysMs = publicRetryDelaysMs;
     this.networkProbe = networkProbe;
     this.networkWaitMs = networkWaitMs;
+    this.networkProbeTimeoutMs = networkProbeTimeoutMs;
     this.logger = logger || { info() {}, warn() {}, error() {} };
     this.runtimes = new Map();
     for (const target of TARGETS) this.runtimes.set(target.id, this._newRuntime(target));
@@ -104,6 +145,7 @@ class TunnelManager {
       publicUrl: '', startedAt: 0, lastReadyAt: 0,
       localHealth: 'unknown', publicHealth: 'unknown', lastHealthAt: 0,
       retryAttempt: 0, nextRetryAt: 0, lastError: null, networkWaitLogged: false,
+      probeFailures: 0, probeController: null,
       reconnecting: false, healthInFlight: false, healthFailures: 0,
       verifyGeneration: 0, verifyingToken: false, verificationProcess: null, verificationError: null,
       reconnectTimer: null, healthTimer: null,
@@ -315,6 +357,7 @@ class TunnelManager {
     runtime.lastError = null;
     runtime.retryAttempt = 0;
     runtime.networkWaitLogged = false;
+    runtime.probeFailures = 0;
     runtime.publicUrl = '';
     runtime.localHealth = 'unknown';
     runtime.publicHealth = 'unknown';
@@ -493,10 +536,34 @@ class TunnelManager {
       runtime.reconnectTimer = null;
       runtime.nextRetryAt = 0;
       if (!this._current(id, generation)) return;
+      // 代理启用时必须经代理探测：直连被本地策略挡住、cloudflared 却能经代理上线时，
+      // 直连探测会把可用链路永久判成离线。
+      const proxyUrl = this._runtimeProxy();
+      const agent = proxyUrl && typeof this.proxy.agentFor === 'function'
+        ? this.proxy.agentFor('tunnelRuntime') : undefined;
+      const controller = new AbortController();
+      runtime.probeController = controller;
       let ready = true;
-      try { ready = await this.networkProbe(); } catch { ready = false; }
+      try {
+        ready = await this.networkProbe({
+          agent, timeoutMs: this.networkProbeTimeoutMs, signal: controller.signal,
+        });
+      } catch { ready = false; } finally {
+        if (runtime.probeController === controller) runtime.probeController = null;
+      }
       if (!this._current(id, generation)) return;
       if (!ready) {
+        runtime.probeFailures = (runtime.probeFailures || 0) + 1;
+        // 代理链路下连续两次探测失败就不再让探测否决重连：交给 cloudflared 按
+        // tunnelRuntime 代理实际尝试。探测只用于减少断网期间的进程拉起。
+        if (agent && runtime.probeFailures >= 2) {
+          this._log(id, '代理连通探测连续失败，跳过预检直接重连');
+          runtime.probeFailures = 0;
+          // 保留 retryAttempt 与 networkWaitLogged：代理也坏时不能让 cloudflared
+          // 回到固定间隔反复拉起；之后探测恢复仍会清零退避。
+          void this._startRun(id, generation);
+          return;
+        }
         if (!runtime.networkWaitLogged) {
           this._log(id, '网络尚未恢复，等待后重试');
           runtime.networkWaitLogged = true;
@@ -505,8 +572,13 @@ class TunnelManager {
         runtime.reconnectTimer = setTimeout(() => void attempt(), this.networkWaitMs);
         return;
       }
-      runtime.networkWaitLogged = false;
-      runtime.retryAttempt = 0;
+      runtime.probeFailures = 0;
+      // 只有从“网络不可用”恢复时才重置退避；普通重连必须继续指数增长，
+      // 否则 PROCESS_EXIT/PUBLIC_HEALTH_FAILED 会永远以 2s 间隔反复拉起进程。
+      if (runtime.networkWaitLogged) {
+        runtime.networkWaitLogged = false;
+        runtime.retryAttempt = 0;
+      }
       void this._startRun(id, generation);
     };
     void (async () => {
@@ -574,6 +646,11 @@ class TunnelManager {
     if (runtime.reconnectTimer) clearTimeout(runtime.reconnectTimer);
     runtime.reconnectTimer = null;
     runtime.nextRetryAt = 0;
+    // 停止/关闭时取消在途探测，避免退出多等一个探测超时。
+    if (runtime.probeController) {
+      try { runtime.probeController.abort(); } catch (_e) { /* ignore */ }
+      runtime.probeController = null;
+    }
   }
 
   /**
@@ -666,4 +743,4 @@ class TunnelManager {
   }
 }
 
-module.exports = { TunnelManager, defaultHealthCheck, defaultPortCheck, FATAL_CODES };
+module.exports = { TunnelManager, defaultHealthCheck, defaultNetworkProbe, defaultPortCheck, FATAL_CODES };
