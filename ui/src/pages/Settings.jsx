@@ -17,7 +17,7 @@ const PLATFORM_CHOICES = [
 ]
 
 const EMPTY_SETTINGS = {
-  general: { closeAction: 'tray', autoStart: false, startMinimized: false, autoStartPlatforms: [] },
+  general: { closeAction: 'tray', autoStart: false, startMinimized: false, keepAwake: false, autoStartPlatforms: [] },
   update: { checkOnLaunch: true, githubToken: '' },
   sub2api: { pgPort: 5433, redisPort: 6380 }
 }
@@ -169,6 +169,10 @@ export default function Settings() {
           <label className="check-row">
             <input type="checkbox" checked={!!g.startMinimized} onChange={(e) => set('general', 'startMinimized', e.target.checked)} />
             启动时最小化（托盘）
+          </label>
+          <label className="check-row">
+            <input type="checkbox" checked={!!g.keepAwake} onChange={(e) => set('general', 'keepAwake', e.target.checked)} />
+            防止系统休眠（屏幕仍可正常息屏）
           </label>
         </div>
       </div>

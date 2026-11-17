@@ -9,6 +9,7 @@ const MOCK_SETTINGS = {
     closeAction: 'tray',
     autoStart: true,
     startMinimized: true,
+    keepAwake: false,
     autoStartPlatforms: ['workbuddy', 'codearts', 'loomy', 'hub'],
     autoStartDelaySec: 0
   },

@@ -660,4 +660,6 @@ magpie 原生 `Limit` 已支持 `period: day|week|month|days|hours|total`，`day
 
 旧逻辑在 `_handleStartError` 中要求 `runtime.wasRunning || runtime.restoring` 才重连，网络中断时 cloudflared 可能从未成功注册（`START_TIMEOUT`），或某次重连失败后 `wasRunning` 为 false，于是隧道停在 `error` 直到用户手动重启。现象是日志里最后一次失败后长时间没有新的 `Starting tunnel`。
 
-现在只要 `desiredRunning` 为真且错误不在 `FATAL_CODES`（配置、Token、鉴权、端口冲突等）中，就持续按指数退避重连（2 秒起，封顶 60 秒）；网络恢复后自动上线。`START_TIMEOUT`、`TARGET_UNAVAILABLE`、`PUBLIC_HEALTH_FAILED`、`PROCESS_EXIT` 都可重试。清理旧实例失败（`STOP_UNCONFIRMED`）仍会停止并阻断新实例，避免双实例。测试 `test-tunnel-manager.js` 注入一次 `START_TIMEOUT`，断言会自动创建第二个进程并上线。
+现在只要 `desiredRunning` 为真且错误不在 `FATAL_CODES`（配置、Token、鉴权、端口冲突等）中，就持续按指数退避重连（2 秒起，封顶 60 秒）；网络恢复后自动上线。设置页可开启“防止系统休眠”：使用 `powerSaveBlocker.start('prevent-app-suspension')`，只设 `ES_SYSTEM_REQUIRED`，不设 `ES_DISPLAY_REQUIRED`，因此屏幕仍会按电源计划息屏；退出或关闭开关时释放。它不能可靠阻止主动睡眠/合盖。`START_TIMEOUT`、`TARGET_UNAVAILABLE`、`PUBLIC_HEALTH_FAILED`、`PROCESS_EXIT` 都可重试。清理旧实例失败（`STOP_UNCONFIRMED`）仍会停止并阻断新实例，避免双实例。
+
+断网可能持续数分钟。为避免每次重试都拉起 cloudflared 再等 30 秒启动超时，重连定时器到点后先做轻量网络探测（`defaultNetworkProbe`：TCP 连接 `api.cloudflare.com:443`，3 秒超时，可注入）。未就绪时不 spawn，只每 `networkWaitMs`（默认 10 秒）重新探测，并且只记一条“网络尚未恢复”日志；一旦探测通过，重置 `retryAttempt` 并立即重连。测试通过注入 `networkProbe` 验证断网期间进程数不增长、恢复后自动上线。

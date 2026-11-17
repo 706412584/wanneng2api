@@ -74,6 +74,7 @@ async function main() {
   let binaryEnsures = 0;
   let failNextStop = false;
   let nextStartPromise = null;
+  let networkReady = true;
   const store = new TunnelStore(root);
   const remoteAuth = new RemoteAuth({ store });
   const adapters = {
@@ -111,6 +112,8 @@ async function main() {
     reconnectMaxMs: 20,
     publicRetryDelaysMs: [1, 2, 3],
     healthIntervalMs: 10,
+    networkProbe: async () => networkReady,
+    networkWaitMs: 20,
   });
 
   try {
@@ -164,6 +167,22 @@ async function main() {
     await waitFor(() => manager.statusOf('loomy').phase === 'running', '重连后应上线', 5000);
     assert.strictEqual(manager.statusOf('loomy').phase, 'running', '非致命启动错误必须继续重连直到成功');
     await manager.stop('loomy');
+
+    // 断网期间不反复拉起 cloudflared，只等待；网络恢复后立即重连
+    console.log('\n[断网等待与恢复]');
+    const offlineError = new Error('cloudflared 建立连接超时');
+    offlineError.code = 'START_TIMEOUT';
+    nextStartPromise = new Promise((_, reject) => setTimeout(() => reject(offlineError), 0));
+    networkReady = false;
+    const beforeOffline = processes.length;
+    manager.start('lingxi');
+    await waitFor(() => manager.statusOf('lingxi').phase === 'reconnecting', '应进入重连等待');
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.strictEqual(processes.length, beforeOffline + 1, '断网期间不得反复拉起 cloudflared');
+    networkReady = true;
+    await waitFor(() => manager.statusOf('lingxi').phase === 'running', '网络恢复后应自动上线', 5000);
+    assert.strictEqual(manager.statusOf('lingxi').phase, 'running', '网络恢复后必须上线');
+    await manager.stop('lingxi');
 
     unavailable.add('codearts');
     store.updateTarget('codearts', { autoStart: true });

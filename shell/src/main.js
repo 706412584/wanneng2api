@@ -7,7 +7,7 @@
  * Electron 相关（窗口/托盘/自启）只在本文件引用，其余模块均为纯 Node。
  */
 
-const { app, BrowserWindow, dialog, shell, Menu, ipcMain, powerMonitor } = require('electron');
+const { app, BrowserWindow, dialog, shell, Menu, ipcMain, powerMonitor, powerSaveBlocker } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
@@ -33,6 +33,31 @@ let quitting = false;
 let closeAction = 'tray';
 // 壳内无痕登录窗（限制并发，关闭即销毁内存会话）
 const loginWindows = new Set();
+// 防止系统休眠（只阻止睡眠，不阻止屏幕息屏）的 blocker
+let keepAwakeBlockerId = null;
+
+/**
+ * 按设置启用/停用防休眠。
+ * prevent-app-suspension 在 Windows 上只设 ES_SYSTEM_REQUIRED，不会设
+ * ES_DISPLAY_REQUIRED，所以屏幕仍会按电源计划息屏，只是系统不会睡眠。
+ * 注意它无法可靠阻止用户主动点“睡眠”或合盖，取决于系统电源策略。
+ */
+function applyKeepAwake(enabled) {
+  if (enabled && keepAwakeBlockerId == null) {
+    try {
+      keepAwakeBlockerId = powerSaveBlocker.start('prevent-app-suspension');
+      shellLog('info', `已启用防休眠（blocker ${keepAwakeBlockerId}），屏幕仍可息屏`);
+    } catch (e) {
+      shellLog('warn', `启用防休眠失败: ${e.message}`);
+    }
+    return;
+  }
+  if (!enabled && keepAwakeBlockerId != null) {
+    try { powerSaveBlocker.stop(keepAwakeBlockerId); } catch (_e) { /* ignore */ }
+    keepAwakeBlockerId = null;
+    shellLog('info', '已停用防休眠');
+  }
+}
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -411,6 +436,7 @@ app.whenReady().then(async () => {
   proxy.init(store);
   proxy.setLogger((m) => shellLog('info', m));
   closeAction = (store.manager.general && store.manager.general.closeAction) || 'tray';
+  applyKeepAwake(!!(store.manager.general && store.manager.general.keepAwake));
 
   managerLogWriter = new (require('./logs').RotatingFileWriter)(
     path.join(dataDir, 'logs', 'manager.log'), { rotateBytes: 10 * 1024 * 1024, keepFiles: 5 });
@@ -441,8 +467,11 @@ app.whenReady().then(async () => {
   api = new ApiServer({
     manager, updater, store, tunnelManager,
     openExternal: (u) => shell.openExternal(u),
-    // 设置保存后（代理可能变了）：壳自更新要重新下发代理
-    onSettingsSaved: () => applyProxyToUpdater(),
+    // 设置保存后：代理可能变了要重新下发；防休眠开关要立即生效
+    onSettingsSaved: () => {
+      applyProxyToUpdater();
+      applyKeepAwake(!!(store.manager.general && store.manager.general.keepAwake));
+    },
     // 壳不是平台，自更新检查走独立通道（前端此前拿 'hub' 占位，永远 404）
     selfUpdate: selfUpdateController(),
   });
@@ -510,6 +539,7 @@ async function gracefulQuit() {
   try { if (tunnelManager) await tunnelManager.stopAll(); } catch (_e) { /* ignore */ }
   try { if (manager) await manager.stopAll(); } catch (_e) { /* ignore */ }
   try { if (api) await api.close(); } catch (_e) { /* ignore */ }
+  applyKeepAwake(false);
   destroyTray();
   app.quit();
 }

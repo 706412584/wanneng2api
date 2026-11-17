@@ -27,6 +27,7 @@ function defaultManagerConfig() {
       startMinimized: false,
       autoStartPlatforms: ['workbuddy', 'codearts', 'loomy', 'lingxi', 'magpie', 'magpie-web'],
       autoStartDelaySec: 0,
+      keepAwake: false,               // 阻止系统睡眠；不阻止显示器息屏
     },
     manager: {
       listen: '127.0.0.1:17800',

@@ -22,6 +22,26 @@ const FATAL_CODES = new Set([
   'BINARY_HASH_MISMATCH', 'BINARY_INVALID', 'SPAWN_ERROR', 'STOP_UNCONFIRMED',
 ]);
 
+/**
+ * 轻量网络就绪探测：只判断到 Cloudflare 的 TCP 443 是否可达。
+ *
+ * 断网期间如果照常重连，每次都会拉起 cloudflared 再等 30 秒启动超时，
+ * 日志和进程开销都很大。这里先探测，未就绪就只等待，恢复后立即重连。
+ */
+function defaultNetworkProbe({ timeoutMs = 3000 } = {}) {
+  return new Promise((resolve) => {
+    const net = require('net');
+    const socket = net.connect({ host: 'api.cloudflare.com', port: 443 });
+    const done = (ok) => {
+      try { socket.destroy(); } catch (_e) { /* ignore */ }
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs, () => done(false));
+    socket.once('connect', () => done(true));
+    socket.once('error', () => done(false));
+  });
+}
+
 function defaultHealthCheck(url, { proxy, timeoutMs = 10000 } = {}) {
   return new Promise((resolve) => {
     const mod = url.startsWith('https:') ? https : http;
@@ -49,7 +69,8 @@ class TunnelManager {
   constructor({ store, adapters, binary, remoteAuth, managerOrigin = 'http://127.0.0.1:17800',
     staticDir = '', proxy, processFactory, apiGatewayFactory, remoteGatewayFactory,
     healthCheck, localCheck, portCheck = defaultPortCheck, healthIntervalMs = 30000,
-    reconnectBaseMs = 2000, reconnectMaxMs = 60000, publicRetryDelaysMs = [1000, 2000, 4000], logger } = {}) {
+    reconnectBaseMs = 2000, reconnectMaxMs = 60000, publicRetryDelaysMs = [1000, 2000, 4000],
+    networkProbe = defaultNetworkProbe, networkWaitMs = 10000, logger } = {}) {
     if (!store || !adapters) throw new TypeError('TunnelManager 需要 store 和 adapters');
     this.store = store;
     this.adapters = adapters;
@@ -68,6 +89,8 @@ class TunnelManager {
     this.reconnectBaseMs = reconnectBaseMs;
     this.reconnectMaxMs = reconnectMaxMs;
     this.publicRetryDelaysMs = publicRetryDelaysMs;
+    this.networkProbe = networkProbe;
+    this.networkWaitMs = networkWaitMs;
     this.logger = logger || { info() {}, warn() {}, error() {} };
     this.runtimes = new Map();
     for (const target of TARGETS) this.runtimes.set(target.id, this._newRuntime(target));
@@ -80,7 +103,7 @@ class TunnelManager {
       phase: 'stopped', stage: 'idle', process: null, gateway: null,
       publicUrl: '', startedAt: 0, lastReadyAt: 0,
       localHealth: 'unknown', publicHealth: 'unknown', lastHealthAt: 0,
-      retryAttempt: 0, nextRetryAt: 0, lastError: null,
+      retryAttempt: 0, nextRetryAt: 0, lastError: null, networkWaitLogged: false,
       reconnecting: false, healthInFlight: false, healthFailures: 0,
       verifyGeneration: 0, verifyingToken: false, verificationProcess: null, verificationError: null,
       reconnectTimer: null, healthTimer: null,
@@ -291,6 +314,7 @@ class TunnelManager {
     runtime.stage = 'preflight';
     runtime.lastError = null;
     runtime.retryAttempt = 0;
+    runtime.networkWaitLogged = false;
     runtime.publicUrl = '';
     runtime.localHealth = 'unknown';
     runtime.publicHealth = 'unknown';
@@ -464,6 +488,27 @@ class TunnelManager {
     runtime.stage = 'idle';
     runtime.publicHealth = 'failed';
     if (this.store.get(id).mode === 'quick') runtime.publicUrl = '';
+    // 到点后先探测网络：断网期间不拉起 cloudflared，只等待；网络恢复后重置退避立即重连。
+    const attempt = async () => {
+      runtime.reconnectTimer = null;
+      runtime.nextRetryAt = 0;
+      if (!this._current(id, generation)) return;
+      let ready = true;
+      try { ready = await this.networkProbe(); } catch { ready = false; }
+      if (!this._current(id, generation)) return;
+      if (!ready) {
+        if (!runtime.networkWaitLogged) {
+          this._log(id, '网络尚未恢复，等待后重试');
+          runtime.networkWaitLogged = true;
+        }
+        runtime.nextRetryAt = Date.now() + this.networkWaitMs;
+        runtime.reconnectTimer = setTimeout(() => void attempt(), this.networkWaitMs);
+        return;
+      }
+      runtime.networkWaitLogged = false;
+      runtime.retryAttempt = 0;
+      void this._startRun(id, generation);
+    };
     void (async () => {
       try {
         if (!cleaned) await this._cleanupAttempt(runtime);
@@ -472,11 +517,7 @@ class TunnelManager {
         const base = Math.min(this.reconnectMaxMs, this.reconnectBaseMs * (2 ** Math.max(0, runtime.retryAttempt - 1)));
         const delay = Math.max(1, Math.round(base * (0.8 + Math.random() * 0.4)));
         runtime.nextRetryAt = Date.now() + delay;
-        runtime.reconnectTimer = setTimeout(() => {
-          runtime.reconnectTimer = null;
-          runtime.nextRetryAt = 0;
-          void this._startRun(id, generation);
-        }, delay);
+        runtime.reconnectTimer = setTimeout(() => void attempt(), delay);
       } catch (cleanupError) {
         runtime.desiredRunning = false;
         runtime.phase = 'error';

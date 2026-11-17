@@ -349,6 +349,11 @@ async function main() {
     `实际 ${sp2.json.general.autoStartPlatforms.length}`);
   const sg2 = await req('GET', '/api/settings');
   ok('PUT 后 GET 读到新值', sg2.json.general.closeAction === 'quit');
+  ok('防休眠默认关闭', sg.json.general.keepAwake === false);
+  const ka = await req('PUT', '/api/settings', { general: { keepAwake: true } });
+  ok('防休眠开关可保存', ka.status === 200 && ka.json.general.keepAwake === true);
+  ok('防休眠保存不覆盖其他设置', ka.json.general.autoStartPlatforms.length === 6);
+  await req('PUT', '/api/settings', { general: { keepAwake: false } });
 
   // ── 代理设置 ──
   console.log('\n[proxy 设置]');
