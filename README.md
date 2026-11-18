@@ -67,7 +67,10 @@ systemctl enable --now wanneng2api
 公网访问需经反向代理（nginx）转发到 `127.0.0.1:17800`，并在反代层做会话认证——管理台自身无鉴权，设计上只监听本机。反代部署时注意两点：
 
 - **Origin 校验**：浏览器经域名访问时，vite 构建的 crossorigin 资产请求会带 `Origin` 头（同源也带），壳的 `isAllowedOrigin` 需放行「与请求 Host 同域」的来源，否则 JS/CSS 被 403 拒绝、页面白屏。
-- **「打开面板」**：服务端 `xdg-open` 在无头服务器上是空操作；浏览器部署下由前端把面板 URL 按端口映射改写为公网反代地址后直接打开（见 `ui/src/api/client.js` 的 `PANEL_PORT_MAP`），无映射的面板用卡片上的「管理」抽屉。
+- **「打开面板」**：服务端 `xdg-open` 在无头服务器上是空操作；浏览器部署下由前端把本机面板 URL 改写为主域名下的子路径后直接打开（见 `ui/src/api/client.js` 的 `rewrite`）。
+  - `17899`（magpie-web）→ `/magpie/`：反代时需剥离前缀，并用 `proxy_redirect / /magpie/;` 改写它的 303（它认为自己部署在根目录）
+  - `6789`（lingxi）→ 原样保留 `/panel/`：其 HTML 与 API 全在此前缀下，零冲突
+  - 面板挂在根路径且资源用绝对路径的（workbuddy/codearts/loomy），无法子路径部署，用卡片上的「管理」抽屉。
 
 ## 组件与端口
 
