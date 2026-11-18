@@ -1,0 +1,1343 @@
+'use strict';
+/**
+ * platform-manager.js — 平台进程托管状态机（纯 Node 模块，无 Electron 依赖）
+ *
+ * 状态机（DESIGN.md §4.3）：
+ *   stopped ──start──► starting ──health ok──► healthy
+ *                      │                         │ 连续 fail≥failThreshold → degraded → unhealthy
+ *                      ▼                         │
+ *                    error ◄────crash────────────┘
+ *                      │ 意外退出 → 指数退避(baseBackoff→maxBackoff) 自动重启
+ *   更新期间：updating（禁止 start/stop）
+ *
+ * 端口预检：spawn 前探测端口占用，被非本平台 PID 占用 → error(port-conflict)，不 spawn。
+ * sub2api 编排（§8）：requires=["pg","redis"] 时按序拉起影子进程，stop 反序。
+ */
+
+const { spawn, execFile, exec } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+const http = require('http');
+const net = require('net');
+const crypto = require('crypto');
+const { EventEmitter } = require('events');
+const { RingBuffer, RotatingFileWriter } = require('./logs');
+
+const STATES = ['stopped', 'starting', 'healthy', 'degraded', 'unhealthy', 'updating', 'error'];
+
+// ────────────────────────── 工具 ──────────────────────────
+
+/** netstat -ano 找出监听端口的 PID（Windows；失败返回 null） */
+function findListeningPid(port) {
+  // Windows: netstat -ano 的最后两列是 PID。
+  if (process.platform === 'win32') {
+    return new Promise((resolve) => {
+      execFile('netstat', ['-ano'], { windowsHide: true, timeout: 5000 }, (err, stdout) => {
+        if (err || !stdout) return resolve(null);
+        for (const line of stdout.split('\n')) {
+          const parts = line.trim().split(/\s+/);
+          // TCP  0.0.0.0:7866  0.0.0.0:0  LISTENING  1234
+          if (parts.length >= 5 && parts[0] === 'TCP' && /^LISTENING$/i.test(parts[3])) {
+            const local = parts[1] || '';
+            const m = local.match(/:(\d+)$/);
+            if (m && Number(m[1]) === port) return resolve(Number(parts[4]));
+          }
+        }
+        resolve(null);
+      });
+    });
+  }
+  // POSIX: `ss -ltnp` 输出形如
+  //   LISTEN 0 128 127.0.0.1:7866 0.0.0.0:* users:(("wb2api",pid=1234,fd=3))
+  // `-p` 需要足够权限才显示 pid；拿不到就回 null，交给 TCP 探测兜底。
+  return new Promise((resolve) => {
+    execFile('ss', ['-ltnp'], { timeout: 5000 }, (err, stdout) => {
+      if (err || !stdout) return resolve(null);
+      for (const line of stdout.split('\n')) {
+        if (!/LISTEN/i.test(line)) continue;
+        const mPort = line.match(/[:.](\d+)\s+\S+/);
+        if (!mPort || Number(mPort[1]) !== port) continue;
+        const mPid = line.match(/pid=(\d+)/);
+        if (mPid) return resolve(Number(mPid[1]));
+      }
+      resolve(null);
+    });
+  });
+}
+
+/** TCP 连接探测端口是否有监听者 */
+/**
+ * 定位 magpie 可执行文件。magpie 是外部依赖（约 79MB），不随安装包分发，
+ * 所以装机后要在这些位置里找：
+ *   1. 源码目录旁的 tools/magpie（开发机）
+ *   2. 数据目录下的 magpie/（用户自己放进来的）
+ *   3. PATH（官方安装脚本会写进 PATH）
+ *   4. %LOCALAPPDATA%\Programs\magpie（官方 Windows 安装位置）
+ */
+function findMagpieBinary(dataDir) {
+  const cands = [];
+  cands.push(path.resolve(__dirname, '..', '..', 'tools', 'magpie', 'magpie.exe'));
+  cands.push(path.resolve(__dirname, '..', '..', 'tools', 'magpie', 'magpie'));
+  if (dataDir) {
+    cands.push(path.join(dataDir, 'magpie', 'magpie.exe'));
+    cands.push(path.join(dataDir, 'magpie', 'magpie'));
+  }
+  for (const name of ['magpie.exe', 'magpie']) {
+    const onPath = whichSync(name);
+    if (onPath) cands.push(onPath);
+  }
+  const local = process.env.LOCALAPPDATA;
+  if (local) {
+    cands.push(path.join(local, 'Programs', 'magpie', 'magpie.exe'));
+    cands.push(path.join(local, 'magpie', 'magpie.exe'));
+  }
+  for (const c of cands) {
+    try {
+      if (c && fs.existsSync(c)) return c;
+    } catch { /* 无权访问的路径跳过 */ }
+  }
+  if (process.env.WANNENG_DISABLE_SYSTEM_MAGPIE === '1') return null;
+  return null;
+}
+
+/** 在 PATH 里找一个可执行文件（同步版） */
+function whichSync(name) {
+  const dirs = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  const exts = process.platform === 'win32'
+    ? String(process.env.PATHEXT || '.EXE;.CMD;.BAT').split(';').filter(Boolean).map((e) => e.toLowerCase())
+    : [''];
+  const lower = name.toLowerCase();
+  for (const d of dirs) {
+    for (const ext of exts) {
+      const f = path.join(d, lower.endsWith(ext) ? name : name + ext);
+      try {
+        if (fs.existsSync(f)) return f;
+      } catch { /* 跳过 */ }
+    }
+  }
+  return null;
+}
+
+function probePortOpen(port, timeoutMs = 800) {
+  return new Promise((resolve) => {
+    const sock = net.connect({ host: '127.0.0.1', port });
+    const done = (open) => {
+      try { sock.destroy(); } catch (_e) { /* ignore */ }
+      resolve(open);
+    };
+    sock.setTimeout(timeoutMs, () => done(false));
+    sock.once('connect', () => done(true));
+    sock.once('error', () => done(false));
+  });
+}
+
+/** 端口预检：free=true 可用；否则返回占用 PID */
+async function checkPortFree(port, ownPid = 0) {
+  const pid = await findListeningPid(port);
+  if (pid === null) {
+    // netstat 没看到监听者，再用 TCP 探测兜底（防 netstat 失败）
+    const open = await probePortOpen(port);
+    return { free: !open, pid: 0 };
+  }
+  if (ownPid && pid === ownPid) return { free: true, pid };
+  return { free: false, pid };
+}
+
+/**
+ * 强杀整个进程树。
+ *
+ * Windows：taskkill /T 按父子关系杀整棵树。
+ * POSIX：没有等价命令，只能靠进程组 —— spawn 时设了 detached 让子进程
+ * 自成一个组（pgid == pid），这里 kill(-pid) 就能打到整组。
+ * 先 SIGTERM 给个收尾机会，再 SIGKILL 兜底；组不存在说明已经退干净了。
+ */
+function taskkillTree(pid, { graceMs = 1500 } = {}) {
+  if (!pid) return Promise.resolve();
+  if (process.platform === 'win32') {
+    return new Promise((resolve) => {
+      execFile('taskkill.exe', ['/pid', String(pid), '/T', '/F'],
+        { windowsHide: true, timeout: 8000, stdio: 'ignore' },
+        () => resolve());
+    });
+  }
+  return new Promise((resolve) => {
+    const signal = (sig) => { try { process.kill(-pid, sig); return true; } catch { return false; } };
+    if (!signal('SIGTERM')) return resolve(); // 组已不存在
+    const timer = setTimeout(() => {
+      signal('SIGKILL');
+      resolve();
+    }, graceMs);
+    if (timer.unref) timer.unref();
+  });
+}
+
+function simpleGlobMatch(pattern, relPath) {
+  if (!pattern) return false;
+  // ** 跨目录，* 单段，? 单字符
+  const rx = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, '\u0000')
+    .replace(/\*/g, '[^/\\\\]*')
+    .replace(/\?/g, '[^/\\\\]')
+    .replace(/\u0000/g, '.*');
+  return new RegExp(`^${rx}$`, 'i').test(relPath.replace(/\\/g, '/'));
+}
+
+/** 健康响应体是否表示「账号池为空」（见 PlatformRuntime._probeHealth 注释）。 */
+function isEmptyPoolBody(text) {
+  if (!text || !/^\s*[{[]/.test(text)) return false;
+  let data;
+  try { data = JSON.parse(text); } catch { return false; }
+  if (!data || typeof data !== 'object') return false;
+  const num = (v) => (v !== null && v !== '' && Number.isFinite(Number(v)) ? Number(v) : null);
+  // workbuddy / lingxi: {"healthy":0,"total":0,...}
+  if (num(data.total) === 0 && num(data.healthy) === 0) return true;
+  // loomy: {"status":"degraded","accounts":0,"usable_accounts":0,...}
+  if (num(data.accounts) === 0) return true;
+  return false;
+}
+
+function randomHex(n = 12) {
+  return crypto.randomBytes(n).toString('hex');
+}
+
+// ────────────────────────── 平台运行时 ──────────────────────────
+
+class PlatformRuntime {
+  constructor(id, cfg, mgr) {
+    this.id = id;
+    this.mgr = mgr;
+    this.status = 'stopped';
+    this.proc = null;
+    this.pid = 0;
+    this.startedAt = 0;
+    this.lastExitCode = null;
+    this.lastError = '';
+    this.restartAttempts = 0;
+    this.failCount = 0;
+    this.okCount = 0;
+    this.healthTimer = null;
+    this.resumeTimer = null;
+    this.restartTimer = null;
+    this.missingBinary = false;
+    this.stopping = false;
+    this.adopted = false;   // 端口上已有本平台实例，被认领而非 spawn
+    this.version = null;
+    this.lastHealthAt = 0;
+    // 进程运行正常、只是账号池为空（网关自己的健康端点如此报告）。
+    this.emptyAccounts = false;
+    this.deps = { pg: { status: 'stopped', pid: 0 }, redis: { status: 'stopped', pid: 0 } };
+    this.ring = new RingBuffer(500);
+    this.writer = null;
+  }
+
+  get cfg() {
+    return this.mgr.store.getPlatform(this.id) || {};
+  }
+
+  get logFile() {
+    return path.join(this.mgr.logsPlatformsDir, `${this.id}.log`);
+  }
+
+  _ensureWriter() {
+    if (!this.writer) {
+      this.writer = new RotatingFileWriter(this.logFile, { rotateBytes: 10 * 1024 * 1024, keepFiles: 5 });
+    }
+    return this.writer;
+  }
+
+  appendLog(stream, text) {
+    const ts = new Date().toISOString();
+    const line = `${ts} [${stream}] ${String(text).replace(/\r?\n$/, '')}`;
+    try { this._ensureWriter().write(line); } catch (_e) { /* 丢弃 */ }
+    this.ring.push(line);
+    this.mgr.emit('log', this.id, stream, line);
+  }
+
+  setStatus(next, extraErr = '') {
+    if (next === this.status && !extraErr) return;
+    this.status = next;
+    // 只有运行中的健康状态才可能"空账号池"；停止/出错时清掉。
+    if (['stopped', 'error', 'updating'].includes(next)) this.emptyAccounts = false;
+    if (extraErr) this.lastError = extraErr;
+    if (next === 'healthy') { this.restartAttempts = 0; this.lastError = ''; }
+    this.mgr.emit('status', this.id, next, this.snapshot());
+  }
+
+  snapshot() {
+    const cfg = this.cfg;
+    return {
+      id: this.id,
+      name: cfg.name || this.id,
+      type: cfg.type || '',
+      enabled: !!cfg.enabled,
+      mode: cfg.mode || '',
+      installed: this.mgr.isInstalled(this.id),
+      missingBinary: this.missingBinary,
+      workDir: this.mgr.store.platformWorkDir(cfg),
+      status: this.status,
+      pid: this.pid,
+      port: cfg.port || 0,
+      startedAt: this.startedAt,
+      uptimeSec: this.startedAt ? Math.floor((Date.now() - this.startedAt) / 1000) : 0,
+      version: this.version || (cfg.updater && cfg.updater.currentVersion) || null,
+      lastExitCode: this.lastExitCode,
+      adopted: this.adopted,
+      lastError: this.lastError,
+      restartAttempts: this.restartAttempts,
+      lastHealthAt: this.lastHealthAt,
+      emptyAccounts: !!this.emptyAccounts,
+      deps: cfg.requires ? this.deps : undefined,
+      // 去掉查询串：magpie-web 的地址里带 ?k=<会话密钥>，
+// snapshot 会经 /api/platforms 与 /api/overview 直接回给前端。
+      adminPanel: typeof cfg.adminPanel === 'string' ? cfg.adminPanel.split('?')[0] : (cfg.adminPanel || null),
+    };
+  }
+
+  clearTimers() {
+    if (this.healthTimer) { clearInterval(this.healthTimer); this.healthTimer = null; }
+    if (this.restartTimer) { clearTimeout(this.restartTimer); this.restartTimer = null; }
+  }
+}
+
+// ────────────────────────── PlatformManager ──────────────────────────
+
+class PlatformManager extends EventEmitter {
+  /**
+   * @param {object} opts
+   * @param {import('./config').ConfigStore} opts.store   配置仓库
+   * @param {string} opts.dataDir    %AppData%/wanneng2api
+   * @param {string} [opts.shellRoot] 壳子根目录（解析 ../hub/hub.exe 等相对路径）
+   * @param {object} [opts.logger]   {info,warn,error}
+   * @param {boolean} [opts.allowOrphanAdopt] 预留：收养已运行实例
+   */
+  constructor({ store, dataDir, shellRoot = path.resolve(__dirname, '..'), logger, allowOrphanAdopt = false }) {
+    super();
+    this.store = store;
+    this.dataDir = dataDir;
+    this.shellRoot = shellRoot;
+    this.allowOrphanAdopt = allowOrphanAdopt;
+    this.log = logger || { info: () => {}, warn: () => {}, error: () => {} };
+    this.logsPlatformsDir = path.join(dataDir, 'logs', 'platforms');
+    fs.mkdirSync(this.logsPlatformsDir, { recursive: true });
+    this.rts = new Map();
+    this._stopping = false;
+    for (const p of store.platforms.platforms) {
+      this.rts.set(p.id, new PlatformRuntime(p.id, p, this));
+    }
+    this._cleanupUpdatingResidue();
+  }
+
+  // ── .updating 残留清理（§7.2-8 / §4.6 崩溃恢复）──
+  _cleanupUpdatingResidue() {
+    for (const p of this.store.platforms.platforms) {
+      const marker = path.join(this.dataDir, 'updates', p.id, '.updating');
+      if (!fs.existsSync(marker)) continue;
+      try {
+        const info = JSON.parse(fs.readFileSync(marker, 'utf8'));
+        this.log.warn(`[update] 发现 ${p.id} 更新残留，尝试回滚: ${JSON.stringify(info)}`);
+        if (info.backupDir && fs.existsSync(info.backupDir)) {
+          this._restoreBackup(p, info);
+        }
+        fs.unlinkSync(marker);
+      } catch (e) {
+        this.log.error(`[update] ${p.id} 残留清理失败: ${e.message}`);
+      }
+    }
+  }
+
+  _restoreBackup(platformCfg, info) {
+    const workDir = this.store.platformWorkDir(platformCfg);
+    if (info.strategy === 'replace-binary' && info.binaryPath && fs.existsSync(info.backupDir)) {
+      const files = fs.readdirSync(info.backupDir);
+      if (files.length) {
+        fs.copyFileSync(path.join(info.backupDir, files[0]), info.binaryPath);
+      }
+    } else if (info.strategy === 'replace-dir' && fs.existsSync(info.backupDir)) {
+      this._copyTree(info.backupDir, workDir, []); // 整目录回滚
+    }
+  }
+
+  _copyTree(src, dest, skipGlobs) {
+    fs.mkdirSync(dest, { recursive: true });
+    for (const name of fs.readdirSync(src)) {
+      const s = path.join(src, name);
+      const d = path.join(dest, name);
+      const rel = path.relative(src, s).replace(/\\/g, '/');
+      if (skipGlobs && skipGlobs.some((g) => simpleGlobMatch(g, rel))) continue;
+      if (fs.statSync(s).isDirectory()) this._copyTree(s, d, skipGlobs);
+      else fs.copyFileSync(s, d);
+    }
+  }
+
+  getRuntime(id) {
+    return this.rts.get(id) || null;
+  }
+
+  isInstalled(id) {
+    const rt = this.getRuntime(id);
+    if (!rt) return false;
+    const cfg = rt.cfg;
+    if (cfg.type === 'external' || cfg.managed === false) return true;
+    try {
+      if (['workbuddy', 'codearts', 'loomy', 'lingxi'].includes(id)) {
+        const root = this.store.platformWorkDir(cfg);
+        if (cfg.type === 'python-module') return fs.existsSync(path.join(root, cfg.run.module || id, '__main__.py'));
+        const binary = (cfg.run && cfg.run.binary) || '';
+        if (!binary) return false;
+        const direct = path.isAbsolute(binary) ? binary : path.join(root, binary);
+        if (fs.existsSync(direct)) return true;
+        // 导入目录可能保留 bin/ 等历史布局；只在目录内再找一层，不搜 PATH。
+        for (const name of fs.readdirSync(root)) {
+          const candidate = path.join(root, name, binary);
+          if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return true;
+        }
+        return false;
+      }
+      if (cfg.type === 'python-module') {
+        const root = this.store.platformWorkDir(cfg);
+        return fs.existsSync(path.join(root, cfg.run.module || id, '__main__.py'));
+      }
+      if (id === 'magpie-web') return !!findMagpieBinary(this.dataDir);
+      const cmd = this._resolveCommand(rt);
+      return fs.existsSync(cmd.command) || (!/[/\\]/.test(cmd.command) && !!whichSync(cmd.command));
+    } catch {
+      return false;
+    }
+  }
+
+  async waitForListening(id, timeoutMs = 30000) {
+    const rt = this.getRuntime(id);
+    if (!rt) return false;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (rt.proc && rt.cfg.port && await probePortOpen(rt.cfg.port)) return true;
+      if (!rt.proc || rt.stopping || this._stopping) return false;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    return false;
+  }
+
+  // ── 命令解析 ──
+  _resolveCommand(rt) {
+    const cfg = rt.cfg;
+    const run = cfg.run || {};
+    const workDir = this.store.platformWorkDir(cfg);
+
+    if (cfg.type === 'python-module') {
+      const py = this._resolvePython(rt);
+      const args = ['-m', run.module || cfg.id, ...(run.args || [])];
+      return { command: py, args, cwd: workDir };
+    }
+
+    let binary = run.binary || '';
+    if (!binary) throw new Error('platform run.binary 未配置');
+    let command;
+    if (path.isAbsolute(binary)) {
+      command = binary;
+    } else if (/^(\.\.[/\\]|\.\/)/.test(binary)) {
+      command = path.resolve(this.shellRoot, binary); // 相对壳子根（如 ../hub/hub.exe）
+    } else if (/[/\\]/.test(binary)) {
+      command = path.join(workDir, binary);           // 相对 workDir（如 bin/xxx.exe）
+    } else {
+      // 裸文件名：先看 workDir 里有没有（Windows 的 spawn 不搜索 cwd，
+      // 直接用裸名会 ENOENT），否则退回 PATH 查找（测试用的 node/python 等）。
+      const inWorkDir = path.join(workDir, binary);
+      command = fs.existsSync(inWorkDir) ? inWorkDir : binary;
+      if (command === binary && ['workbuddy', 'codearts', 'loomy', 'lingxi'].includes(cfg.id)
+        && fs.existsSync(workDir)) {
+        for (const name of fs.readdirSync(workDir)) {
+          const candidate = path.join(workDir, name, binary);
+          if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) { command = candidate; break; }
+        }
+      }
+      // magpie 是外部依赖，不随安装包分发：装机后它可能在 PATH、标准安装
+      // 目录，或用户自己放在数据目录。这里统一探测一次。
+      if (command === binary && /^magpie(\.exe)?$/i.test(binary)) {
+        const found = findMagpieBinary(this.store && this.store.dataDir);
+        if (found) command = found;
+      }
+    }
+    // magpie 不在预期位置时，cwd 也要跟着换成它自己的目录，否则它读不到
+    // 同目录下的资源；workDir 配置本身可能在任何机器上都不存在。
+    let cwd = workDir;
+    if (/^magpie(\.exe)?$/i.test(path.basename(command)) && path.isAbsolute(command)) {
+      const dir = path.dirname(command);
+      if (fs.existsSync(dir)) cwd = dir;
+    }
+    return { command, args: (run.args || []).slice(), cwd };
+  }
+
+  _resolvePython(rt) {
+    const run = rt.cfg.run || {};
+    const py = run.pythonPath || 'bundled';
+    const isWin = process.platform === 'win32';
+    // POSIX 上的可执行文件名不带 .exe；bundled python 里也通常没有扩展名
+    const exeNames = isWin ? ['python.exe'] : ['python3', 'python'];
+    const candidates = [];
+    if (py === 'bundled') {
+      // 打包后 resources/python/python(.exe)；开发期回落系统 python
+      for (const name of exeNames) {
+        if (process.resourcesPath) candidates.push(path.join(process.resourcesPath, 'python', name));
+        candidates.push(path.join(this.shellRoot, 'resources', 'python', name));
+      }
+    } else {
+      candidates.push(py);
+    }
+    for (const c of candidates) {
+      if (fs.existsSync(c)) return c;
+    }
+    // 回落系统解释器：Ubuntu 只提供 python3，没有 python（后者是 python-is-python3
+    // 才装）。写死 'python' 会 spawn ENOENT 且 pid=undefined，把「解释器不存在」
+    // 伪装成「平台启动失败」，排查方向完全跑偏。
+    for (const name of exeNames) {
+      if (whichSync(name)) {
+        this.log.warn(`[python] 未找到捆绑解释器，回落系统 ${name}`);
+        return name;
+      }
+    }
+    this.log.warn(`[python] 未找到任何可用解释器（试过 ${exeNames.join(' / ')}），平台将启动失败`);
+    return exeNames[0];
+  }
+
+  _buildEnv(rt) {
+    const cfg = rt.cfg;
+    const env = { ...process.env };
+    // 参考 AAR backendEnv：清代理变量，防系统代理污染环回/上游
+    for (const k of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']) {
+      delete env[k];
+    }
+    env.NO_PROXY = '*';
+    env.no_proxy = '*';
+    const extra = (cfg.run && cfg.run.env) || {};
+    for (const [k, v] of Object.entries(extra)) env[k] = v;
+    // sub2api 依赖注入（§8.2-4）：影子进程用 manager.json sub2api 段的端口
+    if (Array.isArray(cfg.requires) && cfg.requires.includes('pg')) {
+      const m = this.store.manager.sub2api || {};
+      env.DATABASE_URL = this.buildDatabaseUrl();
+      env.PGPORT = String(m.pgPort || 5433);
+    }
+    if (Array.isArray(cfg.requires) && cfg.requires.includes('redis')) {
+      const m = this.store.manager.sub2api || {};
+      env.REDIS_HOST = '127.0.0.1';
+      env.REDIS_PORT = String(m.redisPort || 6380);
+    }
+    return env;
+  }
+
+  // ── 健康探针 ──
+  /**
+   * 健康探测。返回 { ok, emptyAccounts }。
+   *
+   * 空账号池不是故障：workbuddy / lingxi 无账号时 /healthz 返回
+   * 503 {"healthy":0,"total":0}，loomy 返回 200 但 accounts 为 0。
+   * 进程本身正常，只是在等用户加账号；单独标出来，前端据此显示
+   * 「待添加账号」而不是「异常」。
+   */
+  _probeHealth(url, timeoutSec) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (ok, emptyAccounts = false) => {
+        if (!settled) { settled = true; resolve({ ok, emptyAccounts }); }
+      };
+      const req = http.get(url, { timeout: Math.max(1, timeoutSec) * 1000 }, (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => { if (body.length < 4096) body += c; });
+        res.on('end', () => {
+          const empty = isEmptyPoolBody(body);
+          // 空账号池时网关按语义回 503（healthy:0/total:0）；进程与端口都正常，
+          // 不该判成故障。其余 5xx 仍然算失败。
+          const ok = (res.statusCode >= 200 && res.statusCode < 500)
+            || (res.statusCode === 503 && empty);
+          done(ok, empty);
+        });
+        res.on('error', () => done(false));
+      });
+      req.on('timeout', () => { req.destroy(); done(false); });
+      req.on('error', () => done(false));
+    });
+  }
+
+  /**
+   * 存活探针：只要端口上有人回 HTTP 就算活，不管状态码。
+   * 用于判定"这个端口上的实例是不是该平台自己"（收养用）。
+   * 与 _probeHealth 的区别：灵犀无账号时 /healthz 返回 503
+   * （语义是"上游不可服务"，但进程确实在跑），健康判据会判不健康，
+   * 而收养只需要确认进程活着。
+   */
+  _probeAlive(url, timeoutSec, expect) {
+    return new Promise((resolve) => {
+      let settled = false;
+      let watchdog = null;
+      let req = null;
+      const done = (ok) => {
+        if (settled) return;
+        settled = true;
+        if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+        try { req.destroy(); } catch { /* 已关闭 */ }
+        resolve(ok);
+      };
+
+      // 关键：端口上可能是任意 TCP 服务（比如测试里裸 net.createServer），
+      // 它接受连接却永远不发响应。只靠 req 的 timeout 不够 —— 那管的是
+      // socket 空闲，而对方有时会持续发点什么；必须再加一个总时限，
+      // 否则整个 start() 会挂死在这里。
+      const budgetMs = Math.max(1000, Math.max(1, timeoutSec) * 1000);
+      // agent:false + Connection: close：不复用连接、响应后立刻断开。
+      // 否则 keep-alive 的 socket 会留在池里，占用方 close() 时等它，
+      // 探活就把别人的关闭卡住了（测试里实测会永久挂起）。
+      req = http.get(url, {
+        timeout: budgetMs,
+        agent: false,
+        headers: { Connection: 'close' },
+      }, (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => {
+          if (body.length < 4096) body += c;
+        });
+        res.on('end', () => {
+          // 任何 HTTP 响应都证明端口上有人；但"是不是本平台"还要看响应内容，
+          // 否则端口被别的程序占用时会被误认成该平台。
+          if (!expect || !expect.length) return done(true);
+          const hay = `${res.headers['content-type'] || ''} ${body}`.toLowerCase();
+          // 空账号池的 503 说明进程在跑（只是没账号），仍应被收养。
+          const statusOk = res.statusCode < 500 || (res.statusCode === 503 && isEmptyPoolBody(body));
+          done(statusOk && expect.some((f) => hay.includes(String(f).toLowerCase())));
+        });
+        res.on('error', () => done(false));
+      });
+      watchdog = setTimeout(() => done(false), budgetMs);
+      req.on('timeout', () => done(false));
+      req.on('error', () => done(false));
+    });
+  }
+
+  /**
+   * 系统唤醒后的恢复：重置健康计数并延迟重新探测。
+   * **不 start/spawn**：进程存在就复用，进程已退出交给既有的 exit 重启逻辑。
+   */
+  handleResume({ delayMs = 3000 } = {}) {
+    let scheduled = 0;
+    for (const rt of this.rts.values()) {
+      rt.failCount = 0;
+      rt.okCount = 0;
+      if (rt.healthTimer) { clearInterval(rt.healthTimer); rt.healthTimer = null; }
+      if (rt.resumeTimer) clearTimeout(rt.resumeTimer);
+      if (this._stopping || rt.stopping || ['stopped', 'error', 'updating'].includes(rt.status)) continue;
+      if (!rt.adopted && !rt.proc) continue;
+      rt.resumeTimer = setTimeout(() => {
+        rt.resumeTimer = null;
+        if (this._stopping || rt.stopping) return;
+        if (rt.adopted) this._scheduleAdoptedTimer(rt);
+        else if (rt.proc) this._scheduleHealthTimer(rt);
+      }, delayMs);
+      scheduled++;
+    }
+    return { scheduled };
+  }
+
+  _scheduleHealthTimer(rt) {
+    if (rt.healthTimer) clearInterval(rt.healthTimer);
+    // 收养来的实例没有子进程，_healthTick 的 `!rt.proc` 早退会跳过它，
+    // 导致进程死了也一直显示 healthy。这类走独立探活。
+    if (rt.adopted) return this._scheduleAdoptedTimer(rt);
+    const h = rt.cfg.health || {};
+    const iv = Math.max(0.5, Number(h.intervalSec) || 15) * 1000;
+    rt.healthTimer = setInterval(() => this._healthTick(rt), iv);
+    this._healthTick(rt);
+  }
+
+  /** 收养实例的存活巡检（只探活，不重启 —— 进程不归我们管） */
+  _scheduleAdoptedTimer(rt) {
+    const h = rt.cfg.health || {};
+    const iv = Math.max(1, Number(h.intervalSec) || 15) * 1000;
+    const tick = async () => {
+      if (this._stopping || rt.stopping || ['stopped', 'updating'].includes(rt.status)) return;
+      const probe = await this._probeHealth(
+        h.url || `http://127.0.0.1:${rt.cfg.port}/`,
+        Number(h.timeoutSec) || 3,
+      );
+      rt.lastHealthAt = Date.now();
+      rt.emptyAccounts = !!probe.emptyAccounts;
+      if (!probe.ok && rt.status === 'healthy') {
+        rt.setStatus('unhealthy', '承载的外部实例已不可达（该进程不归壳管理）');
+      } else if (probe.ok && rt.status === 'unhealthy') {
+        rt.setStatus('healthy');
+      }
+    };
+    rt.healthTimer = setInterval(tick, iv);
+    tick();
+  }
+
+  async _healthTick(rt) {
+    if (this._stopping || rt.stopping || !rt.proc) return;
+    if (['stopped', 'error', 'updating'].includes(rt.status)) return;
+    const h = rt.cfg.health || {};
+    const probe = await this._probeHealth(h.url || `http://127.0.0.1:${rt.cfg.port}/`, Number(h.timeoutSec) || 3);
+    rt.lastHealthAt = Date.now();
+    rt.emptyAccounts = !!probe.emptyAccounts;
+    if (probe.ok) {
+      rt.failCount = 0;
+      rt.okCount += 1;
+      const okT = Math.max(1, Number(h.okThreshold) || 1);
+      if (['starting', 'degraded', 'unhealthy'].includes(rt.status) && rt.okCount >= okT) {
+        rt.setStatus('healthy');
+      }
+    } else {
+      rt.okCount = 0;
+      rt.failCount += 1;
+      if (rt.status === 'starting') return; // 启动宽限期内不降级
+      const ft = Math.max(1, Number(h.failThreshold) || 3);
+      if (rt.status === 'healthy' && rt.failCount >= ft) {
+        rt.setStatus('degraded', `健康连续失败 ${rt.failCount} 次`);
+      } else if (rt.status === 'degraded' && rt.failCount >= ft * 2) {
+        rt.setStatus('unhealthy', `健康持续失败 ${rt.failCount} 次`);
+      }
+    }
+  }
+
+  /** 等待首次健康通过（start 内使用，超时返回 false 不抛错） */
+  async _waitForFirstHealth(rt, timeoutSec) {
+    const h = rt.cfg.health || {};
+    const deadline = Date.now() + Math.max(5, timeoutSec) * 1000;
+    while (Date.now() < deadline && rt.proc && !rt.stopping && !this._stopping) {
+      const probe = await this._probeHealth(h.url || `http://127.0.0.1:${rt.cfg.port}/`, Number(h.timeoutSec) || 3);
+      if (probe.ok) {
+        rt.emptyAccounts = !!probe.emptyAccounts;
+        rt.failCount = 0;
+        rt.okCount = Math.max(rt.okCount, 1);
+        return true;
+      }
+      if (!rt.proc) return false; // 进程已退出，走 crash 分支
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    return false;
+  }
+
+  _startTimeoutSec(rt) {
+    const cfg = rt.cfg;
+    if (Array.isArray(cfg.requires) && cfg.requires.length) return 600; // sub2api 首次迁移最长 10min
+    return 120;
+  }
+
+  // ── 启动 ──
+  /**
+   * @param {object} [opts]
+   * @param {boolean} [opts.forUpdate] 更新流程内部重启（替换完文件后要把平台
+   *   拉起来）。平台原本没在运行时，更新期间状态一直是 updating，这条守卫
+   *   会把更新自己的重启挡掉——「平台更新中，禁止启动」。只给 updater 用。
+   */
+  async start(id, { force = false, forUpdate = false, waitForHealth = true } = {}) {
+    const rt = this.getRuntime(id);
+    if (!rt) throw new Error(`未知平台: ${id}`);
+    const cfg = rt.cfg;
+    if (rt.status === 'updating' && !forUpdate) throw new Error('平台更新中，禁止启动');
+    if (rt.proc && !rt.stopping) throw new Error('平台已在运行');
+    if (cfg.enabled === false) throw new Error('平台已禁用，请先 enable');
+
+    rt.stopping = false;
+    rt.clearTimers();
+    rt.lastError = '';
+    rt.failCount = 0;
+    rt.okCount = 0;
+    rt.missingBinary = false;
+
+    // 0. 外部托管平台（如 magpie）：壳不启动它，只探测存活并反映到状态灯。
+    //    它的生命周期由应用自身/系统托盘负责，壳无权启停。
+    if (cfg.type === 'external' || cfg.managed === false) {
+      rt.setStatus('starting');
+      const h = cfg.health || {};
+      const probe = () =>
+        this._probeHealth(h.url || `http://127.0.0.1:${cfg.port}/`, Number(h.timeoutSec) || 3);
+      const p0 = await probe().catch(() => ({ ok: false, emptyAccounts: false }));
+      rt.emptyAccounts = !!p0.emptyAccounts;
+      rt.setStatus(p0.ok ? 'healthy' : 'unhealthy', p0.ok ? '' : '外部服务未运行（由该应用自己启动）');
+      // 外部平台没有子进程，用独立定时器轮询存活（_healthTick 依赖 rt.proc）。
+      const iv = Math.max(1, Number(h.intervalSec) || 20) * 1000;
+      if (rt.healthTimer) clearInterval(rt.healthTimer);
+      rt.healthTimer = setInterval(async () => {
+        if (rt.stopping || rt.status === 'stopped') return;
+        const alive = await probe().catch(() => false);
+        rt.lastHealthAt = Date.now();
+        if (alive && rt.status !== 'healthy') rt.setStatus('healthy');
+        else if (!alive && rt.status === 'healthy') {
+          rt.setStatus('unhealthy', '外部服务已停止（由该应用自己启动）');
+        }
+      }, iv);
+      return rt.snapshot();
+    }
+
+    // 1. 端口预检
+    if (cfg.port) {
+      const { free, pid } = await checkPortFree(cfg.port, rt.pid);
+      if (!free) {
+        // 端口已被占用：先判断是不是该平台自己的实例（用户手动启动、
+        // 或上一次壳退出时没带走）。健康端点通过就"收养"它，只托管不重启。
+        const h = cfg.health || {};
+        // 用存活探针而非健康探针：灵犀无账号时健康端点返回 503，
+        // 但进程确实在跑，应当收养而不是判成冲突。
+        // adoptHints 用来确认"端口上这个程序确实是它"，避免把别的服务认错。
+        const adoptable = await this._probeAlive(
+          h.url || `http://127.0.0.1:${cfg.port}/`,
+          Number(h.timeoutSec) || 3,
+          Array.isArray(cfg.adoptHints) ? cfg.adoptHints : null,
+        ).catch(() => false);
+        if (adoptable) {
+          // 端口上确实是该平台自己的实例：优先收养。
+          // **即使 force 也收养**——force 的语义是「结束占着端口的别人」，
+          // 不是「杀掉用户自己启动的本平台进程」。后者不归壳管，
+          // 杀了等于替用户终止他正在用的服务（曾经真实发生过）。
+          rt.adopted = true;
+          rt.pid = pid || 0;
+          rt.startedAt = Date.now();
+          rt.lastError = '';
+          rt.setStatus('healthy');
+          rt.appendLog('manager', `收养已运行实例（端口 ${cfg.port}，PID ${pid || '未知'}）`
+            + (force ? '；force 只结束非本平台进程，故不重启它' : ''));
+          this._scheduleHealthTimer(rt);
+          return rt.snapshot();
+        }
+        // 用户显式要求强制启动：结束占用者再继续
+        if (force && pid) {
+          rt.appendLog('manager', `强制启动：结束占用端口 ${cfg.port} 的进程 PID ${pid}`);
+          await taskkillTree(pid).catch(() => {});
+          // 等端口真正释放（最多 5s）
+          for (let i = 0; i < 20; i++) {
+            await new Promise((r) => setTimeout(r, 250));
+            const again = await checkPortFree(cfg.port, rt.pid);
+            if (again.free) break;
+          }
+          const after = await checkPortFree(cfg.port, rt.pid);
+          if (!after.free) {
+            const msg = `port-conflict: 已尝试结束 PID ${pid}，端口 ${cfg.port} 仍被占用`;
+            rt.setStatus('error', msg);
+            throw new Error(msg);
+          }
+          rt.appendLog('manager', `端口 ${cfg.port} 已释放，继续启动`);
+        } else {
+          const msg = `port-conflict: 端口 ${cfg.port} 已被 PID ${pid} 占用（非本平台进程）`;
+          rt.setStatus('error', msg);
+          throw new Error(msg);
+        }
+        // force 且不是本平台实例：才会走到 taskkill 分支（见上）
+      }
+    }
+
+    // 2. 依赖编排（sub2api: pg → redis）
+    if (Array.isArray(cfg.requires) && cfg.requires.length) {
+      try {
+        await this._startDeps(rt);
+      } catch (e) {
+        rt.setStatus('error', `依赖启动失败: ${e.message}`);
+        await this._stopDeps(rt).catch(() => {});
+        throw e;
+      }
+    }
+
+    // 3. spawn
+    let cmd;
+    try {
+      cmd = this._resolveCommand(rt);
+    } catch (e) {
+      rt.setStatus('error', e.message);
+      throw e;
+    }
+    // 裸文件名（wb2api.exe / codearts2api-panel.exe）也要校验：spawn 找不到时
+// 只发 error 事件、不触发 exit，过去会先空等 120s 健康检查再报“unhealthy”，
+// 用户看到的是超时而不是“文件不存在”。
+    // 解释器（node / python / python3…）由 _resolvePython 单独解析，
+// 这里不重复判断——但也不能因此整段跳过对「裸名是否存在于 PATH」的检查。
+    const isInterpreter = /^(node|python[0-9.]*|py)$/i.test(path.basename(cmd.command));
+    if (!isInterpreter) {
+      // 裸名（wb2api / wb2api.exe）：_resolveCommand 已优先取 workDir 下的
+      // 绝对路径，仍是裸名说明 workDir 里没有，可能命中 PATH。
+      const exists = fs.existsSync(cmd.command) || (!/[/\\]/.test(cmd.command) && !!whichSync(cmd.command));
+      // 只要确认不存在就直接报「文件不存在」。旧写法额外要求名字像可执行文件
+      // （.exe/.bat 或含路径），那是 Windows 视角：POSIX 上的裸名 wb2api 不带
+      // 扩展名，会漏判 → 静默进 spawn → 空等健康检查超时，报错方向完全错。
+      // exists 已经把「绝对路径存在」和「裸名能在 PATH 找到」都算进去了，
+      // 所以只要 !exists 就是真找不到。
+      if (!exists) {
+        const msg = `可执行文件不存在: ${cmd.command}（工作目录 ${cmd.cwd}）。请先安装或导入该网关`;
+        rt.missingBinary = ['workbuddy', 'codearts', 'loomy', 'lingxi'].includes(id) && !this.isInstalled(id);
+        rt.setStatus('error', msg);
+        throw new Error(msg);
+      }
+      // POSIX 下还要有执行位，否则 spawn 会 EACCES 而不是给「文件不存在」
+      if (exists && process.platform !== 'win32' && path.isAbsolute(cmd.command)) {
+        try {
+          fs.accessSync(cmd.command, fs.constants.X_OK);
+        } catch {
+          const msg = `可执行文件没有执行权限: ${cmd.command}（请 chmod +x）`;
+          rt.setStatus('error', msg);
+          throw new Error(msg);
+        }
+      }
+    }
+
+    rt.setStatus('starting');
+    rt.appendLog('manager', `spawn: "${cmd.command}" ${cmd.args.join(' ')} (cwd=${cmd.cwd})`);
+    let proc;
+    try {
+      proc = spawn(cmd.command, cmd.args, {
+        cwd: cmd.cwd,
+        env: this._buildEnv(rt),
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        // POSIX 下让子进程自成进程组（pgid == pid），taskkillTree 才能用
+        // kill(-pid) 把整棵子树带走。Windows 不用这个（有 taskkill /T）。
+        ...(process.platform === 'win32' ? {} : { detached: true }),
+      });
+    } catch (e) {
+      rt.setStatus('error', `spawn 失败: ${e.message}`);
+      await this._stopDeps(rt).catch(() => {});
+      throw e;
+    }
+
+    rt.proc = proc;
+    rt.pid = proc.pid;
+    rt.startedAt = Date.now();
+    this.log.info(`[platform:${id}] spawned pid=${proc.pid}`);
+
+    proc.stdout.setEncoding('utf8');
+    proc.stderr.setEncoding('utf8');
+    proc.stdout.on('data', (d) => { for (const line of d.split(/\r?\n/)) if (line.trim()) rt.appendLog('out', line); });
+    proc.stderr.on('data', (d) => { for (const line of d.split(/\r?\n/)) if (line.trim()) rt.appendLog('err', line); });
+
+    proc.on('error', (e) => {
+      // spawn 失败（如 ENOENT：解释器/二进制不存在）只走这里，不会触发 exit。
+      // 旧实现只写一行日志，状态仍停在 starting，界面表现为「一直在启动」
+      // 直到 120s 健康检查超时——用户看到的是超时，而不是「文件不存在」。
+      rt.appendLog('manager', `process error: ${e.message}`);
+      rt.proc = null;
+      rt.pid = 0;
+      if (rt.healthTimer) { clearInterval(rt.healthTimer); rt.healthTimer = null; }
+      if (rt.resumeTimer) { clearTimeout(rt.resumeTimer); rt.resumeTimer = null; }
+      if (rt.status === 'starting') rt.setStatus('error', `进程启动失败: ${e.message}`);
+    });
+
+    // 4. 意外退出 → 指数退避自动重启
+    proc.on('exit', (code) => {
+      const wasStopping = rt.stopping;
+      rt.proc = null;
+      rt.pid = 0;
+      rt.lastExitCode = code;
+      if (rt.healthTimer) { clearInterval(rt.healthTimer); rt.healthTimer = null; }
+      if (rt.resumeTimer) { clearTimeout(rt.resumeTimer); rt.resumeTimer = null; }
+      rt.appendLog('manager', `exit code=${code} stopping=${wasStopping}`);
+      if (wasStopping || this._stopping || rt.missingBinary) {
+        rt.setStatus(rt.missingBinary ? 'error' : 'stopped');
+        return;
+      }
+      // crash 分支
+      const r = cfg.restart || {};
+      const base = Math.max(0.2, Number(r.baseBackoffSec) || 2);
+      const maxB = Math.max(base, Number(r.maxBackoffSec) || 300);
+      const maxRetries = Number(r.maxRetries) || 0; // 0 = 无限
+      if (maxRetries > 0 && rt.restartAttempts >= maxRetries) {
+        rt.setStatus('error', `进程退出(code=${code})，已达最大重试次数 ${maxRetries}`);
+        return;
+      }
+      const delay = Math.min(base * Math.pow(2, rt.restartAttempts), maxB);
+      rt.restartAttempts += 1;
+      rt.setStatus('error', `进程意外退出(code=${code})，${delay.toFixed(1)}s 后自动重启（第 ${rt.restartAttempts} 次）`);
+      rt.restartTimer = setTimeout(() => {
+        rt.restartTimer = null;
+        if (rt.stopping || this._stopping) return;
+        this.start(id).catch((e) => this.log.error(`[platform:${id}] 重启失败: ${e.message}`));
+      }, delay * 1000);
+    });
+
+    // 5. 等待首次健康；首次安装只要求监听，空账号池的 503 不算安装失败。
+    if (!waitForHealth) {
+      this._scheduleHealthTimer(rt);
+      return rt.snapshot();
+    }
+    const ok = await this._waitForFirstHealth(rt, this._startTimeoutSec(rt));
+    if (rt.proc && ok) {
+      rt.setStatus('healthy');
+    } else if (rt.proc && !ok) {
+      rt.setStatus('unhealthy', `启动后 ${this._startTimeoutSec(rt)}s 内健康检查未通过（进程仍在，继续巡检）`);
+    }
+    this._scheduleHealthTimer(rt);
+    return rt.snapshot();
+  }
+
+  // ── 优雅停止 ──
+  /**
+   * @param {object} [opts]
+   * @param {boolean} [opts.forUpdate] 更新流程内部停止。更新必须先把自己标成
+   *   updating（挡住用户的手动启停），随后又要停掉旧进程才能替换文件——
+   *   那条「更新中禁止停止」的守卫会把它自己挡住，导致下载完成后永远装不上
+   *   （实测：下载 14.8MB 成功 → 「失败于安装前: 平台更新中，禁止停止」，
+   *   于是每次检查都还是「有新版」）。这个开关只给 updater 用，外部调用
+   *   一律不给，手动停仍然被守卫挡住。
+   */
+  async stop(id, { timeoutMs = 3000, forUpdate = false } = {}) {
+    const rt = this.getRuntime(id);
+    if (!rt) throw new Error(`未知平台: ${id}`);
+    if (rt.status === 'updating' && !forUpdate) throw new Error('平台更新中，禁止停止');
+    // 外部托管平台不归壳管，stop 只停止探测，不碰对方进程。
+    if (rt.cfg.type === 'external' || rt.cfg.managed === false) {
+      rt.clearTimers();
+      rt.proc = null;
+      rt.pid = 0;
+      rt.setStatus('stopped');
+      return rt.snapshot();
+    }
+    // 收养来的实例不是我们 spawn 的：只停止托管，不杀用户自己开的进程。
+    if (rt.adopted) {
+      rt.stopping = true;
+      rt.clearTimers();
+      rt.adopted = false;
+      rt.proc = null;
+      rt.pid = 0;
+      rt.startedAt = 0;
+      rt.failCount = 0;
+      rt.okCount = 0;
+      rt.stopping = false;
+      rt.appendLog('manager', '停止托管收养实例（进程未终止，仍由你自行管理）');
+      rt.setStatus('stopped');
+      return rt.snapshot();
+    }
+    rt.stopping = true;
+    rt.clearTimers();
+
+    const proc = rt.proc;
+    if (proc) {
+      await new Promise((resolve) => {
+        let done = false;
+        const finish = () => { if (!done) { done = true; resolve(); } };
+        proc.once('exit', finish);
+        try { proc.kill(); } catch (_e) { finish(); }
+        setTimeout(async () => {
+          if (!done && proc.pid) {
+            rt.appendLog('manager', `优雅退出超时 ${timeoutMs}ms，taskkill 强杀进程树`);
+            await taskkillTree(proc.pid);
+            finish();
+          }
+        }, timeoutMs);
+      });
+    }
+    rt.proc = null;
+    rt.pid = 0;
+    rt.startedAt = 0;
+    rt.failCount = 0;
+    rt.okCount = 0;
+
+    // 依赖反序停止（server.exe → redis → pg）
+    if (Array.isArray(rt.cfg.requires) && rt.cfg.requires.length) {
+      await this._stopDeps(rt);
+    }
+    rt.stopping = false;
+    if (rt.status !== 'stopped') rt.setStatus('stopped');
+    return rt.snapshot();
+  }
+
+  async restart(id, { force = false } = {}) {
+    await this.stop(id);
+    await new Promise((r) => setTimeout(r, 300)); // 让端口完全释放
+    return this.start(id, { force });
+  }
+
+  enable(id) {
+    const p = this.store.getPlatform(id);
+    if (!p) throw new Error(`未知平台: ${id}`);
+    this.store.updatePlatform(id, { enabled: true });
+    return { id, enabled: true };
+  }
+
+  disable(id) {
+    const p = this.store.getPlatform(id);
+    if (!p) throw new Error(`未知平台: ${id}`);
+    this.store.updatePlatform(id, { enabled: false });
+    const rt = this.getRuntime(id);
+    if (rt && rt.proc) {
+      // 异步停止，不阻塞响应
+      this.stop(id).catch((e) => this.log.error(`[platform:${id}] disable 停止失败: ${e.message}`));
+    }
+    return { id, enabled: false };
+  }
+
+  tailLogs(id, n = 200) {
+    const rt = this.getRuntime(id);
+    if (!rt) throw new Error(`未知平台: ${id}`);
+    return rt.ring.tail(n);
+  }
+
+  onLog(id, fn) {
+    const rt = this.getRuntime(id);
+    if (!rt) return () => {};
+    rt.ring.on('line', fn);
+    return () => rt.ring.off('line', fn);
+  }
+
+  statusList() {
+    return [...this.rts.values()].map((rt) => rt.snapshot());
+  }
+
+  statusOf(id) {
+    const rt = this.getRuntime(id);
+    return rt ? rt.snapshot() : null;
+  }
+
+  /** 启动 autoStartPlatforms（按 manager.json 顺序） */
+  async startAutoStart() {
+    const list = (this.store.manager.general && this.store.manager.general.autoStartPlatforms) || [];
+    const delaySec = Number(this.store.manager.general && this.store.manager.general.autoStartDelaySec) || 0;
+    // 并行启动：start() 会等到平台健康（最长 120s），串行时一个起不来的平台
+    // 会把后面所有的都堵住（例如 lingxi 无账号时健康检查一直不过，
+    // 排在它后面的 magpie-web 就永远轮不到）。
+    await Promise.all(list.map(async (id) => {
+      const rt = this.getRuntime(id);
+      if (!rt) return;
+      if (rt.cfg.enabled === false) return;
+      if (['workbuddy', 'codearts', 'loomy', 'lingxi'].includes(id) && !this.isInstalled(id)) return;
+      if (delaySec > 0) await new Promise((r) => setTimeout(r, delaySec * 1000));
+      try {
+        await this.start(id);
+      } catch (e) {
+        this.log.error(`[platform:${id}] 自启失败: ${e.message}`);
+      }
+    }));
+  }
+
+  /** 反序停止全部（托盘退出用） */
+  async stopAll() {
+    this._stopping = true;
+    const ids = [...this.rts.keys()].reverse(); // platforms.json 顺序的反序
+    for (const id of ids) {
+      const rt = this.getRuntime(id);
+      if (rt && (rt.proc || rt.status !== 'stopped')) {
+        try { await this.stop(id); } catch (e) { this.log.error(`[platform:${id}] stopAll 失败: ${e.message}`); }
+      }
+    }
+    this._stopping = false;
+  }
+
+  // ══════════════════ sub2api 依赖编排（§8）══════════════════
+  //
+  // PG/Redis 是影子进程：不进平台列表，状态挂在 sub2api 卡片（deps 三圆点）。
+  // 目录：%AppData%/wanneng2api/deps/pg15 与 deps/redis（启用 sub2api 时部署）。
+
+  _sub2apiPaths(rt) {
+    const m = this.store.manager.sub2api || {};
+    const depsDir = path.join(this.dataDir, 'deps');
+    const pgBin = path.join(depsDir, 'pg15', 'bin');
+    const redisBin = path.join(depsDir, 'redis');
+    const dataRoot = m.dataDir ? this.store.platformWorkDir({ workDir: m.dataDir })
+      : path.join(this.dataDir, 'platforms', 'sub2api');
+    const pgData = path.join(dataRoot, 'pgdata');
+    // 依赖可执行解析：优先 .exe（正式部署），回落 .cmd（便携 shim / 测试桩）
+    const pgBinDir = pgData ? path.dirname(path.dirname(pgData)) : '';
+    void pgBinDir;
+    return {
+      pgPort: Number(m.pgPort) || 5433,
+      redisPort: Number(m.redisPort) || 6380,
+      pgData,
+      pgBoot: this._depResolve(path.join(pgBin, 'pg_ctl')),
+      pgInit: this._depResolve(path.join(pgBin, 'initdb')),
+      pgIsReady: this._depResolve(path.join(pgBin, 'pg_isready')),
+      pgCreatedb: this._depResolve(path.join(pgBin, 'createdb')),
+      pgPsql: this._depResolve(path.join(pgBin, 'psql')),
+      redisExe: this._depResolve(path.join(redisBin, 'redis-server')),
+    };
+  }
+
+  /** 依赖可执行解析：base.exe → base.cmd → null */
+  _depResolve(base) {
+    for (const ext of ['.exe', '.cmd', '.bat']) {
+      if (fs.existsSync(base + ext)) return base + ext;
+    }
+    return null;
+  }
+
+  /** spawn 依赖程序（.cmd/.bat 需经 cmd.exe，Node ≥20 安全策略禁止直接 spawn） */
+  _depSpawn(exe, args, opts = {}) {
+    if (/\.(cmd|bat)$/i.test(exe)) {
+      const cmdline = `"${exe}" ${args.map((a) => this._quoteArg(a)).join(' ')}`;
+      return spawn(cmdline, [], {
+        shell: true, windowsHide: true, stdio: opts.stdio || 'ignore',
+        env: opts.env || process.env, detached: !!opts.detached,
+      });
+    }
+    return spawn(exe, args, {
+      windowsHide: true, stdio: opts.stdio || 'ignore', env: opts.env || process.env,
+      detached: !!opts.detached,
+    });
+  }
+
+  _ensureDbPassword() {
+    const m = this.store.manager;
+    m.sub2api = m.sub2api || {};
+    if (!m.sub2api.dbPassword) {
+      m.sub2api.dbPassword = randomHex(12);
+      this.store.saveManager();
+      this.log.info('[sub2api] 已生成随机数据库密码并写入 manager.json');
+    }
+    return m.sub2api.dbPassword;
+  }
+
+  _quoteArg(a) {
+    return /[\s"]/.test(a) ? `"${String(a).replace(/"/g, '""')}"` : String(a);
+  }
+
+  _runFile(cmd, args, { timeoutMs = 60000, env } = {}) {
+    // .cmd/.bat 须经 cmd.exe（Node ≥20 安全策略禁止直接 execFile）。
+    // exec() 本身走 cmd /d /s /c "<整串>"，引号语义可控。
+    if (/\.(cmd|bat)$/i.test(cmd)) {
+      const cmdline = `"${cmd}" ${args.map((a) => this._quoteArg(a)).join(' ')}`;
+      return new Promise((resolve) => {
+        exec(cmdline, { windowsHide: true, timeout: timeoutMs, env: env || process.env },
+          (err, stdout, stderr) => resolve({ err, stdout, stderr }));
+      });
+    }
+    return new Promise((resolve) => {
+      execFile(cmd, args, { windowsHide: true, timeout: timeoutMs, env: env || process.env },
+        (err, stdout, stderr) => resolve({ err, stdout, stderr }));
+    });
+  }
+
+  async _startDeps(rt) {
+    const p = this._sub2apiPaths(rt);
+    const password = this._ensureDbPassword();
+    const env = { ...process.env, PGPASSWORD: password, PGDATA_STUB: p.pgData };
+
+    // ── 1. PostgreSQL：initdb（首次）→ spawn → pg_isready 轮询 60s ──
+    if (!p.pgBoot) {
+      throw new Error('未找到便携 PostgreSQL（deps/pg15/bin/pg_ctl.exe），请将 PG15 免安装版部署到 deps/pg15');
+    }
+    if (!fs.existsSync(p.pgData)) {
+      if (!p.pgInit) throw new Error('未找到 initdb（deps/pg15/bin/initdb.exe）');
+      rt.appendLog('manager', '[deps/pg] 首次初始化 initdb ...');
+      const pwFile = this._writePwFile(password);
+      const r = await this._runFile(p.pgInit, ['-D', p.pgData, '-U', 'wanneng', '-E', 'UTF8', '-A', 'scram-sha-256',
+        `--pwfile=${pwFile}`], { timeoutMs: 120000, env });
+      try { fs.unlinkSync(pwFile); } catch (_e) { /* ignore */ }
+      if (r.err) throw new Error(`initdb 失败: ${r.stderr || r.err.message}`);
+      // 最小 postgresql.conf
+      fs.appendFileSync(path.join(p.pgData, 'postgresql.conf'),
+        `\nport = ${p.pgPort}\nlisten_addresses = '127.0.0.1'\nmax_connections = 50\n`);
+    }
+    if (!fs.existsSync(path.join(p.pgData, 'postgresql.conf'))) {
+      throw new Error(`pgdata 缺少 postgresql.conf: ${p.pgData}`);
+    }
+    rt.appendLog('manager', `[deps/pg] spawn postgres -p ${p.pgPort}`);
+    const pgProc = this._depSpawn(p.pgBoot, ['start', '-D', p.pgData, '-w', '-t', '60'], {
+      stdio: 'ignore', env,
+    });
+    rt.deps.pg = { status: 'starting', pid: pgProc.pid };
+
+    // pg_ctl start 在 Windows 下会 spawn postgres 子进程后退出；用 pg_isready 轮询就绪
+    let pgReady = false;
+    for (let i = 0; i < 60 && p.pgIsReady; i++) {
+      const r = await this._runFile(p.pgIsReady, ['-h', '127.0.0.1', '-p', String(p.pgPort)], { timeoutMs: 5000, env });
+      if (!r.err && /accepting connections/i.test(r.stdout || '')) { pgReady = true; break; }
+      await new Promise((res) => setTimeout(res, 1000));
+    }
+    if (!pgReady) {
+      rt.deps.pg = { status: 'unhealthy', pid: 0 };
+      throw new Error('pg_isready 60s 内未就绪');
+    }
+    // 确保 sub2api 数据库存在
+    await this._ensureDb(p, env);
+    rt.deps.pg = { status: 'healthy', pid: pgProc.pid };
+
+    // ── 2. Redis：spawn → PING 探活 30s ──
+    if (!p.redisExe) {
+      throw new Error('未找到便携 Redis（deps/redis/redis-server.exe），请部署到 deps/redis');
+    }
+    rt.appendLog('manager', `[deps/redis] spawn redis-server --port ${p.redisPort}`);
+    const redisProc = this._depSpawn(p.redisExe,
+      ['--port', String(p.redisPort), '--bind', '127.0.0.1', '--save', '', '--appendonly', 'no'], {
+        stdio: 'ignore', env: this._buildEnv(rt),
+      });
+    rt.deps.redis = { status: 'starting', pid: redisProc.pid };
+    let redisOk = false;
+    for (let i = 0; i < 30; i++) {
+      redisOk = await this._redisPing(p.redisPort);
+      if (redisOk) break;
+      await new Promise((res) => setTimeout(res, 1000));
+    }
+    if (!redisOk) {
+      rt.deps.redis = { status: 'unhealthy', pid: 0 };
+      throw new Error('Redis PING 30s 内未就绪');
+    }
+    rt.deps.redis = { status: 'healthy', pid: redisProc.pid };
+    this._depProcs = this._depProcs || new Map();
+    this._depProcs.set(rt.id, { pg: pgProc, redis: redisProc, paths: p });
+  }
+
+  _writePwFile(password) {
+    const f = path.join(this.dataDir, '.pgpw.tmp');
+    fs.writeFileSync(f, password + '\n');
+    return f;
+  }
+
+  async _ensureDb(p, env) {
+    if (!p.pgPsql) return; // 无 psql 时跳过建库（真实部署必有）
+    const q = await this._runFile(p.pgPsql,
+      ['-h', '127.0.0.1', '-p', String(p.pgPort), '-U', 'wanneng', '-d', 'postgres', '-tAc',
+        "SELECT 1 FROM pg_database WHERE datname='sub2api'"], { timeoutMs: 10000, env });
+    if (!q.err && String(q.stdout).trim() !== '1' && p.pgCreatedb) {
+      await this._runFile(p.pgCreatedb, ['-h', '127.0.0.1', '-p', String(p.pgPort), '-U', 'wanneng', 'sub2api'],
+        { timeoutMs: 15000, env });
+    }
+  }
+
+  _redisPing(port) {
+    return new Promise((resolve) => {
+      const sock = net.connect({ host: '127.0.0.1', port });
+      let buf = '';
+      const done = (ok) => { try { sock.destroy(); } catch (_e) { /* ignore */ } resolve(ok); };
+      sock.setTimeout(2000, () => done(false));
+      sock.once('connect', () => sock.write('PING\r\n'));
+      sock.on('data', (d) => {
+        buf += d.toString();
+        if (buf.includes('+PONG')) done(true);
+        else done(false);
+      });
+      sock.once('error', () => done(false));
+    });
+  }
+
+  async _stopDeps(rt) {
+    const held = this._depProcs && this._depProcs.get(rt.id);
+    const p = (held && held.paths) || this._sub2apiPaths(rt);
+    // 反序：redis → pg
+    if (held && held.redis && held.redis.pid) {
+      try { held.redis.kill(); } catch (_e) { /* ignore */ }
+      rt.deps.redis = { status: 'stopped', pid: 0 };
+    }
+    if (p.pgBoot && fs.existsSync(p.pgData)) {
+      rt.appendLog('manager', '[deps/pg] pg_ctl stop -m fast');
+      await this._runFile(p.pgBoot, ['stop', '-D', p.pgData, '-m', 'fast'], { timeoutMs: 15000 });
+    }
+    if (held) this._depProcs.delete(rt.id);
+    rt.deps.pg = { status: 'stopped', pid: 0 };
+    rt.deps.redis = { status: 'stopped', pid: 0 };
+  }
+
+  /** sub2api 首次启用时生成 DATABASE_URL（供 UI 展示/校验） */
+  buildDatabaseUrl() {
+    const m = this.store.manager.sub2api || {};
+    const password = this._ensureDbPassword();
+    return `postgres://wanneng:${password}@127.0.0.1:${m.pgPort || 5433}/sub2api?sslmode=disable`;
+  }
+
+  destroy() {
+    for (const rt of this.rts.values()) rt.clearTimers();
+  }
+}
+
+module.exports = {
+  PlatformManager,
+  STATES,
+  checkPortFree,
+  taskkillTree,
+  findListeningPid,
+  simpleGlobMatch,
+  findMagpieBinary,
+};

@@ -77,6 +77,49 @@ jobs:
             shell/dist/*.blockmap
           if-no-files-found: error
 
+  # Android 壳（WebView + proot）随同一 tag 发布；版本号取自 shell/package.json。
+  android:
+    needs: preflight
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.preflight.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            shell/package-lock.json
+            ui/package-lock.json
+      - name: 安装依赖（shell 提供 stagePayload 需要的 adm-zip）
+        run: |
+          npm --prefix shell ci
+          npm --prefix ui ci
+      - name: 构建 UI
+        run: npm --prefix ui run build
+      - name: 构建 APK（debug 签名，arm64-v8a）
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon
+      - name: 规范化文件名
+        run: |
+          VERSION="${TAG#v}"
+          cp android/app/build/outputs/apk/debug/app-debug.apk \
+             "wanneng2api-android-${VERSION}-arm64.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-arm64
+          path: wanneng2api-android-*-arm64.apk
+          if-no-files-found: error
+
   windows:
     needs: preflight
     runs-on: windows-latest
@@ -110,7 +153,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [preflight, linux, windows]
+    needs: [preflight, linux, android, windows]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -136,7 +179,7 @@ jobs:
       - name: 清理本次 Actions 工件
         run: |
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
-            --jq '.artifacts[] | select(.name == "linux-x64" or .name == "windows-x64") | .id' |
+            --jq '.artifacts[] | select(.name == "linux-x64" or .name == "windows-x64" or .name == "android-arm64") | .id' |
           while read -r id; do
             [ -n "$id" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
           done

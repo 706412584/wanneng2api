@@ -22,8 +22,9 @@
 - Release 资产必须同时包含 Windows（`latest.yml`）与 Linux（`latest-linux.yml`），
   壳的自更新依赖这两份清单。
 - 不再保留 Actions 工件：发布成功后由工作流自行删除，避免配额被 100MB+ 工件占满。
-- Android 版本使用独立 tag `android-vX.Y.Z`，由 `android-apk` 分支手动发布，不经过
-  本工作流。
+- Android APK 由 `release.yml` 的 `android` job 构建（ubuntu + JDK17 + Gradle），
+  以 `wanneng2api-android-<version>-arm64.apk` 随同一 Release 发布；版本号取自
+  `shell/package.json`，无需单独升 `android/` 的版本。
 
 验证命令（本地代理/网络受限时也可用）：
 ```bash
