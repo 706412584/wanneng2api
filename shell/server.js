@@ -48,7 +48,9 @@ async function main() {
   proxy.init(store);
   proxy.setLogger(log.info);
   const manager = new PlatformManager({ store, dataDir: store.dataDir, logger: log });
-  const updater = new PlatformUpdater({ store, manager, logger: log });
+  // dataDir 必传：安装/更新都走 updater 的 path.join(this.dataDir, 'updates', …)，
+  // 漏传会让每次平台安装都抛 "path argument must be of type string. Received undefined"。
+  const updater = new PlatformUpdater({ store, manager, dataDir: store.dataDir, logger: log });
   const tunnelManager = require('./src/tunnel').createTunnelSystem({
     configStore: store,
     dataDir: store.dataDir,
