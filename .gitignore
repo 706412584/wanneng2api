@@ -42,3 +42,9 @@ Thumbs.db
 
 # 图标渲染临时页（只保留 icon.png）
 shell/build/icon.html
+
+# Android 构建产物与本地配置
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
