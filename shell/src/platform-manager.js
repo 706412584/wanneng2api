@@ -183,6 +183,20 @@ function simpleGlobMatch(pattern, relPath) {
   return new RegExp(`^${rx}$`, 'i').test(relPath.replace(/\\/g, '/'));
 }
 
+/** 健康响应体是否表示「账号池为空」（见 PlatformRuntime._probeHealth 注释）。 */
+function isEmptyPoolBody(text) {
+  if (!text || !/^\s*[{[]/.test(text)) return false;
+  let data;
+  try { data = JSON.parse(text); } catch { return false; }
+  if (!data || typeof data !== 'object') return false;
+  const num = (v) => (v !== null && v !== '' && Number.isFinite(Number(v)) ? Number(v) : null);
+  // workbuddy / lingxi: {"healthy":0,"total":0,...}
+  if (num(data.total) === 0 && num(data.healthy) === 0) return true;
+  // loomy: {"status":"degraded","accounts":0,"usable_accounts":0,...}
+  if (num(data.accounts) === 0) return true;
+  return false;
+}
+
 function randomHex(n = 12) {
   return crypto.randomBytes(n).toString('hex');
 }
@@ -210,6 +224,8 @@ class PlatformRuntime {
     this.adopted = false;   // 端口上已有本平台实例，被认领而非 spawn
     this.version = null;
     this.lastHealthAt = 0;
+    // 进程运行正常、只是账号池为空（网关自己的健康端点如此报告）。
+    this.emptyAccounts = false;
     this.deps = { pg: { status: 'stopped', pid: 0 }, redis: { status: 'stopped', pid: 0 } };
     this.ring = new RingBuffer(500);
     this.writer = null;
@@ -241,6 +257,8 @@ class PlatformRuntime {
   setStatus(next, extraErr = '') {
     if (next === this.status && !extraErr) return;
     this.status = next;
+    // 只有运行中的健康状态才可能"空账号池"；停止/出错时清掉。
+    if (['stopped', 'error', 'updating'].includes(next)) this.emptyAccounts = false;
     if (extraErr) this.lastError = extraErr;
     if (next === 'healthy') { this.restartAttempts = 0; this.lastError = ''; }
     this.mgr.emit('status', this.id, next, this.snapshot());
@@ -268,6 +286,7 @@ class PlatformRuntime {
       lastError: this.lastError,
       restartAttempts: this.restartAttempts,
       lastHealthAt: this.lastHealthAt,
+      emptyAccounts: !!this.emptyAccounts,
       deps: cfg.requires ? this.deps : undefined,
       // 去掉查询串：magpie-web 的地址里带 ?k=<会话密钥>，
 // snapshot 会经 /api/platforms 与 /api/overview 直接回给前端。
@@ -507,13 +526,33 @@ class PlatformManager extends EventEmitter {
   }
 
   // ── 健康探针 ──
+  /**
+   * 健康探测。返回 { ok, emptyAccounts }。
+   *
+   * 空账号池不是故障：workbuddy / lingxi 无账号时 /healthz 返回
+   * 503 {"healthy":0,"total":0}，loomy 返回 200 但 accounts 为 0。
+   * 进程本身正常，只是在等用户加账号；单独标出来，前端据此显示
+   * 「待添加账号」而不是「异常」。
+   */
   _probeHealth(url, timeoutSec) {
     return new Promise((resolve) => {
       let settled = false;
-      const done = (ok) => { if (!settled) { settled = true; resolve(ok); } };
+      const done = (ok, emptyAccounts = false) => {
+        if (!settled) { settled = true; resolve({ ok, emptyAccounts }); }
+      };
       const req = http.get(url, { timeout: Math.max(1, timeoutSec) * 1000 }, (res) => {
-        res.resume(); // 排空
-        done(res.statusCode >= 200 && res.statusCode < 500);
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => { if (body.length < 4096) body += c; });
+        res.on('end', () => {
+          const empty = isEmptyPoolBody(body);
+          // 空账号池时网关按语义回 503（healthy:0/total:0）；进程与端口都正常，
+          // 不该判成故障。其余 5xx 仍然算失败。
+          const ok = (res.statusCode >= 200 && res.statusCode < 500)
+            || (res.statusCode === 503 && empty);
+          done(ok, empty);
+        });
+        res.on('error', () => done(false));
       });
       req.on('timeout', () => { req.destroy(); done(false); });
       req.on('error', () => done(false));
@@ -563,7 +602,9 @@ class PlatformManager extends EventEmitter {
           // 否则端口被别的程序占用时会被误认成该平台。
           if (!expect || !expect.length) return done(true);
           const hay = `${res.headers['content-type'] || ''} ${body}`.toLowerCase();
-          done(res.statusCode < 500 && expect.some((f) => hay.includes(String(f).toLowerCase())));
+          // 空账号池的 503 说明进程在跑（只是没账号），仍应被收养。
+          const statusOk = res.statusCode < 500 || (res.statusCode === 503 && isEmptyPoolBody(body));
+          done(statusOk && expect.some((f) => hay.includes(String(f).toLowerCase())));
         });
         res.on('error', () => done(false));
       });
@@ -614,14 +655,15 @@ class PlatformManager extends EventEmitter {
     const iv = Math.max(1, Number(h.intervalSec) || 15) * 1000;
     const tick = async () => {
       if (this._stopping || rt.stopping || ['stopped', 'updating'].includes(rt.status)) return;
-      const ok = await this._probeHealth(
+      const probe = await this._probeHealth(
         h.url || `http://127.0.0.1:${rt.cfg.port}/`,
         Number(h.timeoutSec) || 3,
       );
       rt.lastHealthAt = Date.now();
-      if (!ok && rt.status === 'healthy') {
+      rt.emptyAccounts = !!probe.emptyAccounts;
+      if (!probe.ok && rt.status === 'healthy') {
         rt.setStatus('unhealthy', '承载的外部实例已不可达（该进程不归壳管理）');
-      } else if (ok && rt.status === 'unhealthy') {
+      } else if (probe.ok && rt.status === 'unhealthy') {
         rt.setStatus('healthy');
       }
     };
@@ -633,9 +675,10 @@ class PlatformManager extends EventEmitter {
     if (this._stopping || rt.stopping || !rt.proc) return;
     if (['stopped', 'error', 'updating'].includes(rt.status)) return;
     const h = rt.cfg.health || {};
-    const ok = await this._probeHealth(h.url || `http://127.0.0.1:${rt.cfg.port}/`, Number(h.timeoutSec) || 3);
+    const probe = await this._probeHealth(h.url || `http://127.0.0.1:${rt.cfg.port}/`, Number(h.timeoutSec) || 3);
     rt.lastHealthAt = Date.now();
-    if (ok) {
+    rt.emptyAccounts = !!probe.emptyAccounts;
+    if (probe.ok) {
       rt.failCount = 0;
       rt.okCount += 1;
       const okT = Math.max(1, Number(h.okThreshold) || 1);
@@ -660,7 +703,9 @@ class PlatformManager extends EventEmitter {
     const h = rt.cfg.health || {};
     const deadline = Date.now() + Math.max(5, timeoutSec) * 1000;
     while (Date.now() < deadline && rt.proc && !rt.stopping && !this._stopping) {
-      if (await this._probeHealth(h.url || `http://127.0.0.1:${rt.cfg.port}/`, Number(h.timeoutSec) || 3)) {
+      const probe = await this._probeHealth(h.url || `http://127.0.0.1:${rt.cfg.port}/`, Number(h.timeoutSec) || 3);
+      if (probe.ok) {
+        rt.emptyAccounts = !!probe.emptyAccounts;
         rt.failCount = 0;
         rt.okCount = Math.max(rt.okCount, 1);
         return true;
@@ -706,8 +751,9 @@ class PlatformManager extends EventEmitter {
       const h = cfg.health || {};
       const probe = () =>
         this._probeHealth(h.url || `http://127.0.0.1:${cfg.port}/`, Number(h.timeoutSec) || 3);
-      const ok = await probe().catch(() => false);
-      rt.setStatus(ok ? 'healthy' : 'unhealthy', ok ? '' : '外部服务未运行（由该应用自己启动）');
+      const p0 = await probe().catch(() => ({ ok: false, emptyAccounts: false }));
+      rt.emptyAccounts = !!p0.emptyAccounts;
+      rt.setStatus(p0.ok ? 'healthy' : 'unhealthy', p0.ok ? '' : '外部服务未运行（由该应用自己启动）');
       // 外部平台没有子进程，用独立定时器轮询存活（_healthTick 依赖 rt.proc）。
       const iv = Math.max(1, Number(h.intervalSec) || 20) * 1000;
       if (rt.healthTimer) clearInterval(rt.healthTimer);

@@ -42,3 +42,15 @@ Thumbs.db
 
 # 图标渲染临时页（只保留 icon.png）
 shell/build/icon.html
+
+# Android 构建产物与本地配置（local.properties 带本机 SDK 路径）
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+
+# 首启预置归档（rootfs/node 共 74MB，本地弱网测试用）
+/preseed/
+
+# 实机验证截图
+/screen-*.png

@@ -579,7 +579,9 @@ function addProvider(binaryPath, { id, key, args = [] }, { timeoutMs = 180000 } 
       return resolve({ ok: false, stdout: '', stderr: `非法 provider id: ${id}` });
     }
     const argv = ['provider', 'add', id];
-    if (key) argv.push(String(key));
+    // 自定义 provider 只接受 k=v（裸 key 仅内置 preset 可用，magpie 会报
+    // `expected key=value, got ...`）。
+    if (key) argv.push(`key=${String(key)}`);
     // 具名参数只接受 key=value（如 project=xxx）；拒绝以 - 开头的串，
     // 否则等于让调用方往 magpie CLI 里塞任意 flag。
     for (const a of args) {

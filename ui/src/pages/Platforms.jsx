@@ -671,6 +671,8 @@ function PlatformCard({ p, busy, onAction, onOpenPanel, onRefresh }) {
   const fmtBytes = (n) => `${(Number(n || 0) / 1048576).toFixed(1)} MB`
   const disabled = BUSY_STATES.includes(p.state) || !!busy
   const running = ['healthy', 'degraded', 'unhealthy', 'starting', 'updating'].includes(p.state)
+  // 进程健康但账号池为空：显示「待添加账号」，不按异常告警。
+  const emptyPool = !!p.emptyAccounts && p.state === 'healthy'
   // 四家自研网关有原生管理面板；内核（external）没有，仍走「打开面板」
   const hasManager = !!p.id && ['workbuddy', 'codearts', 'loomy', 'lingxi'].includes(p.id)
   const [managerOpen, setManagerOpen] = useState(false)
@@ -719,7 +721,7 @@ function PlatformCard({ p, busy, onAction, onOpenPanel, onRefresh }) {
   return (
     <div className="card plat-card" data-kind={p.type === 'external' ? 'core' : 'own'}>
       <div className="plat-head">
-        <StateDot state={p.state} />
+        <StateDot state={emptyPool ? 'degraded' : p.state} />
         <div className="grow">
           <div className="name">
             {p.name}
@@ -738,8 +740,8 @@ function PlatformCard({ p, busy, onAction, onOpenPanel, onRefresh }) {
       </div>
 
       <div className="plat-stats">
-        <span>状态 <b>{installBusy ? '安装中' : install?.status === 'needs-import' ? '需导入' : needsInstall && !installBusy ? '未安装' : STATE_TEXT[p.state] || p.state}</b></span>
-        <span>健康 <b>{p.health === 'ok' ? '正常' : p.health === 'off' ? '—' : p.health === 'pending' ? '等待' : p.health}</b></span>
+        <span>状态 <b>{installBusy ? '安装中' : install?.status === 'needs-import' ? '需导入' : needsInstall && !installBusy ? '未安装' : emptyPool ? '待添加账号' : STATE_TEXT[p.state] || p.state}</b></span>
+        <span>健康 <b>{p.health === 'ok' ? '正常' : p.health === 'empty' ? '无账号' : p.health === 'off' ? '—' : p.health === 'pending' ? '等待' : p.health}</b></span>
         <span>运行 <b>{running ? fmtUptime(p.uptimeSec) : '—'}</b></span>
       </div>
 
