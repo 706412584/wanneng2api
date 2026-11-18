@@ -1,0 +1,142 @@
+name: release
+
+# 发布唯一入口：打 v* tag 即完成 构建 → 挂 Release → 清理 Actions 工件。
+# 不再在本地跑 electron-builder/手动 gh upload（见 CLAUDE.md「发布流程」）。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已存在的 tag（如 v0.2.8），用于重跑/补发'
+        required: true
+
+# 同一 tag 同时只跑一个发布，避免两次构建互相覆盖资产。
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # 创建 Release 与上传资产
+  actions: write    # 发布后删除本次 Actions 工件
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - id: v
+        name: 校验 tag 与 shell 版本一致
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="$TAG"
+          VERSION="${VERSION#v}"
+          PKG="$(node -p "require('./shell/package.json').version")"
+          if [ "$VERSION" != "$PKG" ]; then
+            echo "shell/package.json=$PKG，tag=$TAG 不一致；先提交 chore(release) 再打 tag" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            shell/package-lock.json
+            ui/package-lock.json
+      - name: 安装依赖
+        run: |
+          npm --prefix shell ci
+          npm --prefix ui ci
+      - name: 构建 UI
+        run: npm --prefix ui run build
+      - name: 打包 Linux（AppImage + deb，不发布）
+        working-directory: shell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --linux --x64 --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: |
+            shell/dist/*.AppImage
+            shell/dist/*.deb
+            shell/dist/latest-linux.yml
+            shell/dist/*.blockmap
+          if-no-files-found: error
+
+  windows:
+    needs: preflight
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            shell/package-lock.json
+            ui/package-lock.json
+      - name: 安装依赖
+        run: |
+          npm --prefix shell ci
+          npm --prefix ui ci
+      - name: 构建 UI
+        run: npm --prefix ui run build
+      - name: 打包 Windows（nsis，不发布）
+        working-directory: shell
+        run: npx electron-builder --win --x64 --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            shell/dist/*.exe
+            shell/dist/latest.yml
+            shell/dist/*.blockmap
+          if-no-files-found: error
+
+  publish:
+    needs: [preflight, linux, windows]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.preflight.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-all
+          merge-multiple: true
+
+      - name: 创建或补齐 Release
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist-all/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist-all/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --generate-notes
+          fi
+
+      # Release 已持有资产，Actions 工件不再需要（每个几十~上百 MB）。
+      - name: 清理本次 Actions 工件
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name == "linux-x64" or .name == "windows-x64") | .id' |
+          while read -r id; do
+            [ -n "$id" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
+          done
