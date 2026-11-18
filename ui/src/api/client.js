@@ -90,7 +90,10 @@ function adaptPlatform(p) {
   return {
     ...p,
     state: stateOf(p),
-    health: p.health ?? (stateOf(p) === 'healthy' ? 'ok' : 'unknown'),
+    // 空账号池：进程正常，只是在等用户加账号（壳回 emptyAccounts）。
+    health: p.health ?? (stateOf(p) === 'healthy'
+      ? (p.emptyAccounts ? 'empty' : 'ok')
+      : 'unknown'),
     uptimeSec: p.uptimeSec ?? 0,
     updateAvailable: p.updateAvailable ?? p.hasUpdate ?? false
   }
@@ -141,7 +144,14 @@ export const api = new Proxy({
 
   checkUpdate: (id) => request(`/api/platforms/${encodeURIComponent(id)}/update/check`, { method: 'POST' }),
   applyUpdate: (id, checkInfo) => request(`/api/platforms/${encodeURIComponent(id)}/update/apply`, { method: 'POST', body: checkInfo ? { checkInfo } : undefined }),
-  openPanel: (id, query) => request(`/api/platforms/${encodeURIComponent(id)}/open-panel`, { method: 'POST', body: query ? { query } : undefined }),
+  openPanel: async (id, query) => {
+    const r = await request(`/api/platforms/${encodeURIComponent(id)}/open-panel`, { method: 'POST', body: query ? { query } : undefined })
+    // 安卓壳：容器里没有 xdg-open，服务端打开是空操作，改由 App 起系统浏览器。
+    if (r && r.opened && window.W2ABridge && typeof window.W2ABridge.openExternal === 'function') {
+      try { window.W2ABridge.openExternal(r.opened) } catch { /* 打开失败不阻塞业务流程 */ }
+    }
+    return r
+  },
 
   // 自研网关原生管理：统一视图 / 日志 / 受限动作。
   // 凭据（CodeArts admin_key、Lingxi/Loomy api_key）全部留在壳后台，
@@ -340,7 +350,8 @@ function openPollingLogStream(ids, onLine) {
 
 export function openLogStream(ids, onLine) {
   if (isMock) return mockLogStream(ids, onLine)
-  if (remoteCsrf()) return openPollingLogStream(ids, onLine)
+  // 安卓壳的请求走原生桥接，没有可用的 SSE，直接使用去重轮询回退。
+  if (remoteCsrf() || window.__W2A_ANDROID__) return openPollingLogStream(ids, onLine)
   const sources = []
   for (const id of ids) {
     try {
