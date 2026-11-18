@@ -32,12 +32,20 @@ const MAX_BODY = 1024 * 1024;
  */
 const CLIENT_HEADER = 'x-wanneng-client';
 
-function isAllowedOrigin(origin) {
+function isAllowedOrigin(origin, host) {
   if (!origin) return true; // curl / 同源 / 桌面主进程
   if (origin === 'null') return true; // 具体写操作再由 _isTrustedWrite 二次校验
   try {
     const u = new URL(origin);
-    return u.hostname === '127.0.0.1' || u.hostname === 'localhost';
+    if (u.hostname === '127.0.0.1' || u.hostname === 'localhost') return true;
+    // 反代部署：Origin 与请求 Host 同域 → 视为同源放行。
+    // 壳只监听 127.0.0.1，公网请求必经 nginx 反代（Host 由 proxy_set_header 透传），
+    // 且受保护路径在 nginx 层已有会话认证；跨站 Origin 与 Host 不同域，仍被拒。
+    if (host) {
+      const hostNoPort = String(host).split(':')[0].trim();
+      if (hostNoPort && u.hostname === hostNoPort) return true;
+    }
+    return false;
   } catch (_e) {
     return false;
   }
@@ -339,7 +347,7 @@ class ApiServer {
 
   async _handler(req, res) {
     const origin = req.headers.origin;
-    if (!isAllowedOrigin(origin)) {
+    if (!isAllowedOrigin(origin, req.headers.host)) {
       return json(res, 403, { error: 'origin not allowed' }, null);
     }
     if (req.method === 'OPTIONS') {

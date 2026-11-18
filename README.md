@@ -33,6 +33,42 @@ cd shell && npm install && npm start
 
 Loomy 需要 Python 3.9+（未捆绑解释器时使用系统 Python）。首次安装支持 Windows x64，以及具有对应 Release 资产的 Linux x64/ARM64。
 
+## 无头服务器部署（headless）
+
+无显示器的 Linux 服务器上不跑 Electron，直接跑纯 Node 管理台（与桌面壳共用同一套 PlatformManager / ApiServer / ConfigStore，无窗口/托盘/自更新，一切经浏览器操作）：
+
+```bash
+# 构建 UI 后（同上）
+cd shell && npm install --omit=dev
+
+# systemd 常驻
+cat > /etc/systemd/system/wanneng2api.service <<'EOF'
+[Unit]
+Description=Wanneng2API headless manager (webui on 127.0.0.1:17800)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/wanneng2api/shell
+Environment=WANENG_DATA_DIR=/opt/wanneng2api/data
+Environment=HOME=/root        # 必需：magpie CLI 依赖 HOME 定位自身文件，
+                              # systemd 默认不给服务设 HOME，缺失时注册报
+                              # "HOME is not set: magpie needs the home folder"
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable --now wanneng2api
+```
+
+公网访问需经反向代理（nginx）转发到 `127.0.0.1:17800`，并在反代层做会话认证——管理台自身无鉴权，设计上只监听本机。反代部署时注意两点：
+
+- **Origin 校验**：浏览器经域名访问时，vite 构建的 crossorigin 资产请求会带 `Origin` 头（同源也带），壳的 `isAllowedOrigin` 需放行「与请求 Host 同域」的来源，否则 JS/CSS 被 403 拒绝、页面白屏。
+- **「打开面板」**：服务端 `xdg-open` 在无头服务器上是空操作；浏览器部署下由前端把面板 URL 按端口映射改写为公网反代地址后直接打开（见 `ui/src/api/client.js` 的 `PANEL_PORT_MAP`），无映射的面板用卡片上的「管理」抽屉。
+
 ## 组件与端口
 
 | 组件 | 端口 | 说明 |
