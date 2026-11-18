@@ -71,7 +71,7 @@ export default function Platforms() {
   const openPanel = async (p) => {
     try {
       await api.openPanel(p.id)
-      if (!isMock) toast(`已在系统浏览器打开 ${p.name} 面板`)
+      if (!isMock) toast(`已在新标签页打开 ${p.name} 面板`)
       else toast(`（mock）将打开 http://127.0.0.1:${p.port}/`)
     } catch (e) {
       toast(`打开面板失败：${e.message}`, 'err')

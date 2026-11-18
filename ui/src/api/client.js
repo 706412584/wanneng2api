@@ -146,9 +146,34 @@ export const api = new Proxy({
   applyUpdate: (id, checkInfo) => request(`/api/platforms/${encodeURIComponent(id)}/update/apply`, { method: 'POST', body: checkInfo ? { checkInfo } : undefined }),
   openPanel: async (id, query) => {
     const r = await request(`/api/platforms/${encodeURIComponent(id)}/open-panel`, { method: 'POST', body: query ? { query } : undefined })
+    if (!r || !r.opened) return r
     // 安卓壳：容器里没有 xdg-open，服务端打开是空操作，改由 App 起系统浏览器。
-    if (r && r.opened && window.W2ABridge && typeof window.W2ABridge.openExternal === 'function') {
+    if (window.W2ABridge && typeof window.W2ABridge.openExternal === 'function') {
       try { window.W2ABridge.openExternal(r.opened) } catch { /* 打开失败不阻塞业务流程 */ }
+      return r
+    }
+    // 浏览器直连部署（headless 服务器）：服务端 xdg-open 是空操作（无显示器），
+    // 且 127.0.0.1 在用户浏览器里指向用户自己的电脑。把面板 URL 改写为
+    // 公网可达的反代地址后由浏览器直接打开。
+    // PANEL_PORT_MAP：本机面板端口 → nginx 反代公网端口（需在反代层配置）。
+    const PANEL_PORT_MAP = { 17899: 8443 }
+    const rewrite = (url) => {
+      try {
+        const u = new URL(url)
+        if (u.hostname === '127.0.0.1' && PANEL_PORT_MAP[u.port]) {
+          u.protocol = window.location.protocol
+          u.hostname = window.location.hostname
+          u.port = String(PANEL_PORT_MAP[u.port])
+        }
+        return { url: u.toString(), mapped: u.hostname !== '127.0.0.1' }
+      } catch { return { url, mapped: false } }
+    }
+    const { url, mapped } = rewrite(r.opened)
+    if (mapped) {
+      window.open(url, '_blank', 'noopener')
+    } else {
+      // 无公网映射的面板（如自研网关原面板）：明确告知替代入口，而不是静默无反应
+      throw new Error('该面板仅监听本机、无公网入口；请使用卡片上的「管理」按钮（账号/签到/统计/日志）')
     }
     return r
   },
