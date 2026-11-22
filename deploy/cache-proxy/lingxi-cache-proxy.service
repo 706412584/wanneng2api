@@ -1,0 +1,14 @@
+[Unit]
+Description=Lingxi request dedup cache proxy (6791 -> 6789)
+After=network.target redis.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/lingxi-cache-proxy/cache_proxy.py
+WorkingDirectory=/opt/lingxi-cache-proxy
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
