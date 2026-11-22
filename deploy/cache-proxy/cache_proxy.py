@@ -79,11 +79,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _forward(self, body, headers):
         req = Request(UPSTREAM + self.path, data=body, method="POST")
+        # 原样透传所有请求头,只排除连接级/传输级头(由 urllib 自动处理)
+        skip = {"host", "content-length", "connection", "accept-encoding"}
         for k, v in headers.items():
-            if k.lower() in ("host", "content-length", "connection"):
+            if k.lower() in skip:
                 continue
             req.add_header(k, v)
-        req.add_header("Content-Type", "application/json")
+        # Content-Type 透传原始值(不强制覆盖),客户端没传才补默认
+        if not headers.get("Content-Type"):
+            req.add_header("Content-Type", "application/json")
         return urlopen(req, timeout=300)
 
     def do_POST(self):
