@@ -158,10 +158,20 @@ export const api = new Proxy({
     // 端口 → 子路径映射：
     //   17899=magpie-web → /magpie/(前缀剥离,HTML 资源全相对路径)
     //   6789=lingxi     → 原样保留 /panel/(其 HTML/API 全在此前缀下,零冲突)
+    //
+    // 关键前提：只有「页面本身经公网反代访问」时才改写。桌面壳与本机浏览器
+    // 的 window.location 就是 127.0.0.1:17800（壳自己托管 UI），此时把
+    // 127.0.0.1:6789 改写成 <origin>/panel 会指到壳的 17800 上（无此路由），
+    // 结果是空白页；本机浏览器本来就能直连各端口，原样打开即可。
+    const isLoopback = (h) => h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '[::1]'
     const rewrite = (url) => {
       try {
         const u = new URL(url)
-        if (u.hostname !== '127.0.0.1') return { url, mapped: false }
+        if (u.hostname !== '127.0.0.1') return { url, mapped: true }
+        // 页面打开在本机（桌面壳 / 本机浏览器 / file:// 回退页）：直接开原地址
+        if (isLoopback(window.location.hostname) || !window.location.origin || window.location.origin === 'null') {
+          return { url, mapped: true }
+        }
         let path = u.pathname
         if (u.port === '17899') path = '/magpie/' + path.replace(/^\//, '')
         if (u.port === '17899' || u.port === '6789') {
