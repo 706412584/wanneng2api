@@ -23,6 +23,25 @@ function resetText(value) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
+/** 单个额度窗口：计数用 amount/limit（used 是百分比，不能当计数用） */
+function QuotaWindow({ w, compact = false }) {
+  return <article className={`plugin-quota${compact ? ' compact' : ''}`}>
+    <div className="plugin-quota-head">
+      <b>{w.name}</b>
+      <span className="mono sub">{w.amount !== null && w.limit > 0
+        ? `${w.amount} / ${w.limit}${w.unit ? ' ' + w.unit : ''}`
+        : (w.display || '上游未给上限')}</span>
+    </div>
+    {w.percent !== null
+      ? <div className="progress"><div className="bar" style={{ width: `${w.percent}%` }} /></div>
+      : <div className="plugin-quota-nolimit">上游只给了用量描述，没有百分比，不画进度条</div>}
+    <div className="plugin-quota-foot">
+      {w.percent !== null && <span>{w.percent}% 已用</span>}
+      {w.resetsAt && <span>重置 {resetText(w.resetsAt)}</span>}
+    </div>
+  </article>
+}
+
 /** 一个账号今天的签到状态：只有 day 是今天且不是 failed 才算已签到 */
 function checkinState(account) {
   const today = todayCN()
@@ -69,6 +88,9 @@ export default function PluginManager({ plugin, onClose, onChanged }) {
   const { run } = useBusy()
   const selected = modelDraft ?? data?.chosen ?? []
   const dirty = modelDraft !== null || Object.keys(optionDraft).length > 0
+  // 内核「一账号一行」：单账号时 accounts 只有一项，界面照旧显示一组额度；
+  // 多账号时上方显示合计，下方按账号分列。
+  const quotaAccounts = data?.quota?.accounts || []
 
   const request = (action, body = {}) => api.magpiePluginAction(plugin.package, provider, action, body)
   const refresh = async () => {
@@ -458,28 +480,35 @@ export default function PluginManager({ plugin, onClose, onChanged }) {
             {tab === 'quota' && <>
               <div className="plugin-manager-section-title">
                 <h3>额度</h3>
-                <span className="sub">{data.quota.plan ? `套餐 ${data.quota.plan}` : ""}</span>
+                <span className="sub">{quotaAccounts.length > 1
+                  ? `${quotaAccounts.length} 个账号合计${data.quota.plan ? ` · 套餐 ${data.quota.plan}` : ''}`
+                  : (data.quota.plan ? `套餐 ${data.quota.plan}` : '')}</span>
               </div>
               {data.quota.error && <div className="plugin-manager-error" role="alert">上游未给出额度：{data.quota.error}</div>}
               {!data.quota.windows.length && !data.quota.error && <div className="plugin-manager-empty">该服务的上游没有返回额度信息。</div>}
               <div className="plugin-quota-list">
-                {data.quota.windows.map((w) => <article className="plugin-quota" key={w.name}>
-                  <div className="plugin-quota-head">
-                    <b>{w.name}</b>
-                    {/* 计数用 amount/limit：used 是百分比，拿它当计数会显示错 */}<span className="mono sub">{w.amount !== null && w.limit > 0
-                      ? `${w.amount} / ${w.limit}${w.unit ? ' ' + w.unit : ''}`
-                      : (w.display || '上游未给上限')}</span>
-                  </div>
-                  {w.percent !== null
-                    ? <div className="progress"><div className="bar" style={{ width: `${w.percent}%` }} /></div>
-                    : <div className="plugin-quota-nolimit">上游只给了用量描述，没有百分比，不画进度条</div>}
-                  <div className="plugin-quota-foot">
-                    {w.percent !== null && <span>{w.percent}% 已用</span>}
-                    {w.resetsAt && <span>重置 {resetText(w.resetsAt)}</span>}
-                  </div>
-                </article>)}
+                {data.quota.windows.map((w) => <QuotaWindow w={w} key={w.name} />)}
               </div>
-              <p className="sub" style={{ marginTop: 14 }}>额度由内核向各服务实时读取；没有上限的窗口不会画进度条，避免显示错误的比例。</p>
+              {quotaAccounts.length > 1 && <>
+                <div className="plugin-manager-section-title" style={{ marginTop: 22 }}>
+                  <h3>各账号</h3>
+                  <span className="sub">{quotaAccounts.length} 个</span>
+                </div>
+                <div className="plugin-quota-accounts">
+                  {quotaAccounts.map((a) => <article className="plugin-quota-account" key={a.user || a.label}>
+                    <div className="plugin-quota-head">
+                      <b>{a.label || a.user}</b>
+                      <span className="sub">{a.plan || ''}</span>
+                    </div>
+                    {a.error && <div className="plugin-manager-error" role="alert">该账号上游未给出额度：{a.error}</div>}
+                    {!a.windows.length && !a.error && <div className="plugin-quota-nolimit">上游没有返回该账号的额度</div>}
+                    <div className="plugin-quota-list compact">
+                      {a.windows.map((w) => <QuotaWindow w={w} key={w.name} compact />)}
+                    </div>
+                  </article>)}
+                </div>
+              </>}
+              <p className="sub" style={{ marginTop: 14 }}>额度由内核向各服务实时读取；没有上限的窗口不会画进度条，避免显示错误的比例。多账号时上方为合计，下方按账号分列。</p>
             </>}
             {tab === 'checkin' && <>
               <div className="plugin-manager-section-title"><h3>每日签到</h3><span className="sub">{data.checkin.accounts.length} 个账号</span></div>

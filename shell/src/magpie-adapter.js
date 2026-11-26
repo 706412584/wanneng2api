@@ -1601,39 +1601,101 @@ class PluginPanel {
   async _quota(provider) {
     const quotas = await this._api('usage/quotas');
     if (!Array.isArray(quotas)) return { available: false, windows: [] };
-    const row = quotas.find((q) => q && q.provider === provider);
-    if (!row) return { available: false, windows: [] };
-    const windows = (Array.isArray(row.windows) ? row.windows : []).filter((w) => w && typeof w.name === 'string').map((w) => {
-      // 内核语义（app.js `to100(w.used)`、`quotaCount` 用 `w.amount / w.limit`）：
-      //   used  = **已用百分比**（0–100）
-      //   amount= 已用计数，limit = 总量
-      // 把 used 当计数去算 used/limit 会得出完全错误的比例。
-      const pctRaw = typeof w.used === 'number' && Number.isFinite(w.used) ? w.used : null;
-      const pct = pctRaw !== null ? Math.max(0, Math.min(100, Math.round(pctRaw))) : null;
-      const amount = typeof w.amount === 'number' && Number.isFinite(w.amount) ? w.amount : null;
-      const limit = typeof w.limit === 'number' && Number.isFinite(w.limit) ? w.limit : null;
-      return {
-        name: w.name,
-        used: pctRaw,
-        // 计数用 amount；上游没给 amount 时保留 null，由界面回退到 display
-        amount,
-        limit,
-        // 上游有时只给一句人话（"0 credits left"），原样透传，不当成数值
-        display: typeof w.display === 'string' ? w.display : '',
-        unit: typeof w.unit === 'string' ? w.unit : '',
-        percent: pct,
-        // 有 limit 才能画进度条；没有就只显示文字
-        resetsAt: typeof w.resetsAt === 'string' ? w.resetsAt : '',
-      };
-    });
-    return {
-      available: windows.length > 0,
-      plan: typeof row.plan === 'string' ? row.plan : '',
+    // 内核是「一个账号一行」：同一个 provider 有多个账号时会有多行。
+    // 过去只 find 第一行，多账号平台（如小浣熊 14 个号）面板只显示一个号的额度。
+    const rows = quotas.filter((q) => q && q.provider === provider);
+    if (!rows.length) return { available: false, windows: [] };
+
+    // 内核语义（app.js `to100(w.used)`、`quotaCount` 用 `w.amount / w.limit`）：
+    //   used  = **已用百分比**（0–100）
+    //   amount= 已用计数，limit = 总量
+    // 把 used 当计数去算 used/limit 会得出完全错误的比例。
+    const mapWindows = (row) => (Array.isArray(row.windows) ? row.windows : [])
+      .filter((w) => w && typeof w.name === 'string')
+      .map((w) => {
+        const pctRaw = typeof w.used === 'number' && Number.isFinite(w.used) ? w.used : null;
+        const pct = pctRaw !== null ? Math.max(0, Math.min(100, Math.round(pctRaw))) : null;
+        const amount = typeof w.amount === 'number' && Number.isFinite(w.amount) ? w.amount : null;
+        const limit = typeof w.limit === 'number' && Number.isFinite(w.limit) ? w.limit : null;
+        return {
+          name: w.name,
+          used: pctRaw,
+          // 计数用 amount；上游没给 amount 时保留 null，由界面回退到 display
+          amount,
+          limit,
+          // 上游有时只给一句人话（"0 credits left"），原样透传，不当成数值
+          display: typeof w.display === 'string' ? w.display : '',
+          unit: typeof w.unit === 'string' ? w.unit : '',
+          percent: pct,
+          // 有 limit 才能画进度条；没有就只显示文字
+          resetsAt: typeof w.resetsAt === 'string' ? w.resetsAt : '',
+        };
+      });
+
+    const accounts = rows.map((row) => ({
+      // alias 是内核给账号起的别名（小浣熊是脱敏手机号 185****5698），
+      // 没有别名时才退回 user（多为 accountId 这种长串）。
+      label: typeof row.alias === 'string' && row.alias
+        ? row.alias
+        : (typeof row.user === 'string' ? row.user : ''),
       user: typeof row.user === 'string' ? row.user : '',
+      plan: typeof row.plan === 'string' ? row.plan : '',
       readAt: typeof row.readAt === 'string' ? row.readAt : '',
       // 上游错误可能夹带 token/UUID/URL 片段：脱敏后再给前端
       error: typeof row.error === 'string' ? this._redact(row.error) : '',
+      windows: mapWindows(row),
+    }));
+
+    // 单账号：原样返回该行窗口，used 就是内核给的百分比。
+    // 多账号：同名窗口把 amount/limit 相加再重算百分比——把各账号的百分比
+    // 直接平均是错的（每个号总量可能不同）。
+    let windows = accounts[0].windows;
+    if (accounts.length > 1) {
+      const merged = new Map();
+      for (const acc of accounts) {
+        for (const w of acc.windows) {
+          let cur = merged.get(w.name);
+          if (!cur) {
+            cur = {
+              name: w.name, amount: null, limit: null, used: null, percent: null,
+              unit: w.unit, display: '', resetsAt: '',
+            };
+            merged.set(w.name, cur);
+          }
+          if (!cur.unit && w.unit) cur.unit = w.unit;
+          if (!cur.display && w.display) cur.display = w.display;
+          // 取最早的重置时间：整池先回血的时间点最有用
+          if (w.resetsAt && (!cur.resetsAt || w.resetsAt < cur.resetsAt)) cur.resetsAt = w.resetsAt;
+          if (w.amount !== null && w.limit !== null && w.limit > 0) {
+            cur.amount = (cur.amount || 0) + w.amount;
+            cur.limit = (cur.limit || 0) + w.limit;
+          }
+        }
+      }
+      windows = [...merged.values()].map((cur) => {
+        if (cur.amount === null || !(cur.limit > 0)) return cur;
+        const pct = Math.max(0, Math.min(100, Math.round((cur.amount / cur.limit) * 100)));
+        return {
+          ...cur,
+          used: pct,
+          percent: pct,
+          display: `${cur.amount} / ${cur.limit}${cur.unit ? ' ' + cur.unit : ''}`,
+        };
+      });
+    }
+
+    const first = accounts[0];
+    const errors = [...new Set(accounts.map((a) => a.error).filter(Boolean))];
+    return {
+      available: windows.length > 0,
+      plan: first.plan,
+      user: first.user,
+      readAt: first.readAt,
+      error: errors.join('；'),
       windows,
+      // 每个账号各自的一行，供界面在多账号时分开展示
+      accounts,
+      accountCount: accounts.length,
     };
   }
 

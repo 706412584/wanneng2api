@@ -113,6 +113,13 @@ async function main() {
       { provider: 'other', name: '其它', user: 'bob', checkins: true,
         checkinBy: 'plugin:other', checkinKey: 'other|bob',
         checkin: { day: '2026-11-11', outcome: 'claimed' } },
+      // 多账号 provider：内核「一账号一行」，面板必须合计 + 分列，不能只取第一行。
+      { provider: 'test-cn', name: '测试国内版', user: 'Raccoon-a', alias: '185****0001', plan: 'Free',
+        windows: [{ name: 'Credits', used: 10, amount: 100, limit: 1000, unit: 'credits',
+          display: '100 / 1000', resetsAt: '2026-12-02T00:00:00Z' }] },
+      { provider: 'test-cn', name: '测试国内版', user: 'Raccoon-b', alias: '186****0002', plan: 'Free',
+        windows: [{ name: 'Credits', used: 50, amount: 250, limit: 500, unit: 'credits',
+          display: '250 / 500', resetsAt: '2026-12-01T00:00:00Z' }] },
     ]);
     if (u.pathname === '/api/usage/checkin-account') {
       calls.push({ path: 'checkin-account', body });
@@ -178,7 +185,21 @@ async function main() {
     const serialized = JSON.stringify(detail);
     for (const secret of ['never-return-this', 'private-token', 'bob', 'secret:password', 'test-web-key', 'test-session']) assert.equal(serialized.includes(secret), false);
     assert.equal(calls.filter((x) => x.path === '/').length, 1);
-    assert.equal((await panel.detail(pkg, 'test-cn')).models.length, 0);
+    // 单账号 provider：accounts 只有一行，窗口原样（不重算 used）
+    assert.equal(detail.quota.accountCount, 1);
+    assert.equal(detail.quota.accounts.length, 1);
+    assert.equal(detail.quota.accounts[0].label, 'alice');
+    const multi = await panel.detail(pkg, 'test-cn');
+    assert.equal(multi.models.length, 0);
+    // 多账号 provider：两行都要在，标签用 alias，合计按 amount/limit 相加后重算百分比
+    assert.equal(multi.quota.accountCount, 2);
+    assert.deepEqual(multi.quota.accounts.map((a) => a.label), ['185****0001', '186****0002']);
+    assert.deepEqual(multi.quota.accounts.map((a) => a.windows[0].amount), [100, 250]);
+    const merged = multi.quota.windows.find((w) => w.name === 'Credits');
+    assert.equal(merged.amount, 350, '合计用 amount 相加');
+    assert.equal(merged.limit, 1500, '合计用 limit 相加');
+    assert.equal(merged.percent, 23, '百分比按 合计已用/合计总量 重算，不是平均');
+    assert.equal(merged.resetsAt, '2026-12-01T00:00:00Z', '取最早重置时间');
     await assert.rejects(panel.detail(pkg, 'other'), /不属于/);
     await assert.rejects(panel.action(pkg, 'test', 'account-remove', { user: 'bob' }), /不属于/);
     await assert.rejects(panel.action(pkg, 'test', 'anything', {}), /不支持/);
