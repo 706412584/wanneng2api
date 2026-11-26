@@ -154,18 +154,20 @@ export const api = new Proxy({
     }
     // 浏览器直连部署（headless 服务器）：服务端 xdg-open 是空操作（无显示器），
     // 且 127.0.0.1 在用户浏览器里指向用户自己的电脑。把面板 URL 改写为
-    // 公网可达的反代地址后由浏览器直接打开。
-    // PANEL_PORT_MAP：本机面板端口 → nginx 反代公网端口（需在反代层配置）。
-    const PANEL_PORT_MAP = { 17899: 8443 }
+    // 主域名下的子路径（与 nginx 反代一致），由浏览器直接打开。
+    // 端口 → 子路径映射：
+    //   17899=magpie-web → /magpie/(前缀剥离,HTML 资源全相对路径)
+    //   6789=lingxi     → 原样保留 /panel/(其 HTML/API 全在此前缀下,零冲突)
     const rewrite = (url) => {
       try {
         const u = new URL(url)
-        if (u.hostname === '127.0.0.1' && PANEL_PORT_MAP[u.port]) {
-          u.protocol = window.location.protocol
-          u.hostname = window.location.hostname
-          u.port = String(PANEL_PORT_MAP[u.port])
+        if (u.hostname !== '127.0.0.1') return { url, mapped: false }
+        let path = u.pathname
+        if (u.port === '17899') path = '/magpie/' + path.replace(/^\//, '')
+        if (u.port === '17899' || u.port === '6789') {
+          return { url: window.location.origin + path + u.search, mapped: true }
         }
-        return { url: u.toString(), mapped: u.hostname !== '127.0.0.1' }
+        return { url, mapped: false }
       } catch { return { url, mapped: false } }
     }
     const { url, mapped } = rewrite(r.opened)
