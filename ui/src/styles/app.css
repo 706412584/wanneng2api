@@ -778,6 +778,12 @@ html.has-titlebar .plugin-manager-mask { top: 34px; }
 .plugin-quota-foot { display: flex; justify-content: space-between; gap: 12px; font-size: 11.5px; color: var(--text-3); }
 .plugin-quota-nolimit { font-size: 12px; color: var(--text-3); }
 .plugin-quota .progress { height: 8px; }
+/* 多账号：合计在上，按账号分列在下（窗口卡片压缩一档，账号多时不至于太长） */
+.plugin-quota-accounts { display: flex; flex-direction: column; gap: 10px; }
+.plugin-quota-account { display: flex; flex-direction: column; gap: 9px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius); }
+.plugin-quota-list.compact { gap: 8px; }
+.plugin-quota.compact { padding: 10px 12px; gap: 6px; }
+.plugin-quota.compact .progress { height: 6px; }
 .plugin-checkin-list { display: flex; flex-direction: column; gap: 10px; }
 .plugin-checkin { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 14px 16px; border: 1px solid var(--border); border-radius: var(--radius); }
 .plugin-checkin-info { display: flex; flex-direction: column; gap: 7px; min-width: 0; overflow-wrap: anywhere; }
